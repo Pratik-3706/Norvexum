@@ -1,0 +1,290 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Tools — Registry, trait, and result types
+//
+// All tools:
+//   • Implement the Tool trait (async execute)
+//   • Are registered by name in the ToolRegistry
+//   • Return ToolResult with structured output
+//   • Are sandboxed to the project directory
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub mod filesystem;
+pub mod image_download;
+pub mod image_inspect;
+pub mod image_search;
+pub mod package_safety;
+pub mod shell;
+pub mod web_fetch;
+pub mod web_search;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::ai::types::ToolDef;
+use crate::config::Settings;
+
+/// Result of a tool execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub success: bool,
+    pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Structured data for the agent to use (e.g. file paths, image URLs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+impl ToolResult {
+    pub fn ok(output: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            output: output.into(),
+            error: None,
+            data: None,
+        }
+    }
+
+    pub fn ok_with_data(output: impl Into<String>, data: serde_json::Value) -> Self {
+        Self {
+            success: true,
+            output: output.into(),
+            error: None,
+            data: Some(data),
+        }
+    }
+
+    pub fn err(error: impl Into<String>) -> Self {
+        let error_str = error.into();
+        Self {
+            success: false,
+            output: String::new(),
+            error: Some(error_str),
+            data: None,
+        }
+    }
+
+    /// Format for inclusion in the AI conversation as a tool result.
+    pub fn to_message_content(&self) -> String {
+        if self.success {
+            if let Some(data) = &self.data {
+                format!(
+                    "{}\n\n[data]: {}",
+                    self.output,
+                    serde_json::to_string(data).unwrap_or_default()
+                )
+            } else {
+                self.output.clone()
+            }
+        } else {
+            format!(
+                "ERROR: {}",
+                self.error.as_deref().unwrap_or("Unknown error")
+            )
+        }
+    }
+}
+
+/// Context passed to every tool execution.
+#[derive(Clone)]
+pub struct ToolContext {
+    pub settings: Arc<Settings>,
+    /// Current working directory (within sandbox)
+    pub cwd: std::path::PathBuf,
+    pub client: Option<Arc<dyn crate::ai::AiClient>>,
+}
+
+/// The trait all tools must implement.
+#[async_trait]
+pub trait Tool: Send + Sync {
+    /// Unique name used in tool calls (e.g. "read_file", "web_search")
+    fn name(&self) -> &str;
+
+    /// Human-readable description for the AI model
+    fn description(&self) -> &str;
+
+    /// JSON Schema describing the tool's parameters
+    fn parameters(&self) -> serde_json::Value;
+
+    /// Execute the tool with the given arguments
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult;
+
+    /// Convert to a ToolDef for the AI API
+    fn to_tool_def(&self) -> ToolDef {
+        ToolDef {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: self.parameters(),
+        }
+    }
+}
+
+/// Registry of all available tools.
+pub struct ToolRegistry {
+    tools: HashMap<String, Box<dyn Tool>>,
+}
+
+impl ToolRegistry {
+    /// Create a new registry and register all built-in tools.
+    pub fn new(_settings: &Settings) -> Self {
+        let mut registry = Self {
+            tools: HashMap::new(),
+        };
+
+        // ── Filesystem tools ─────────────────────────────────────────────
+        registry.register(Box::new(filesystem::ReadFileTool));
+        registry.register(Box::new(filesystem::WriteFileTool));
+        registry.register(Box::new(filesystem::EditFileTool));
+        registry.register(Box::new(filesystem::ListDirTool));
+        registry.register(Box::new(filesystem::GrepTool));
+        registry.register(Box::new(filesystem::FindTool));
+        registry.register(Box::new(filesystem::TouchTool));
+        registry.register(Box::new(filesystem::RemoveTool));
+        registry.register(Box::new(filesystem::MoveTool));
+        registry.register(Box::new(filesystem::CopyTool));
+        registry.register(Box::new(filesystem::PwdTool));
+        registry.register(Box::new(filesystem::CatTool));
+
+        // ── Web tools ────────────────────────────────────────────────────
+        registry.register(Box::new(web_search::WebSearchTool));
+        registry.register(Box::new(web_fetch::WebFetchTool));
+        registry.register(Box::new(image_search::ImageSearchTool));
+        registry.register(Box::new(image_download::DownloadImageTool));
+        registry.register(Box::new(image_download::BatchDownloadImageTool));
+        registry.register(Box::new(image_inspect::InspectImageTool));
+
+        // ── Package safety ───────────────────────────────────────────────
+        registry.register(Box::new(package_safety::PackageSafetyTool));
+
+        // ── Shell command execution ──────────────────────────────────────
+        registry.register(Box::new(shell::ShellCommandTool));
+
+        registry
+    }
+
+    fn register(&mut self, tool: Box<dyn Tool>) {
+        self.tools.insert(tool.name().to_string(), tool);
+    }
+
+    /// Get a tool by name.
+    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+        self.tools.get(name).map(|t| t.as_ref())
+    }
+
+    /// Execute a tool by name with the given arguments.
+    pub async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> ToolResult {
+        match self.get(name) {
+            Some(tool) => tool.execute(args, ctx).await,
+            None => ToolResult::err(format!("Unknown tool: {}", name)),
+        }
+    }
+
+    /// Get all tool definitions for the AI API.
+    pub fn tool_defs(&self) -> Vec<ToolDef> {
+        self.tools.values().map(|t| t.to_tool_def()).collect()
+    }
+
+    /// List all registered tool names.
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.tools.keys().map(|s| s.as_str()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_context() -> (std::path::PathBuf, ToolContext) {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("tool-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut settings = Settings::default();
+        settings.project_root = root.clone();
+        let context = ToolContext {
+            settings: Arc::new(settings),
+            cwd: root.clone(),
+        };
+        (root, context)
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_nested_directories() {
+        let (root, context) = test_context();
+        let registry = ToolRegistry::new(&context.settings);
+        let result = registry
+            .execute(
+                "write_file",
+                json!({ "path": "nested/deeper/file.txt", "content": "works" }),
+                &context,
+            )
+            .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            std::fs::read_to_string(root.join("nested/deeper/file.txt")).unwrap(),
+            "works"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn nonzero_shell_exit_is_a_failed_tool_result() {
+        let (root, context) = test_context();
+        let registry = ToolRegistry::new(&context.settings);
+        let command = if cfg!(windows) { "exit 7" } else { "exit 7" };
+        let result = registry
+            .execute("run_command", json!({ "command": command }), &context)
+            .await;
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or_default().contains('7'));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_download_cannot_escape_project() {
+        let (root, context) = test_context();
+        let registry = ToolRegistry::new(&context.settings);
+        let result = registry
+            .execute(
+                "download_image",
+                json!({
+                    "url": "https://example.invalid/image.png",
+                    "filename": "image",
+                    "output_dir": "../outside"
+                }),
+                &context,
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside the project sandbox")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn registry_exposes_only_implemented_tools() {
+        let settings = Settings::default();
+        let registry = ToolRegistry::new(&settings);
+        let names = registry.tool_names();
+        assert!(!names.contains(&"browser_click"));
+        assert!(!names.contains(&"browser_screenshot"));
+        assert!(!names.contains(&"cd"));
+    }
+}
