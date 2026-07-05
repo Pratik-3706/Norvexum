@@ -154,6 +154,7 @@ impl ToolRegistry {
         registry.register(Arc::new(web_search::WebSearchTool));
         registry.register(Arc::new(web_fetch::WebFetchTool));
         registry.register(Arc::new(image_search::ImageSearchTool));
+        registry.register(Arc::new(image_search::ZerochanSearchTool));
         registry.register(Arc::new(image_download::DownloadImageTool));
         registry.register(Arc::new(image_download::BatchDownloadImageTool));
         registry.register(Arc::new(image_inspect::InspectImageTool));

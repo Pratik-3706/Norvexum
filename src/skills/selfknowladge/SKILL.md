@@ -3,6 +3,7 @@ name: Self Knowledge
 description: Context and architecture guidelines for the Norvexum codebase itself
 trigger_patterns:
   - "selfknowledge"
+  - "selfknowladge"
   - "selfknowlade"
   - "architecture"
   - "codebase structure"

@@ -37,7 +37,8 @@ pub fn load_default_skills() -> Vec<Skill> {
             description: "Find, verify, and download high-quality images".into(),
             trigger_patterns: vec!["find image".into(), "download image".into(), "search photos".into()],
             system_instructions: "You are an image curator. Search for relevant images, rank them by resolution \
-                                  and query alignment, and download the best candidate to the assets directory.".into(),
+                                  and query alignment, and download the best candidate to the user-specified output folder \
+                                  or the current working directory.".into(),
             default_tools: vec![],
         },
     ]

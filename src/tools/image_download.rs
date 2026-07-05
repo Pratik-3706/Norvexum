@@ -31,8 +31,12 @@ async fn download_image_bytes(url: &str, referer: &str) -> eyre::Result<(Vec<u8>
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let ua = super::web_search::USER_AGENTS
-        [rand::Rng::random_range(&mut rand::rng(), 0..super::web_search::USER_AGENTS.len())];
+    let ua = if url.contains("zerochan.net") {
+        "Norvexum - ZerochanAPIUser"
+    } else {
+        super::web_search::USER_AGENTS
+            [rand::Rng::random_range(&mut rand::rng(), 0..super::web_search::USER_AGENTS.len())]
+    };
 
     let response = client
         .get(url)

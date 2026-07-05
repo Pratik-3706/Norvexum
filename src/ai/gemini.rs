@@ -120,13 +120,34 @@ impl GeminiClient {
 
     /// Convert tool definitions to Gemini function declarations.
     fn format_tools(&self, tools: &[ToolDef]) -> serde_json::Value {
+        fn convert_types_to_uppercase(val: &mut serde_json::Value) {
+            match val {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::String(t)) = map.get_mut("type") {
+                        *t = t.to_uppercase();
+                    }
+                    for v in map.values_mut() {
+                        convert_types_to_uppercase(v);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for v in arr {
+                        convert_types_to_uppercase(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let declarations: Vec<serde_json::Value> = tools
             .iter()
             .map(|t| {
+                let mut params = t.parameters.clone();
+                convert_types_to_uppercase(&mut params);
                 json!({
                     "name": t.name,
                     "description": t.description,
-                    "parameters": t.parameters
+                    "parameters": params
                 })
             })
             .collect();
