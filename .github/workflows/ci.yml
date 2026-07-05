@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  checks: write
+
 jobs:
   build:
     name: Build & Test
@@ -45,7 +49,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Generate Cargo.lock
-        run: cargo generate-lockfile
+        run: |
+          cargo generate-lockfile
+          cargo update -p time
       
       - name: Install cargo-audit
         uses: rustsec/audit-check@v2
