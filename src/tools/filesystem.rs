@@ -17,7 +17,13 @@ pub(super) fn resolve_path(path_str: &str, ctx: &ToolContext) -> Result<PathBuf,
         return Err("Path cannot be empty".to_string());
     }
 
-    let path = if Path::new(path_str).is_absolute() {
+    let path = if path_str == "~" {
+        dirs::home_dir().ok_or_else(|| "Could not resolve home directory".to_string())?
+    } else if path_str.starts_with("~/") || path_str.starts_with("~\\") {
+        dirs::home_dir()
+            .map(|h| h.join(&path_str[2..]))
+            .ok_or_else(|| "Could not resolve home directory".to_string())?
+    } else if Path::new(path_str).is_absolute() {
         PathBuf::from(path_str)
     } else {
         ctx.cwd.join(path_str)
@@ -266,7 +272,7 @@ impl Tool for EditFileTool {
             if !prefix_part.is_empty() {
                 prefix_part.push('\n');
             }
-            
+
             let mut suffix_part = lines[end..].join("\n");
             if !suffix_part.is_empty() && !original.ends_with('\n') {
                 // Keep the trailing newline structure
@@ -286,7 +292,7 @@ impl Tool for EditFileTool {
                 } else {
                     target_segment.replacen(target, replacement, 1)
                 };
-                
+
                 let mut final_content = format!("{}{}", prefix_part, modified_segment);
                 if !suffix_part.is_empty() {
                     final_content.push('\n');
@@ -312,7 +318,11 @@ impl Tool for EditFileTool {
             // Classic global text replace
             let target = match target_opt {
                 Some(t) => t,
-                None => return ToolResult::err("Target string is required if no line range is specified"),
+                None => {
+                    return ToolResult::err(
+                        "Target string is required if no line range is specified",
+                    );
+                }
             };
 
             if target.is_empty() {

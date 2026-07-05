@@ -36,7 +36,7 @@ graph TD
 Norvexum is designed for speed. If the AI requests multiple tool calls (e.g. reading three separate files and fetching a webpage), Norvexum executes them **concurrently** using `futures::join_all` and Tokio async wakers, rather than sequentially.
 
 ### 🛡️ Secure Workspace Sandbox
-Enforces strict canonical path verification. The agent cannot read, edit, copy, or write to any file outside the workspace root directory. Any attempt to traverse directories (e.g., using `../../`) is immediately blocked and returned as a sandboxing error.
+Enforces strict canonical path verification across all filesystem and shell execution tools. The agent cannot read, edit, copy, write, or execute paths outside the workspace root directory. For shell commands, the tool tokenizes the command line, resolving and validating every path-like argument (including command names, traversal sequences like `../../`, home directories `~/`, and `file://` URLs) against the project root. Safe commands execute directly without spawning a subshell, while unparseable commands or commands with shell metacharacters fall back to a shell under forced user approval. Critical binaries are hard-blocked using a strict command name denylist.
 
 ### 🌸 Dedicated Zerochan & DDG Clients
 *   **`zerochan_search`**: A dedicated API tag client for high-quality anime, game, manga, and fictional character illustrations. Supports multi-tag queries using comma separations (e.g. `Genshin Impact, Furina`). It handles tag-specific redirections and preserves JSON API parameters.

@@ -21,9 +21,7 @@ pub fn snapshot_file(project_root: &Path, file_path: &Path) -> Result<PathBuf> {
     let checkpoint_dir = next_checkpoint_dir(project_root)?;
 
     // Preserve relative path structure inside the checkpoint
-    let relative = file_path
-        .strip_prefix(project_root)
-        .unwrap_or(file_path);
+    let relative = file_path.strip_prefix(project_root).unwrap_or(file_path);
     let snapshot_path = checkpoint_dir.join(relative);
 
     if let Some(parent) = snapshot_path.parent() {

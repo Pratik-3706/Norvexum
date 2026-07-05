@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 pub struct ModelInfo {
     pub id: String,
     pub family: String,
-    pub multimodal: bool,      // Can accept image input (vision)
-    pub image_gen: bool,       // Can generate images
-    pub tool_calling: bool,    // Supports function/tool calling
-    pub streaming: bool,       // Supports streaming responses
-    pub context_window: usize, // Max tokens in context
+    pub multimodal: bool,        // Can accept image input (vision)
+    pub image_gen: bool,         // Can generate images
+    pub tool_calling: bool,      // Supports function/tool calling
+    pub streaming: bool,         // Supports streaming responses
+    pub context_window: usize,   // Max tokens in context
     pub cost_per_1k_input: f64,  // Cost per 1K input tokens (USD)
     pub cost_per_1k_output: f64, // Cost per 1K output tokens (USD)
 }

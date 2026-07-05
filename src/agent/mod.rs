@@ -209,12 +209,11 @@ impl Agent {
                                 }
                             }
                             "list" => {
-                                let sessions =
-                                    session::Session::list(&self.settings.project_root);
+                                let sessions = session::Session::list(&self.settings.project_root);
                                 if sessions.is_empty() {
-                                    let _ = self.event_tx.send(AgentEvent::Content(
-                                        "No saved sessions.".into(),
-                                    ));
+                                    let _ = self
+                                        .event_tx
+                                        .send(AgentEvent::Content("No saved sessions.".into()));
                                 } else {
                                     let list: Vec<String> = sessions
                                         .iter()
@@ -233,11 +232,10 @@ impl Agent {
                                 }
                             }
                             "clear" => {
-                                let _ =
-                                    session::Session::clear_all(&self.settings.project_root);
-                                let _ = self.event_tx.send(AgentEvent::Content(
-                                    "✅ All sessions cleared.".into(),
-                                ));
+                                let _ = session::Session::clear_all(&self.settings.project_root);
+                                let _ = self
+                                    .event_tx
+                                    .send(AgentEvent::Content("✅ All sessions cleared.".into()));
                             }
                             _ => {
                                 let _ = self.event_tx.send(AgentEvent::Content(
@@ -333,11 +331,14 @@ impl Agent {
                                 vec![format!("Available Models for {}:", current_provider)];
 
                             if current_provider == "ollama" {
-                                let ollama_url = self.settings
+                                let ollama_url = self
+                                    .settings
                                     .ollama_base_url
                                     .as_deref()
                                     .unwrap_or(crate::ai::ollama::DEFAULT_OLLAMA_URL);
-                                if let Some(models) = crate::ai::ollama::discover_models(ollama_url).await {
+                                if let Some(models) =
+                                    crate::ai::ollama::discover_models(ollama_url).await
+                                {
                                     for model in &models {
                                         let capabilities = format!(
                                             "{}{}{}",
@@ -351,7 +352,10 @@ impl Agent {
                                         ));
                                     }
                                 } else {
-                                    list.push("  (Ollama is unreachable or no local models installed)".to_string());
+                                    list.push(
+                                        "  (Ollama is unreachable or no local models installed)"
+                                            .to_string(),
+                                    );
                                 }
                             } else {
                                 let registry = crate::config::providers::build_registry();
@@ -521,10 +525,9 @@ impl Agent {
                             user_msg = Some(Message::user_with_image(user_input, b64, mime));
                         }
                         Err(e) => {
-                            let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                "Failed to load image: {}",
-                                e
-                            )));
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::Error(format!("Failed to load image: {}", e)));
                         }
                     }
                 } else if let Some(ocr_key) = &self.settings.ocr_space_api_key {
@@ -563,8 +566,13 @@ impl Agent {
         let final_msg = user_msg.unwrap_or_else(|| Message::user(user_input));
 
         // Check if user input triggers a skill template
-        if let Some(skill) = crate::skills::find_matching_skill(user_input, &self.settings.project_root) {
-            let _ = self.event_tx.send(AgentEvent::Status(format!("✨ Triggered skill: {}", skill.name)));
+        if let Some(skill) =
+            crate::skills::find_matching_skill(user_input, &self.settings.project_root)
+        {
+            let _ = self.event_tx.send(AgentEvent::Status(format!(
+                "✨ Triggered skill: {}",
+                skill.name
+            )));
             if let Some(system_msg) = self.messages.first_mut() {
                 if system_msg.role == Role::System {
                     let mut text = system_msg.text();
@@ -613,9 +621,7 @@ impl Agent {
             let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<AiStreamEvent>();
 
             let client = self.client.clone();
-            let stream_handle = async move {
-                client.chat_stream(request, stream_tx).await
-            };
+            let stream_handle = async move { client.chat_stream(request, stream_tx).await };
 
             // Process stream in background
             let event_tx = self.event_tx.clone();
@@ -744,7 +750,9 @@ impl Agent {
 
             // If no tool calls, we're done
             if !has_tool_calls {
-                let _ = self.event_tx.send(AgentEvent::Done { usage: Some(accumulated_usage.clone()) });
+                let _ = self.event_tx.send(AgentEvent::Done {
+                    usage: Some(accumulated_usage.clone()),
+                });
                 self.save_session();
                 return Ok(());
             }
@@ -756,11 +764,13 @@ impl Agent {
                     let name = tc.name.clone();
                     let id = tc.id.clone();
                     let args = match &tc.arguments {
-                        serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or(json!({})),
+                        serde_json::Value::String(s) => {
+                            serde_json::from_str(s).unwrap_or(json!({}))
+                        }
                         other => other.clone(),
                     };
 
-                    if self.settings.needs_approval(&name) {
+                    if tool_needs_approval(&self.settings, &name, &args) {
                         let _ = self.event_tx.send(AgentEvent::ApprovalRequest {
                             id: id.clone(),
                             tool_name: name.clone(),
@@ -832,8 +842,7 @@ impl Agent {
                     if name == "write_file" || name == "edit_file" {
                         if let Some(data) = &result.data {
                             if let Some(path) = data["path"].as_str() {
-                                let preview =
-                                    result.output.chars().take(200).collect::<String>();
+                                let preview = result.output.chars().take(200).collect::<String>();
                                 let _ = ev_tx.send(AgentEvent::FileWrite {
                                     path: path.to_string(),
                                     content_preview: preview,
@@ -870,11 +879,8 @@ impl Agent {
                         let err_msg = format!("Tool execution panicked: {}", e);
                         let _ = self.event_tx.send(AgentEvent::Error(err_msg.clone()));
                         // Still add a result so the model doesn't get confused
-                        self.messages.push(Message::tool_result(
-                            "error",
-                            "internal",
-                            err_msg,
-                        ));
+                        self.messages
+                            .push(Message::tool_result("error", "internal", err_msg));
                     }
                 }
             }
@@ -886,7 +892,9 @@ impl Agent {
             "Max thinking loops ({}) reached",
             max_loops
         )));
-        let _ = self.event_tx.send(AgentEvent::Done { usage: Some(accumulated_usage) });
+        let _ = self.event_tx.send(AgentEvent::Done {
+            usage: Some(accumulated_usage),
+        });
         self.save_session();
 
         Ok(())
@@ -1012,3 +1020,74 @@ fn detect_image(user_input: &str, project_root: &std::path::Path) -> Option<std:
 }
 
 use serde_json::json;
+
+fn tool_needs_approval(settings: &Settings, tool_name: &str, args: &serde_json::Value) -> bool {
+    let mut needs_app = settings.needs_approval(tool_name);
+    if tool_name == "run_command" {
+        let command_str = args["command"].as_str().unwrap_or("");
+        if crate::tools::shell::is_unparseable_or_fallback(command_str) {
+            needs_app = true;
+        }
+    }
+    needs_app
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_needs_approval() {
+        let mut settings = Settings::default();
+        settings.require_approval = vec!["run_command".to_string()];
+
+        // Default: run_command requires approval
+        assert!(tool_needs_approval(
+            &settings,
+            "run_command",
+            &json!({"command": "echo hello"})
+        ));
+        assert!(tool_needs_approval(
+            &settings,
+            "run_command",
+            &json!({"command": "echo hello | grep foo"})
+        ));
+        assert!(!tool_needs_approval(
+            &settings,
+            "read_file",
+            &json!({"path": "src/main.rs"})
+        ));
+
+        // Opted-out: run_command not in settings
+        settings.require_approval = vec![];
+
+        // Clean command runs without approval
+        assert!(!tool_needs_approval(
+            &settings,
+            "run_command",
+            &json!({"command": "echo hello"})
+        ));
+
+        // Fallback/metacharacter/wildcard commands always require approval
+        assert!(tool_needs_approval(
+            &settings,
+            "run_command",
+            &json!({"command": "echo hello | grep foo"})
+        ));
+        assert!(tool_needs_approval(
+            &settings,
+            "run_command",
+            &json!({"command": "echo 'hello"})
+        ));
+        assert!(tool_needs_approval(
+            &settings,
+            "run_command",
+            &json!({"command": "echo hello; ls"})
+        ));
+        assert!(tool_needs_approval(
+            &settings,
+            "run_command",
+            &json!({"command": "echo *.txt"})
+        ));
+    }
+}

@@ -21,9 +21,7 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
                 .sum::<usize>()
                 + m.tool_calls
                     .iter()
-                    .map(|tc| {
-                        tc.name.len() / 4 + tc.arguments.to_string().len() / 4
-                    })
+                    .map(|tc| tc.name.len() / 4 + tc.arguments.to_string().len() / 4)
                     .sum::<usize>()
         })
         .sum()

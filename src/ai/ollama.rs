@@ -7,7 +7,7 @@
 
 use serde::Deserialize;
 
-use crate::config::providers::{ModelInfo, ProviderInfo, ApiStyle};
+use crate::config::providers::{ApiStyle, ModelInfo, ProviderInfo};
 
 /// Default Ollama API base URL.
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
@@ -37,21 +37,21 @@ struct OllamaModelDetails {
 /// Returns None if Ollama is not running or unreachable.
 pub async fn discover_models(base_url: &str) -> Option<Vec<ModelInfo>> {
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
-    
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;
 
     let response = client.get(&url).send().await.ok()?;
-    
+
     if !response.status().is_success() {
         return None;
     }
 
     let tags: OllamaTagsResponse = response.json().await.ok()?;
     let models = tags.models?;
-    
+
     if models.is_empty() {
         return None;
     }
@@ -64,7 +64,7 @@ pub async fn discover_models(base_url: &str) -> Option<Vec<ModelInfo>> {
                 .as_ref()
                 .and_then(|d| d.family.clone())
                 .unwrap_or_else(|| extract_family(&m.name));
-            
+
             let is_vision = m.name.contains("llava")
                 || m.name.contains("vision")
                 || m.name.contains("bakllava")
@@ -92,7 +92,7 @@ pub async fn discover_models(base_url: &str) -> Option<Vec<ModelInfo>> {
 /// Build an Ollama provider entry with discovered models.
 pub async fn build_ollama_provider(base_url: &str) -> Option<ProviderInfo> {
     let models = discover_models(base_url).await?;
-    
+
     Some(ProviderInfo {
         name: "ollama".into(),
         display_name: "Ollama (Local)".into(),
@@ -109,9 +109,14 @@ pub async fn is_available(base_url: &str) -> bool {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build();
-    
+
     match client {
-        Ok(c) => c.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false),
+        Ok(c) => c
+            .get(&url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false),
         Err(_) => false,
     }
 }

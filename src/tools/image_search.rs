@@ -246,13 +246,45 @@ async fn fetch_zerochan_images(
     limit: usize,
 ) -> Option<Vec<ImageResult>> {
     let stop_words: std::collections::HashSet<&str> = [
-        "a", "an", "the", "cool", "website", "images", "image", "photo", "photos", "with", 
-        "having", "and", "or", "in", "on", "at", "to", "for", "make", "create", "find", 
-        "search", "show", "me", "beautiful", "elegant", "cute", "of", "some", "nice", "designed"
-    ].iter().cloned().collect();
+        "a",
+        "an",
+        "the",
+        "cool",
+        "website",
+        "images",
+        "image",
+        "photo",
+        "photos",
+        "with",
+        "having",
+        "and",
+        "or",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "make",
+        "create",
+        "find",
+        "search",
+        "show",
+        "me",
+        "beautiful",
+        "elegant",
+        "cute",
+        "of",
+        "some",
+        "nice",
+        "designed",
+    ]
+    .iter()
+    .cloned()
+    .collect();
 
     // Clean query of search operators, domain names, and the word "zerochan" itself
-    let cleaned = query.to_lowercase()
+    let cleaned = query
+        .to_lowercase()
         .replace("site:zerochan.net", "")
         .replace("site:zerochan.org", "")
         .replace("site:zerochan.com", "")
@@ -273,7 +305,9 @@ async fn fetch_zerochan_images(
     let tags: Vec<String> = raw_tags
         .into_iter()
         .map(|w| w.trim())
-        .filter(|w| !w.is_empty() && w.len() > 1 && !stop_words.contains(&w.to_lowercase().as_str()))
+        .filter(|w| {
+            !w.is_empty() && w.len() > 1 && !stop_words.contains(&w.to_lowercase().as_str())
+        })
         .map(|w| capitalize_tag(w))
         .collect();
 
@@ -394,7 +428,7 @@ async fn query_zerochan_raw(
                     } else {
                         loc_str.to_string()
                     };
-                    
+
                     // Zerochan redirects strip query parameters, so we must re-append them
                     let base_url = absolute_loc.split('?').next().unwrap_or(&absolute_loc);
                     current_url = format!("{}?json&l={}&s=fav", base_url, limit);

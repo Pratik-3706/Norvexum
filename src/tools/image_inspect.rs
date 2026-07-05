@@ -32,7 +32,9 @@ impl Tool for InspectImageTool {
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let path_str = args["path"].as_str().unwrap_or("");
-        let prompt_str = args["prompt"].as_str().unwrap_or("Describe this image in detail");
+        let prompt_str = args["prompt"]
+            .as_str()
+            .unwrap_or("Describe this image in detail");
 
         let path = match super::filesystem::resolve_path(path_str, ctx) {
             Ok(p) => p,
@@ -93,10 +95,7 @@ impl Tool for InspectImageTool {
             // Fallback: OCR space
             match vision::ocr_image(ocr_key, &path).await {
                 Ok(text) => ToolResult::ok_with_data(
-                    format!(
-                        "🖼️ Image OCR text extracted from {}:\n\n{}",
-                        path_str, text
-                    ),
+                    format!("🖼️ Image OCR text extracted from {}:\n\n{}", path_str, text),
                     json!({ "path": path.to_string_lossy(), "ocr_text": text }),
                 ),
                 Err(e) => ToolResult::err(format!("OCR failed: {}", e)),

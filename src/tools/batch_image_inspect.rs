@@ -97,11 +97,7 @@ impl Tool for BatchViewImageTool {
         if supports_vision {
             // Build a multi-image message
             let mut content_parts = vec![ContentPart::Text {
-                text: format!(
-                    "{}\n\nAnalyzing {} images:",
-                    prompt,
-                    resolved_paths.len()
-                ),
+                text: format!("{}\n\nAnalyzing {} images:", prompt, resolved_paths.len()),
             }];
 
             for (name, path) in &resolved_paths {
@@ -184,7 +180,10 @@ impl Tool for BatchViewImageTool {
         if !supports_vision || ocr_fallback {
             if let Some(ocr_key) = &ctx.settings.ocr_space_api_key {
                 let prefix = if ocr_fallback {
-                    format!("⚠️ Vision API failed ({}), falling back to OCR...\n\n", vision_error)
+                    format!(
+                        "⚠️ Vision API failed ({}), falling back to OCR...\n\n",
+                        vision_error
+                    )
                 } else {
                     String::new()
                 };
@@ -219,7 +218,10 @@ impl Tool for BatchViewImageTool {
 
         // If both failed or ocr key is missing
         let err_reason = if ocr_fallback {
-            format!("Vision API failed: {}. No OCR_SPACE_API_KEY set for fallback.", vision_error)
+            format!(
+                "Vision API failed: {}. No OCR_SPACE_API_KEY set for fallback.",
+                vision_error
+            )
         } else {
             "The current AI model does not support vision (image inputs), and no OCR_SPACE_API_KEY is configured.".to_string()
         };

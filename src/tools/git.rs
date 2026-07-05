@@ -108,7 +108,9 @@ impl Tool for GitCommitTool {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let message = args["message"].as_str().unwrap_or("Auto-commit by Norvexum");
+        let message = args["message"]
+            .as_str()
+            .unwrap_or("Auto-commit by Norvexum");
         let add_all = args["add_all"].as_bool().unwrap_or(true);
 
         if add_all {

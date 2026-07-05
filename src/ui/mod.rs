@@ -210,7 +210,12 @@ impl App {
                         let key = if is_write { "content" } else { "replacement" };
                         let content = extract_streaming_content(&entry.detail, key);
 
-                        if let Some(line) = self.chat_lines.iter_mut().rev().find(|l| l.tool_call_id == Some(id.clone())) {
+                        if let Some(line) = self
+                            .chat_lines
+                            .iter_mut()
+                            .rev()
+                            .find(|l| l.tool_call_id == Some(id.clone()))
+                        {
                             line.content = format!(
                                 "📝 Writing file `{}`:\n```\n{}\n```",
                                 path_display, content
@@ -246,8 +251,17 @@ impl App {
                 }
                 // Update final code block layout if write/edit tool completed
                 if name == "write_file" || name == "edit_file" {
-                    if let Some(line) = self.chat_lines.iter_mut().rev().find(|l| l.tool_call_id == Some(id.clone())) {
-                        let prefix = if success { "✅ Successfully wrote" } else { "❌ Failed to write" };
+                    if let Some(line) = self
+                        .chat_lines
+                        .iter_mut()
+                        .rev()
+                        .find(|l| l.tool_call_id == Some(id.clone()))
+                    {
+                        let prefix = if success {
+                            "✅ Successfully wrote"
+                        } else {
+                            "❌ Failed to write"
+                        };
                         let detail = compact_detail(&result, 120);
                         line.content = format!("{} to file:\n{}", prefix, detail);
                     }
@@ -264,7 +278,10 @@ impl App {
                 content_preview,
             } => {
                 self.chat_lines.push(ChatLine {
-                    content: format!("📝 Updated {path}\n{}", compact_detail(&content_preview, 160)),
+                    content: format!(
+                        "📝 Updated {path}\n{}",
+                        compact_detail(&content_preview, 160)
+                    ),
                     style: LineStyle::FileWrite,
                     tool_call_id: None,
                 });
@@ -379,10 +396,18 @@ impl App {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.show_tool_details = false;
                 }
-                KeyCode::Up => self.tool_details_scroll = self.tool_details_scroll.saturating_sub(1),
-                KeyCode::Down => self.tool_details_scroll = self.tool_details_scroll.saturating_add(1),
-                KeyCode::PageUp => self.tool_details_scroll = self.tool_details_scroll.saturating_sub(10),
-                KeyCode::PageDown => self.tool_details_scroll = self.tool_details_scroll.saturating_add(10),
+                KeyCode::Up => {
+                    self.tool_details_scroll = self.tool_details_scroll.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    self.tool_details_scroll = self.tool_details_scroll.saturating_add(1)
+                }
+                KeyCode::PageUp => {
+                    self.tool_details_scroll = self.tool_details_scroll.saturating_sub(10)
+                }
+                KeyCode::PageDown => {
+                    self.tool_details_scroll = self.tool_details_scroll.saturating_add(10)
+                }
                 _ => {}
             }
             return None;
@@ -399,7 +424,8 @@ impl App {
                 }
                 KeyCode::Down => {
                     if !self.tool_log.is_empty() {
-                        self.selected_tool_index = (self.selected_tool_index + 1).min(self.tool_log.len().saturating_sub(1));
+                        self.selected_tool_index = (self.selected_tool_index + 1)
+                            .min(self.tool_log.len().saturating_sub(1));
                     }
                 }
                 KeyCode::PageUp => {
@@ -407,7 +433,8 @@ impl App {
                 }
                 KeyCode::PageDown => {
                     if !self.tool_log.is_empty() {
-                        self.selected_tool_index = (self.selected_tool_index + 5).min(self.tool_log.len().saturating_sub(1));
+                        self.selected_tool_index = (self.selected_tool_index + 5)
+                            .min(self.tool_log.len().saturating_sub(1));
                     }
                 }
                 KeyCode::Enter => {
@@ -603,7 +630,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         let block = Block::default()
             .title(Span::styled(
                 " ⚠️  TOOL RUN APPROVAL ",
-                Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(border_color)
+                    .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
@@ -640,7 +669,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
             let block = Block::default()
                 .title(Span::styled(
                     format!(" 🔧  TOOL DETAILS: {} ", entry.name),
-                    Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(border_color)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border_color))
@@ -660,10 +691,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 ]),
                 Line::from(vec![
                     Span::styled("Status:    ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(status_str, Style::default().fg(border_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        status_str,
+                        Style::default()
+                            .fg(border_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::default(),
-                Line::from(Span::styled("DETAILS / OUTPUT:", Style::default().add_modifier(Modifier::BOLD).fg(app.theme.accent_color))),
+                Line::from(Span::styled(
+                    "DETAILS / OUTPUT:",
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(app.theme.accent_color),
+                )),
                 Line::default(),
             ];
 
@@ -728,10 +769,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(app.theme.fg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            token_info,
-            Style::default().fg(app.theme.dim_color),
-        ),
+        Span::styled(token_info, Style::default().fg(app.theme.dim_color)),
     ]);
     let state_color = if app.status == "Error" {
         app.theme.error_color
@@ -825,7 +863,11 @@ fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
         title,
         Style::default()
-            .fg(if app.active_panel == ActivePanel::Activity { app.theme.accent_color } else { app.theme.dim_color })
+            .fg(if app.active_panel == ActivePanel::Activity {
+                app.theme.accent_color
+            } else {
+                app.theme.dim_color
+            })
             .add_modifier(Modifier::BOLD),
     ))];
     lines.push(Line::default());
@@ -840,7 +882,7 @@ fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
     // Render all tools in reverse order (newest first)
     for (i, entry) in app.tool_log.iter().rev().enumerate() {
         let is_selected = app.active_panel == ActivePanel::Activity && i == app.selected_tool_index;
-        
+
         let (mark, color) = match entry.status {
             ToolStatus::Running => ("~", app.theme.tool_color),
             ToolStatus::Success => ("+", app.theme.success_color),
@@ -860,7 +902,12 @@ fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
         };
 
         lines.push(Line::from(vec![
-            Span::styled(cursor, Style::default().fg(app.theme.accent_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                cursor,
+                Style::default()
+                    .fg(app.theme.accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("{mark} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -1091,10 +1138,7 @@ pub async fn run_tui(
     .await;
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
 }
@@ -1159,9 +1203,7 @@ fn render_message(
             (
                 "  ",
                 heading,
-                Style::default()
-                    .fg(color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             )
         } else if let Some(heading) = raw.strip_prefix("## ") {
             (
@@ -1204,7 +1246,11 @@ fn render_message(
 
         // Handle numbered lists (e.g., "1. item")
         let (final_prefix, final_content) = if content.len() > 2
-            && content.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && content
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
         {
             if let Some(rest) = content.strip_prefix(|c: char| c.is_ascii_digit()) {
                 if let Some(rest) = rest.strip_prefix(". ") {
@@ -1254,11 +1300,7 @@ fn render_message(
 }
 
 /// Parse inline markdown: **bold**, *italic*, `code`, ~~strikethrough~~
-fn parse_inline_markdown(
-    text: &str,
-    base_style: Style,
-    _kind: LineStyle,
-) -> Vec<Span<'static>> {
+fn parse_inline_markdown(text: &str, base_style: Style, _kind: LineStyle) -> Vec<Span<'static>> {
     // For performance, if there's no markdown formatting, return as-is
     if !text.contains('*') && !text.contains('`') && !text.contains('~') {
         return vec![Span::styled(text.to_string(), base_style)];
@@ -1274,10 +1316,7 @@ fn parse_inline_markdown(
         // Bold: **text**
         if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
             if !current.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut current),
-                    base_style,
-                ));
+                spans.push(Span::styled(std::mem::take(&mut current), base_style));
             }
             i += 2;
             let mut bold_text = String::new();
@@ -1296,10 +1335,7 @@ fn parse_inline_markdown(
         // Inline code: `text`
         else if chars[i] == '`' {
             if !current.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut current),
-                    base_style,
-                ));
+                spans.push(Span::styled(std::mem::take(&mut current), base_style));
             }
             i += 1;
             let mut code_text = String::new();
@@ -1321,10 +1357,7 @@ fn parse_inline_markdown(
         // Italic: *text*
         else if chars[i] == '*' {
             if !current.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut current),
-                    base_style,
-                ));
+                spans.push(Span::styled(std::mem::take(&mut current), base_style));
             }
             i += 1;
             let mut italic_text = String::new();
@@ -1343,10 +1376,7 @@ fn parse_inline_markdown(
         // Strikethrough: ~~text~~
         else if i + 1 < len && chars[i] == '~' && chars[i + 1] == '~' {
             if !current.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut current),
-                    base_style,
-                ));
+                spans.push(Span::styled(std::mem::take(&mut current), base_style));
             }
             i += 2;
             let mut strike_text = String::new();
@@ -1460,12 +1490,28 @@ fn extract_streaming_content(json_accumulated: &str, key: &str) -> String {
                 if c == '\\' {
                     if let Some(next_c) = chars.peek() {
                         match next_c {
-                            'n' => { result.push('\n'); chars.next(); }
-                            't' => { result.push('\t'); chars.next(); }
-                            'r' => { chars.next(); }
-                            '"' => { result.push('"'); chars.next(); }
-                            '\\' => { result.push('\\'); chars.next(); }
-                            _ => { result.push(c); }
+                            'n' => {
+                                result.push('\n');
+                                chars.next();
+                            }
+                            't' => {
+                                result.push('\t');
+                                chars.next();
+                            }
+                            'r' => {
+                                chars.next();
+                            }
+                            '"' => {
+                                result.push('"');
+                                chars.next();
+                            }
+                            '\\' => {
+                                result.push('\\');
+                                chars.next();
+                            }
+                            _ => {
+                                result.push(c);
+                            }
                         }
                     } else {
                         result.push(c);
@@ -1526,7 +1572,8 @@ mod tests {
 
     #[test]
     fn inline_markdown_parses_bold() {
-        let spans = parse_inline_markdown("hello **world**", Style::default(), LineStyle::Assistant);
+        let spans =
+            parse_inline_markdown("hello **world**", Style::default(), LineStyle::Assistant);
         assert!(spans.len() >= 2);
     }
 

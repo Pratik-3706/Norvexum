@@ -130,10 +130,7 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
                     }
                     AgentEvent::Done { usage } => {
                         if let Some(u) = usage {
-                            println!(
-                                "\n--- Done ({} tokens) ---",
-                                u.total_tokens
-                            );
+                            println!("\n--- Done ({} tokens) ---", u.total_tokens);
                         } else {
                             println!("\n--- Done ---");
                         }

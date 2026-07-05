@@ -77,7 +77,7 @@ impl Default for Settings {
             browser_timeout_secs: 30,
             max_thinking_loops: 25,
             max_content_chars: 12000,
-            require_approval: vec![], // Empty = no approval required by default
+            require_approval: vec!["run_command".to_string()],
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }

@@ -4,8 +4,8 @@
 
 use super::{Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
-use serde_json::json;
 use base64::Engine;
+use serde_json::json;
 
 pub struct GenerateImageTool;
 
@@ -24,17 +24,17 @@ impl Tool for GenerateImageTool {
         json!({
             "type": "object",
             "properties": {
-                "prompt": { 
-                    "type": "string", 
-                    "description": "Extremely detailed description of the image to generate. Include style, colors, lighting, subject matter, and details." 
+                "prompt": {
+                    "type": "string",
+                    "description": "Extremely detailed description of the image to generate. Include style, colors, lighting, subject matter, and details."
                 },
-                "filename": { 
-                    "type": "string", 
-                    "description": "Base filename to save the generated image (without extension, e.g., 'furina_artwork')" 
+                "filename": {
+                    "type": "string",
+                    "description": "Base filename to save the generated image (without extension, e.g., 'furina_artwork')"
                 },
-                "output_dir": { 
-                    "type": "string", 
-                    "description": "Output directory relative to project root (default: current dir)" 
+                "output_dir": {
+                    "type": "string",
+                    "description": "Output directory relative to project root (default: current dir)"
                 },
                 "width": { "type": "integer", "description": "Width of the generated image (default: 1024)" },
                 "height": { "type": "integer", "description": "Height of the generated image (default: 1024)" }
@@ -74,12 +74,17 @@ impl Tool for GenerateImageTool {
                 if res.images.is_empty() {
                     return ToolResult::err("Provider returned no images");
                 }
-                
+
                 // Get the first generated image
                 let (base64_data, mime) = &res.images[0];
                 let decoded = match base64::engine::general_purpose::STANDARD.decode(base64_data) {
                     Ok(bytes) => bytes,
-                    Err(e) => return ToolResult::err(format!("Failed to decode base64 image data: {}", e)),
+                    Err(e) => {
+                        return ToolResult::err(format!(
+                            "Failed to decode base64 image data: {}",
+                            e
+                        ));
+                    }
                 };
 
                 let ext = match mime.as_str() {
@@ -103,7 +108,9 @@ impl Tool for GenerateImageTool {
                         ToolResult::ok_with_data(
                             format!(
                                 "✅ Successfully generated image using {} ({}) and saved to {}",
-                                res.provider, res.model, filepath.display()
+                                res.provider,
+                                res.model,
+                                filepath.display()
                             ),
                             json!({
                                 "path": filepath.to_string_lossy(),
@@ -114,7 +121,9 @@ impl Tool for GenerateImageTool {
                             }),
                         )
                     }
-                    Err(e) => ToolResult::err(format!("Failed to write generated image to disk: {}", e)),
+                    Err(e) => {
+                        ToolResult::err(format!("Failed to write generated image to disk: {}", e))
+                    }
                 }
             }
             Err(e) => ToolResult::err(format!("Image generation failed: {}", e)),

@@ -95,7 +95,7 @@ pub fn parse_skill_markdown(content: &str) -> Option<Skill> {
                     description = v;
                 } else if k == "trigger_patterns" && !v.is_empty() {
                     if v.starts_with('[') && v.ends_with(']') {
-                        let parsed: Vec<String> = v[1..v.len()-1]
+                        let parsed: Vec<String> = v[1..v.len() - 1]
                             .split(',')
                             .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
                             .collect();
