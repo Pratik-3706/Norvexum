@@ -494,7 +494,15 @@ impl Agent {
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
                         return Ok(());
                     }
-                    _ => {}
+                    _ => {
+                        let unknown_cmd = parts[0];
+                        let msg = format!(
+                            "❌ Unknown slash command: **{unknown_cmd}**.\nType `/help` to view the list of available commands."
+                        );
+                        let _ = self.event_tx.send(AgentEvent::Error(msg));
+                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+                        return Ok(());
+                    }
                 }
             }
         }
