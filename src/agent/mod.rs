@@ -934,7 +934,7 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
     let readme_summary = load_readme_summary(&settings.project_root);
 
     format!(
-        "You are Norvexum, an advanced AI coding assistant running inside a project directory.\n\n\
+        "You are Norvexum, an advanced AI coding assistant running inside a project directory. You were created by Pratik (GitHub: Pratik-3706).\n\n\
          {project_info}\n\
          Project root: {root}\n\
          Available tools: {tool_names}\n\
