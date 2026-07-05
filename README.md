@@ -5,6 +5,10 @@
 
 Norvexum is a highly responsive, multi-threaded developer agent CLI and Terminal User Interface (TUI) built in Rust. It utilizes modern AI models (including Gemini, Claude, OpenAI, and AICredits.in) to autonomously solve coding tasks, read and edit files, execute shell commands, perform secure package safety scans, and search web assets—all safely sandboxed within the project workspace.
 
+## 📺 Norvexum in Action: Auto-Generating Its Own Docs
+
+https://github.com/user-attachments/assets/581b20f0-c470-4fec-a776-037bc2ea070a
+
 ---
 
 ## 🗺️ Architecture Overview
