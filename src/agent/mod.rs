@@ -951,10 +951,10 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          - For batch image analysis, use batch_view_images (up to 10 at once)\n\
          - Use git tools (git_status, git_diff, git_commit, git_log) for version control\n\
          - Be concise but thorough in your responses\n\
-         - If generating images, decide whether to generate (create) or search (find existing)\n\
-         - For fictional/anime/game character images, use zerochan_search. Format the query with comma-separated tags (e.g., 'Genshin Impact, Furina') to target Zerochan's tagging system precisely.\n\
-         - For other standard images, real-world photos, and standard web graphics, use image_search.\n\
-         - Save/download images to the user's desired/requested folder or the current working directory, not a hardcoded 'assets' folder\n",
+         - If the user asks to generate, create, or make an image, use the generate_image tool.\n\
+         - For finding or searching existing fictional/anime/game character images, use zerochan_search. Format the query with comma-separated tags (e.g., 'Genshin Impact, Furina') to target Zerochan's tagging system precisely.\n\
+         - For other standard existing images, real-world photos, and web graphics, use image_search.\n\
+         - Save/download/generate images to the user's desired/requested folder or the current working directory, not a hardcoded 'assets' folder\n",
         root = settings.project_root.display(),
         readme = readme_summary,
     )

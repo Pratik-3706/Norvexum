@@ -110,7 +110,7 @@ The agent has access to a comprehensive suite of registered developer tools:
 
 *   **Filesystem**: `read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_files`, `touch`, `remove_file`, `move_file`, `copy_file`, `pwd`.
 *   **Web Operations**: `web_search` (Tavily search client), `web_fetch` (markdown scraper).
-*   **Media**: `image_search` (DDG), `zerochan_search` (Zerochan Tag API), `download_image`, `batch_download_images`, `view_image`.
+*   **Media**: `generate_image` (Gemini/Pollinations/DALL-E 3 unified generator), `image_search` (DDG), `zerochan_search` (Zerochan Tag API), `download_image`, `batch_download_images`, `view_image`.
 *   **Execution**: `run_command` (shell task runner with TUI interactive turn approvals), `check_package` (OSV vulnerability protection shield).
 *   **VCS**: `git_status`, `git_diff`, `git_commit`, `git_log`.
 
