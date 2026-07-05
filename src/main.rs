@@ -1,7 +1,5 @@
-// ═══════════════════════════════════════════════════════════════════════════
-// Norvexum — Advanced Agentic CLI
-// Entry point: CLI parsing, runtime bootstrap, project sandbox guard.
-// ═══════════════════════════════════════════════════════════════════════════
+#![allow(unused)]
+#![allow(clippy::all)]
 
 mod agent;
 mod ai;
