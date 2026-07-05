@@ -978,7 +978,7 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          - Use tools to accomplish tasks — don't just describe what you'd do\n\
          - For web content, prefer web_fetch. Use browser_open only when blocked\n\
          - Check packages for safety before installing (check_package tool)\n\
-         - Create Python venvs when pip packages are needed\n\
+         - Create Python venvs **inside** the project directory (e.g., `./.venv` or `./pdfenv`). Never create or reference paths outside the project root (such as `../.venv`), as they will be blocked by the security sandbox.\n\
          - When an image is relevant, check if you can see it (vision) or use OCR\n\
          - For batch image analysis, use batch_view_images (up to 10 at once)\n\
          - Use git tools (git_status, git_diff, git_commit, git_log) for version control\n\

@@ -25,16 +25,32 @@ pub fn is_unparseable_or_fallback(command_str: &str) -> bool {
     }
 }
 
+fn contains_single_ampersand(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i] == '&' {
+            let prev_is_amp = i > 0 && chars[i - 1] == '&';
+            let next_is_amp = i + 1 < chars.len() && chars[i + 1] == '&';
+            if !prev_is_amp && !next_is_amp {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn has_shell_metacharacters(command_str: &str) -> bool {
     command_str.contains('|')
         || command_str.contains(';')
         || command_str.contains("&&")
         || command_str.contains('>')
+        || command_str.contains('<')
+        || command_str.contains('$')
         || command_str.contains('`')
-        || command_str.contains("$(")
         || command_str.contains('*')
         || command_str.contains('?')
         || command_str.contains('[')
+        || contains_single_ampersand(command_str)
 }
 
 fn is_url_with_non_file_scheme(s: &str) -> bool {
@@ -149,6 +165,19 @@ fn handle_output(output_res: std::io::Result<std::process::Output>) -> ToolResul
     }
 }
 
+fn check_raw_command_paths(command_str: &str, ctx: &ToolContext) -> Result<(), String> {
+    let words = command_str.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '=');
+    for word in words {
+        let clean = clean_path_string(word.trim());
+        if !clean.is_empty() && looks_like_path(clean) {
+            if let Err(e) = super::filesystem::resolve_path(clean, ctx) {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub struct ShellCommandTool;
 
 #[async_trait]
@@ -179,6 +208,28 @@ impl Tool for ShellCommandTool {
         }
 
         let parsed_argv = shlex::split(command_str);
+
+        // 1. Hard denylist block first
+        if let Some(ref argv) = parsed_argv {
+            if !argv.is_empty() {
+                let cmd_name = get_command_name(&argv[0]);
+                if is_denylisted(&cmd_name) {
+                    return ToolResult::err(format!(
+                        "⚠️ Command blocked: execution of '{}' is restricted for security.",
+                        cmd_name
+                    ));
+                }
+            }
+        }
+
+        // 2. Check raw command strings for Windows path escapes (catches shlex stripping backslashes)
+        if let Err(e) = check_raw_command_paths(command_str, ctx) {
+            return ToolResult::err(format!(
+                "⚠️ Command blocked: directory escape attempt detected.\n{}",
+                e
+            ));
+        }
+
         let fallback = is_unparseable_or_fallback(command_str)
             || parsed_argv
                 .as_ref()
@@ -189,14 +240,6 @@ impl Tool for ShellCommandTool {
         if let Some(ref argv) = parsed_argv {
             if !argv.is_empty() {
                 let cmd_name = get_command_name(&argv[0]);
-
-                // 1. Hard denylist block
-                if is_denylisted(&cmd_name) {
-                    return ToolResult::err(format!(
-                        "⚠️ Command blocked: execution of '{}' is restricted for security.",
-                        cmd_name
-                    ));
-                }
 
                 // 2. Standalone cd interception
                 if cmd_name == "cd" {
