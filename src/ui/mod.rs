@@ -54,6 +54,7 @@ pub struct App {
     pub selected_tool_index: usize,
     pub show_tool_details: bool,
     pub tool_details_scroll: u16,
+    pub active_skill: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +134,7 @@ impl App {
             selected_tool_index: 0,
             show_tool_details: false,
             tool_details_scroll: 0,
+            active_skill: None,
         }
     }
 
@@ -290,6 +292,7 @@ impl App {
             AgentEvent::Done { usage } => {
                 self.is_processing = false;
                 self.is_thinking = false;
+                self.active_skill = None;
                 if let Some(ref u) = usage {
                     self.total_tokens_used += u.total_tokens as u64;
                     self.prompt_tokens_used += u.prompt_tokens as u64;
@@ -314,6 +317,7 @@ impl App {
                 });
                 self.is_processing = false;
                 self.is_thinking = false;
+                self.active_skill = None;
                 self.status = "Error".into();
                 self.auto_scroll();
             }
@@ -336,6 +340,9 @@ impl App {
                     tool_name,
                     args_preview,
                 });
+            }
+            AgentEvent::TriggeredSkill(name) => {
+                self.active_skill = Some(name);
             }
         }
     }
@@ -755,7 +762,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
 
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(
             " NORVEXUM ",
             Style::default()
@@ -769,8 +776,23 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(app.theme.fg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(token_info, Style::default().fg(app.theme.dim_color)),
-    ]);
+    ];
+
+    if let Some(ref skill) = app.active_skill {
+        title_spans.push(Span::styled(
+            format!("  │ Skill: {}", skill),
+            Style::default()
+                .fg(app.theme.accent_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    title_spans.push(Span::styled(
+        token_info,
+        Style::default().fg(app.theme.dim_color),
+    ));
+
+    let title = Line::from(title_spans);
     let state_color = if app.status == "Error" {
         app.theme.error_color
     } else if app.is_processing {

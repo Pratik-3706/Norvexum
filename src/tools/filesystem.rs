@@ -24,7 +24,19 @@ pub(super) fn resolve_path(path_str: &str, ctx: &ToolContext) -> Result<PathBuf,
             .map(|h| h.join(&path_str[2..]))
             .ok_or_else(|| "Could not resolve home directory".to_string())?
     } else if Path::new(path_str).is_absolute() {
-        PathBuf::from(path_str)
+        // On Windows, if a path starts with a single slash/backslash (e.g. \test or /test)
+        // and doesn't specify a drive letter or UNC prefix, it is drive-relative.
+        // We should resolve it relative to CWD instead of drive root to maintain sandbox containment.
+        if cfg!(windows)
+            && (path_str.starts_with('/') || path_str.starts_with('\\'))
+            && !path_str.starts_with("//")
+            && !path_str.starts_with("\\\\")
+            && !path_str.chars().nth(1).map(|c| c == ':').unwrap_or(false)
+        {
+            ctx.cwd.join(path_str.trim_start_matches(['/', '\\']))
+        } else {
+            PathBuf::from(path_str)
+        }
     } else {
         ctx.cwd.join(path_str)
     };

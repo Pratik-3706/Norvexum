@@ -70,6 +70,8 @@ pub enum AgentEvent {
         tool_name: String,
         args_preview: String,
     },
+    /// Dynamic skill triggered
+    TriggeredSkill(String),
 }
 
 /// The core agent that orchestrates AI ↔ Tool interaction.
@@ -84,6 +86,10 @@ pub struct Agent {
     approval_rx: Option<mpsc::UnboundedReceiver<bool>>,
     /// Sender side stored so the UI can clone it
     approval_tx: mpsc::UnboundedSender<bool>,
+    /// Flag to dynamically disable tool approvals check
+    pub approval_disabled: bool,
+    /// Maximum thinking loop cycle limit
+    pub max_loops: usize,
 }
 
 impl Agent {
@@ -97,6 +103,7 @@ impl Agent {
         let messages = vec![Message::system(system)];
 
         let (approval_tx, approval_rx) = mpsc::unbounded_channel();
+        let max_loops = settings.max_thinking_loops;
 
         Ok(Self {
             client,
@@ -107,6 +114,8 @@ impl Agent {
             session: None,
             approval_rx: Some(approval_rx),
             approval_tx,
+            approval_disabled: false,
+            max_loops,
         })
     }
 
@@ -125,6 +134,8 @@ impl Agent {
                         let msg = vec![
                             "📖 **Norvexum Interactive Chat Commands:**",
                             "  `/help`                 - Show this help message",
+                            "  `/ask_perms <on/off>`   - Toggle interactive tool run approval checks on/off",
+                            "  `/loops <num>`          - Set the maximum thinking loop cycle limit",
                             "  `/clear`                - Clear TUI chat log & conversation memory",
                             "  `/copy`                 - Copy the last AI response to system clipboard",
                             "  `/copy chat`            - Copy the entire conversation history to clipboard",
@@ -141,6 +152,67 @@ impl Agent {
                             "💡 *Tip: Drag-select text in the chat to copy it to clipboard.*",
                         ].join("\n");
                         let _ = self.event_tx.send(AgentEvent::Content(msg));
+                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+                        return Ok(());
+                    }
+                    "/ask_perms" => {
+                        if parts.len() > 1 {
+                            match parts[1] {
+                                "off" => {
+                                    self.approval_disabled = true;
+                                    let _ = self.event_tx.send(AgentEvent::Status("🔓 Dynamic tool approval requirements disabled (warning: commands will execute automatically).".into()));
+                                }
+                                "on" => {
+                                    self.approval_disabled = false;
+                                    let _ = self.event_tx.send(AgentEvent::Status(
+                                        "🔒 Dynamic tool approval requirements enabled.".into(),
+                                    ));
+                                }
+                                _ => {
+                                    let _ = self.event_tx.send(AgentEvent::Error(
+                                        "Usage: `/ask_perms <on/off>`".into(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            let status = if self.approval_disabled {
+                                "OFF (Auto-approve)"
+                            } else {
+                                "ON (Interactive)"
+                            };
+                            let _ = self.event_tx.send(AgentEvent::Content(format!(
+                                "Current tool approval state: {}\nUsage: `/ask_perms <on/off>`",
+                                status
+                            )));
+                        }
+                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+                        return Ok(());
+                    }
+                    "/loops" => {
+                        if parts.len() > 1 {
+                            if let Ok(num) = parts[1].parse::<usize>() {
+                                if num > 0 {
+                                    self.max_loops = num;
+                                    let _ = self.event_tx.send(AgentEvent::Status(format!(
+                                        "🔄 Maximum thinking loop cycles set to {}.",
+                                        num
+                                    )));
+                                } else {
+                                    let _ = self.event_tx.send(AgentEvent::Error(
+                                        "Loop limit must be greater than 0".into(),
+                                    ));
+                                }
+                            } else {
+                                let _ = self
+                                    .event_tx
+                                    .send(AgentEvent::Error("Usage: `/loops <num>`".into()));
+                            }
+                        } else {
+                            let _ = self.event_tx.send(AgentEvent::Content(format!(
+                                "Current thinking loop cycle limit: {}\nUsage: `/loops <num>`",
+                                self.max_loops
+                            )));
+                        }
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
                         return Ok(());
                     }
@@ -569,6 +641,9 @@ impl Agent {
         if let Some(skill) =
             crate::skills::find_matching_skill(user_input, &self.settings.project_root)
         {
+            let _ = self
+                .event_tx
+                .send(AgentEvent::TriggeredSkill(skill.name.clone()));
             let _ = self.event_tx.send(AgentEvent::Status(format!(
                 "✨ Triggered skill: {}",
                 skill.name
@@ -597,7 +672,7 @@ impl Agent {
             self.messages = compaction::compact(&self.messages, 4);
         }
 
-        let max_loops = self.settings.max_thinking_loops;
+        let max_loops = self.max_loops;
 
         let mut accumulated_usage = UsageStats {
             prompt_tokens: 0,
@@ -612,8 +687,17 @@ impl Agent {
                 max_loops
             )));
 
+            let mut active_messages = self.messages.clone();
+            if loop_num >= max_loops.saturating_sub(2) {
+                active_messages.push(Message::system(format!(
+                    "⚠️ SYSTEM WARNING: You are on cycle {} of {}. You are about to reach the loop limit. \
+                     You MUST stop calling tools now, summarize your current progress, and ask the user to type 'continue' to let you proceed in the next turn.",
+                    loop_num + 1, max_loops
+                )));
+            }
+
             // Create AI request with current conversation + tools
-            let request = AiRequest::new(self.messages.clone())
+            let request = AiRequest::new(active_messages)
                 .with_tools(self.tools.tool_defs())
                 .with_temperature(0.7);
 
@@ -770,7 +854,8 @@ impl Agent {
                         other => other.clone(),
                     };
 
-                    if tool_needs_approval(&self.settings, &name, &args) {
+                    if !self.approval_disabled && tool_needs_approval(&self.settings, &name, &args)
+                    {
                         let _ = self.event_tx.send(AgentEvent::ApprovalRequest {
                             id: id.clone(),
                             tool_name: name.clone(),
@@ -972,6 +1057,7 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          {skills}\n\
          {readme}\n\
          RULES:\n\
+         - BEFORE calling any tool to perform a major action (such as executing shell commands with run_command, writing/editing files, or git operations), you MUST first output a brief status update explaining what you're about to do, ask the user for 'continue' to proceed, and finish your current turn WITHOUT calling the tools. Only execute the tools in the next turn once the user replies with 'continue' (or says go ahead).\n\
          - You can ONLY access files within the project directory (sandbox)\n\
          - Think step by step before acting\n\
          - When writing files, always show what you're writing\n\

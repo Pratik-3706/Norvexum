@@ -66,8 +66,23 @@ fn is_url_with_non_file_scheme(s: &str) -> bool {
 }
 
 fn looks_like_path(s: &str) -> bool {
-    (s.contains('/') || s.contains('\\') || s.starts_with('.') || s.starts_with('~'))
+    if (s.contains('/') || s.contains('\\') || s.starts_with('.') || s.starts_with('~'))
         && !is_url_with_non_file_scheme(s)
+    {
+        // On Windows, ignore forward-slash command line switches (e.g. /c, /all, /fo)
+        if cfg!(windows)
+            && s.starts_with('/')
+            && s.len() > 1
+            && !s[1..].contains('/')
+            && !s[1..].contains('\\')
+            && !s[1..].contains('.')
+        {
+            return false;
+        }
+        true
+    } else {
+        false
+    }
 }
 
 fn clean_path_string(s: &str) -> &str {
