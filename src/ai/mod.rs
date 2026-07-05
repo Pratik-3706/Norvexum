@@ -2,12 +2,13 @@
 // AI — Multi-provider AI client layer
 //
 // Unified trait for chat completions, tool calling, streaming, vision,
-// and image generation across all providers.
+// and image generation across all providers including Ollama (local).
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub mod anthropic;
 pub mod gemini;
 pub mod image_gen;
+pub mod ollama;
 pub mod openai_compat;
 pub mod types;
 
@@ -51,6 +52,23 @@ pub trait AiClient: Send + Sync {
 
 /// Build the appropriate AI client based on settings.
 pub fn build_client(settings: &Settings) -> Result<Box<dyn AiClient>> {
+    // Special handling for Ollama — doesn't need a traditional provider lookup
+    if settings.active_provider == "ollama" {
+        let base_url = settings
+            .ollama_base_url
+            .as_deref()
+            .unwrap_or(ollama::DEFAULT_OLLAMA_URL);
+
+        // Ollama uses OpenAI-compatible API at /v1
+        let api_url = format!("{}/v1", base_url.trim_end_matches('/'));
+        return Ok(Box::new(openai_compat::OpenAiCompatClient::new(
+            api_url,
+            "ollama".to_string(), // Ollama doesn't need a real API key
+            settings.active_model.clone(),
+            None, // Model info will be discovered dynamically
+        )));
+    }
+
     let provider = find_provider(&settings.active_provider)
         .ok_or_else(|| eyre::eyre!("Unknown provider: {}", settings.active_provider))?;
 

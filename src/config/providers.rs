@@ -14,6 +14,8 @@ pub struct ModelInfo {
     pub tool_calling: bool,    // Supports function/tool calling
     pub streaming: bool,       // Supports streaming responses
     pub context_window: usize, // Max tokens in context
+    pub cost_per_1k_input: f64,  // Cost per 1K input tokens (USD)
+    pub cost_per_1k_output: f64, // Cost per 1K output tokens (USD)
 }
 
 /// Describes an AI provider endpoint.
@@ -57,6 +59,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 200_000,
+                    cost_per_1k_input: 0.003,
+                    cost_per_1k_output: 0.015,
                 },
                 ModelInfo {
                     id: "anthropic/claude-3-5-haiku".into(),
@@ -66,6 +70,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 200_000,
+                    cost_per_1k_input: 0.0008,
+                    cost_per_1k_output: 0.004,
                 },
                 ModelInfo {
                     id: "anthropic/claude-3-haiku".into(),
@@ -75,6 +81,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 200_000,
+                    cost_per_1k_input: 0.00025,
+                    cost_per_1k_output: 0.00125,
                 },
                 ModelInfo {
                     id: "moonshotai/kimi-k2.6".into(),
@@ -84,6 +92,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 128_000,
+                    cost_per_1k_input: 0.001,
+                    cost_per_1k_output: 0.002,
                 },
                 ModelInfo {
                     id: "deepseek/deepseek-v4-pro".into(),
@@ -93,15 +103,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 128_000,
-                },
-                ModelInfo {
-                    id: "deepseek/deepseek-chat".into(),
-                    family: "deepseek".into(),
-                    multimodal: false,
-                    image_gen: false,
-                    tool_calling: true,
-                    streaming: true,
-                    context_window: 128_000,
+                    cost_per_1k_input: 0.00014,
+                    cost_per_1k_output: 0.00028,
                 },
                 ModelInfo {
                     id: "deepseek/deepseek-reasoner".into(),
@@ -111,6 +114,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: false,
                     streaming: true,
                     context_window: 64_000,
+                    cost_per_1k_input: 0.00055,
+                    cost_per_1k_output: 0.00219,
                 },
                 ModelInfo {
                     id: "minimax/minimax-m3".into(),
@@ -120,6 +125,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 128_000,
+                    cost_per_1k_input: 0.00015,
+                    cost_per_1k_output: 0.0003,
                 },
                 ModelInfo {
                     id: "google/gemini-2.5-flash".into(),
@@ -129,6 +136,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 1_000_000,
+                    cost_per_1k_input: 0.000075,
+                    cost_per_1k_output: 0.0003,
                 },
                 ModelInfo {
                     id: "z-ai/glm-5.1".into(),
@@ -138,6 +147,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 128_000,
+                    cost_per_1k_input: 0.0001,
+                    cost_per_1k_output: 0.0002,
                 },
                 ModelInfo {
                     id: "z-ai/glm-4.5".into(),
@@ -147,6 +158,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 128_000,
+                    cost_per_1k_input: 0.0001,
+                    cost_per_1k_output: 0.0002,
                 },
             ],
         },
@@ -166,6 +179,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 1_000_000,
+                    cost_per_1k_input: 0.0,
+                    cost_per_1k_output: 0.0,
                 },
                 ModelInfo {
                     id: "gemini-3.1-flash-lite".into(),
@@ -175,6 +190,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 1_000_000,
+                    cost_per_1k_input: 0.0,
+                    cost_per_1k_output: 0.0,
                 },
                 ModelInfo {
                     id: "gemini-2.5-flash".into(),
@@ -184,6 +201,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 1_000_000,
+                    cost_per_1k_input: 0.0,
+                    cost_per_1k_output: 0.0,
                 },
                 ModelInfo {
                     id: "gemini-3.1-flash-image".into(),
@@ -193,6 +212,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 1_000_000,
+                    cost_per_1k_input: 0.0,
+                    cost_per_1k_output: 0.0,
                 },
             ],
         },
@@ -212,6 +233,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 128_000,
+                    cost_per_1k_input: 0.0025,
+                    cost_per_1k_output: 0.010,
                 },
                 ModelInfo {
                     id: "gpt-4o-mini".into(),
@@ -221,6 +244,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 128_000,
+                    cost_per_1k_input: 0.00015,
+                    cost_per_1k_output: 0.0006,
                 },
             ],
         },
@@ -240,6 +265,8 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 200_000,
+                    cost_per_1k_input: 0.003,
+                    cost_per_1k_output: 0.015,
                 },
                 ModelInfo {
                     id: "claude-3-5-haiku-latest".into(),
@@ -249,6 +276,41 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     tool_calling: true,
                     streaming: true,
                     context_window: 200_000,
+                    cost_per_1k_input: 0.0008,
+                    cost_per_1k_output: 0.004,
+                },
+            ],
+        },
+        // ── Ollama local ─────────────────────────────────────────────────
+        ProviderInfo {
+            name: "ollama".into(),
+            display_name: "Ollama (Local)".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            api_style: ApiStyle::OpenAiCompat,
+            env_key: "OLLAMA_BASE_URL".into(),
+            models: vec![
+                // Default models that will be shown if query fails
+                ModelInfo {
+                    id: "llama3".into(),
+                    family: "llama".into(),
+                    multimodal: false,
+                    image_gen: false,
+                    tool_calling: true,
+                    streaming: true,
+                    context_window: 8192,
+                    cost_per_1k_input: 0.0,
+                    cost_per_1k_output: 0.0,
+                },
+                ModelInfo {
+                    id: "mistral".into(),
+                    family: "mistral".into(),
+                    multimodal: false,
+                    image_gen: false,
+                    tool_calling: true,
+                    streaming: true,
+                    context_window: 32768,
+                    cost_per_1k_input: 0.0,
+                    cost_per_1k_output: 0.0,
                 },
             ],
         },
@@ -275,10 +337,15 @@ pub fn available_providers() -> Vec<ProviderInfo> {
     build_registry()
         .into_iter()
         .filter(|p| {
-            std::env::var(&p.env_key)
-                .ok()
-                .filter(|s| !s.is_empty())
-                .is_some()
+            if p.name == "ollama" {
+                // Ollama is always available locally
+                true
+            } else {
+                std::env::var(&p.env_key)
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+            }
         })
         .collect()
 }

@@ -42,11 +42,18 @@ pub struct Settings {
     #[serde(skip)]
     pub pollinations_api_key: Option<String>,
 
+    // ── Ollama (local models) ────────────────────────────────────────────
+    pub ollama_base_url: Option<String>,
+
     // ── Runtime behaviour ────────────────────────────────────────────────
     pub headless: bool,
     pub browser_timeout_secs: u64,
     pub max_thinking_loops: usize,
     pub max_content_chars: usize,
+
+    // ── Safety / approval ────────────────────────────────────────────────
+    /// Tools that require user approval before execution
+    pub require_approval: Vec<String>,
 
     // ── Paths ────────────────────────────────────────────────────────────
     /// Project root (where .norvexum/ lives)
@@ -65,10 +72,12 @@ impl Default for Settings {
             tavily_api_key: None,
             ocr_space_api_key: None,
             pollinations_api_key: None,
+            ollama_base_url: None,
             headless: false,
             browser_timeout_secs: 30,
             max_thinking_loops: 25,
             max_content_chars: 12000,
+            require_approval: vec![], // Empty = no approval required by default
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
@@ -101,6 +110,9 @@ impl Settings {
         settings.pollinations_api_key = std::env::var("POLLINATIONS_API_KEY")
             .ok()
             .filter(|s| !s.is_empty());
+        settings.ollama_base_url = std::env::var("OLLAMA_BASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         // ── 2. Project-local config ──────────────────────────────────────
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -127,6 +139,12 @@ impl Settings {
             }
             if let Some(chars) = file_settings.max_content_chars {
                 settings.max_content_chars = chars;
+            }
+            if let Some(approval) = file_settings.require_approval {
+                settings.require_approval = approval;
+            }
+            if let Some(url) = file_settings.ollama_base_url {
+                settings.ollama_base_url = Some(url);
             }
         }
 
@@ -158,6 +176,12 @@ impl Settings {
             browser_timeout_secs: Some(self.browser_timeout_secs),
             max_thinking_loops: Some(self.max_thinking_loops),
             max_content_chars: Some(self.max_content_chars),
+            require_approval: if self.require_approval.is_empty() {
+                None
+            } else {
+                Some(self.require_approval.clone())
+            },
+            ollama_base_url: self.ollama_base_url.clone(),
         };
 
         let content = toml::to_string_pretty(&file_settings)?;
@@ -196,8 +220,14 @@ impl Settings {
             "google_direct" => self.google_ai_api_key.as_deref(),
             "openai" => self.openai_api_key.as_deref(),
             "anthropic" => self.anthropic_api_key.as_deref(),
+            "ollama" => Some("ollama"), // Ollama doesn't need a real key
             _ => None,
         }
+    }
+
+    /// Check if a tool requires user approval.
+    pub fn needs_approval(&self, tool_name: &str) -> bool {
+        self.require_approval.iter().any(|t| t == tool_name)
     }
 }
 
@@ -209,4 +239,6 @@ struct FileSettings {
     browser_timeout_secs: Option<u64>,
     max_thinking_loops: Option<usize>,
     max_content_chars: Option<usize>,
+    require_approval: Option<Vec<String>>,
+    ollama_base_url: Option<String>,
 }

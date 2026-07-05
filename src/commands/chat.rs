@@ -1,5 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // Commands: chat — Starts interactive agent session in TUI or Headless mode
+//
+// Supports:
+//   • Full TUI mode with streaming, tool calls, and text selection
+//   • Headless mode for CI/scripting with --headless flag
+//   • Session persistence with auto-save/resume
+//   • Tool approval flow for sandboxed execution
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::agent::{Agent, AgentEvent};
@@ -35,6 +41,7 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
 
     // Instantiate the agent
     let mut agent = Agent::new(settings.clone(), agent_tx.clone())?;
+    let approval_tx = agent.approval_sender();
 
     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
 
@@ -121,14 +128,31 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
                     } => {
                         println!("📝 File written: {}", path);
                     }
-                    AgentEvent::Done { usage: _ } => {
-                        println!("\n--- Done ---");
+                    AgentEvent::Done { usage } => {
+                        if let Some(u) = usage {
+                            println!(
+                                "\n--- Done ({} tokens) ---",
+                                u.total_tokens
+                            );
+                        } else {
+                            println!("\n--- Done ---");
+                        }
                     }
                     AgentEvent::Error(e) => {
                         eprintln!("\n❌ Error: {}", e);
                     }
                     AgentEvent::Status(s) => {
                         println!("Status: {}", s);
+                    }
+                    AgentEvent::ApprovalRequest {
+                        id: _,
+                        tool_name,
+                        args_preview,
+                    } => {
+                        println!(
+                            "\n⚠️  Tool '{}' wants to execute:\n  {}\n  [Auto-approved in headless mode]",
+                            tool_name, args_preview
+                        );
                     }
                     _ => {}
                 }
@@ -164,7 +188,7 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
         if let Some(message) = initial_for_ui {
             app.add_user_message(message);
         }
-        run_tui(app, agent_rx, user_tx, cancel_tx)
+        run_tui(app, agent_rx, user_tx, cancel_tx, approval_tx)
             .await
             .wrap_err("TUI runtime encountered an error")?;
     }

@@ -214,8 +214,8 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing specific text. Finds the exact target string and replaces it. \
-         Shows a diff preview of changes made."
+        "Edit a file by replacing specific text or lines. Can be targeted to a specific line range (selection lock). \
+         If start_line and end_line are specified, you can omit or specify the target text. Shows a diff preview."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -223,23 +223,23 @@ impl Tool for EditFileTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File path" },
-                "target": { "type": "string", "description": "Exact text to find and replace" },
+                "target": { "type": "string", "description": "Exact text to find and replace (optional if start_line/end_line are specified)" },
                 "replacement": { "type": "string", "description": "Replacement text" },
-                "all": { "type": "boolean", "description": "Replace all occurrences (default: false, replace first only)" }
+                "start_line": { "type": "integer", "description": "Start line of the selection to edit (1-indexed, optional)" },
+                "end_line": { "type": "integer", "description": "End line of the selection to edit (1-indexed, optional)" },
+                "all": { "type": "boolean", "description": "Replace all occurrences within the target region (default: false)" }
             },
-            "required": ["path", "target", "replacement"]
+            "required": ["path", "replacement"]
         })
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let path_str = args["path"].as_str().unwrap_or("");
-        let target = args["target"].as_str().unwrap_or("");
+        let target_opt = args["target"].as_str();
         let replacement = args["replacement"].as_str().unwrap_or("");
+        let start_line = args["start_line"].as_u64().map(|n| n as usize);
+        let end_line = args["end_line"].as_u64().map(|n| n as usize);
         let replace_all = args["all"].as_bool().unwrap_or(false);
-
-        if target.is_empty() {
-            return ToolResult::err("Target string cannot be empty");
-        }
 
         let path = match resolve_path(path_str, ctx) {
             Ok(p) => p,
@@ -251,24 +251,87 @@ impl Tool for EditFileTool {
             Err(e) => return ToolResult::err(format!("Failed to read file: {}", e)),
         };
 
-        if !original.contains(target) {
-            return ToolResult::err(format!(
-                "Target text not found in {}.\nSearched for:\n{}",
-                path.display(),
-                target
-            ));
-        }
+        let new_content = if let (Some(start), Some(end)) = (start_line, end_line) {
+            // Line range edit (selection lock)
+            let lines: Vec<&str> = original.lines().collect();
+            let total = lines.len();
+            if start < 1 || start > total || end < start || end > total {
+                return ToolResult::err(format!(
+                    "Invalid line range: {}-{}. File has {} lines.",
+                    start, end, total
+                ));
+            }
 
-        let new_content = if replace_all {
-            original.replace(target, replacement)
-        } else {
-            original.replacen(target, replacement, 1)
-        };
+            let mut prefix_part = lines[..start.saturating_sub(1)].join("\n");
+            if !prefix_part.is_empty() {
+                prefix_part.push('\n');
+            }
+            
+            let mut suffix_part = lines[end..].join("\n");
+            if !suffix_part.is_empty() && !original.ends_with('\n') {
+                // Keep the trailing newline structure
+            }
 
-        let count = if replace_all {
-            original.matches(target).count()
+            let target_segment = lines[start.saturating_sub(1)..end].join("\n");
+
+            if let Some(target) = target_opt {
+                if !target_segment.contains(target) {
+                    return ToolResult::err(format!(
+                        "Target text not found in lines {}-{}.\nSearched for:\n{}",
+                        start, end, target
+                    ));
+                }
+                let modified_segment = if replace_all {
+                    target_segment.replace(target, replacement)
+                } else {
+                    target_segment.replacen(target, replacement, 1)
+                };
+                
+                let mut final_content = format!("{}{}", prefix_part, modified_segment);
+                if !suffix_part.is_empty() {
+                    final_content.push('\n');
+                    final_content.push_str(&suffix_part);
+                }
+                if original.ends_with('\n') && !final_content.ends_with('\n') {
+                    final_content.push('\n');
+                }
+                final_content
+            } else {
+                // Replace the entire selected block directly
+                let mut final_content = format!("{}{}", prefix_part, replacement);
+                if !suffix_part.is_empty() {
+                    final_content.push('\n');
+                    final_content.push_str(&suffix_part);
+                }
+                if original.ends_with('\n') && !final_content.ends_with('\n') {
+                    final_content.push('\n');
+                }
+                final_content
+            }
         } else {
-            1
+            // Classic global text replace
+            let target = match target_opt {
+                Some(t) => t,
+                None => return ToolResult::err("Target string is required if no line range is specified"),
+            };
+
+            if target.is_empty() {
+                return ToolResult::err("Target string cannot be empty");
+            }
+
+            if !original.contains(target) {
+                return ToolResult::err(format!(
+                    "Target text not found in {}.\nSearched for:\n{}",
+                    path.display(),
+                    target
+                ));
+            }
+
+            if replace_all {
+                original.replace(target, replacement)
+            } else {
+                original.replacen(target, replacement, 1)
+            }
         };
 
         // Generate diff
@@ -280,7 +343,6 @@ impl Tool for EditFileTool {
                 similar::ChangeTag::Insert => "+",
                 similar::ChangeTag::Equal => " ",
             };
-            // Only show changed lines and a bit of context
             if change.tag() != similar::ChangeTag::Equal {
                 diff_output.push_str(&format!("{}{}", sign, change));
             }
@@ -289,13 +351,11 @@ impl Tool for EditFileTool {
         match std::fs::write(&path, &new_content) {
             Ok(_) => ToolResult::ok_with_data(
                 format!(
-                    "✅ Edited {} ({} replacement{})\n\nDiff:\n```diff\n{}\n```",
+                    "✅ Edited {}\n\nDiff:\n```diff\n{}\n```",
                     path.display(),
-                    count,
-                    if count > 1 { "s" } else { "" },
                     diff_output.trim()
                 ),
-                json!({ "path": path.to_string_lossy(), "replacements": count }),
+                json!({ "path": path.to_string_lossy(), "success": true }),
             ),
             Err(e) => ToolResult::err(format!("Failed to write file: {}", e)),
         }

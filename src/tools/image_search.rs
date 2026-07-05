@@ -39,8 +39,14 @@ impl Tool for ImageSearchTool {
             return ToolResult::err("Search query cannot be empty");
         }
 
-        // Use DDG image search HTML page and extract image URLs
         let client = super::web_search::build_stealth_client();
+
+        // Try Zerochan first for character queries
+        if let Some(zerochan_results) = fetch_zerochan_images(&client, query, num).await {
+            let scored = score_images(query, zerochan_results);
+            let top: Vec<_> = scored.into_iter().take(num).collect();
+            return format_image_results(query, &top, "zerochan");
+        }
 
         let delay = rand::Rng::random_range(&mut rand::rng(), 300..900);
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -77,7 +83,7 @@ impl Tool for ImageSearchTool {
                 Ok(results) if !results.is_empty() => {
                     let scored = score_images(query, results);
                     let top: Vec<_> = scored.into_iter().take(num).collect();
-                    return format_image_results(query, &top);
+                    return format_image_results(query, &top, "ddg");
                 }
                 _ => {} // Fall through to HTML parsing
             }
@@ -89,7 +95,7 @@ impl Tool for ImageSearchTool {
             return ToolResult::err(format!("No image results found for: {}", query));
         }
 
-        format_image_results(query, &images)
+        format_image_results(query, &images, "ddg")
     }
 }
 
@@ -237,10 +243,11 @@ fn extract_images_from_html(html: &str, max: usize) -> Vec<ImageResult> {
     results
 }
 
-fn format_image_results(query: &str, results: &[ImageResult]) -> ToolResult {
+fn format_image_results(query: &str, results: &[ImageResult], source: &str) -> ToolResult {
     let mut lines = vec![format!(
-        "Found {} image(s) for '{}':\n",
+        "Found {} image(s) from {} for '{}':\n",
         results.len(),
+        source,
         query
     )];
     for (i, img) in results.iter().enumerate() {
@@ -265,6 +272,147 @@ fn format_image_results(query: &str, results: &[ImageResult]) -> ToolResult {
 
     ToolResult::ok_with_data(
         lines.join("\n"),
-        json!({ "images": results, "count": results.len() }),
+        json!({ "images": results, "count": results.len(), "source": source }),
     )
+}
+
+async fn fetch_zerochan_images(
+    client: &reqwest::Client,
+    query: &str,
+    limit: usize,
+) -> Option<Vec<ImageResult>> {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+
+    // Try primary search with all words joined by '+'
+    let search_path = words.join("+");
+    let url = format!(
+        "https://www.zerochan.net/{}?json&l={}",
+        urlencoding::encode(&search_path),
+        limit
+    );
+
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Norvexum - pratik_1")
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let data: serde_json::Value = response.json().await.ok()?;
+    let mut results = Vec::new();
+
+    if let Some(items) = data["items"].as_array() {
+        for item in items {
+            let id = item["id"].as_u64().unwrap_or(0);
+            let img_url = item["large"]
+                .as_str()
+                .or_else(|| item["full"].as_str())
+                .or_else(|| item["preview"].as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if img_url.is_empty() {
+                continue;
+            }
+
+            let tags: Vec<String> = item["tags"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let title = if tags.is_empty() {
+                format!("Zerochan Image #{}", id)
+            } else {
+                tags.join(", ")
+            };
+
+            results.push(ImageResult {
+                image_url: img_url,
+                title,
+                source_url: format!("https://www.zerochan.net/{}", id),
+                width: item["width"].as_u64().unwrap_or(0) as u32,
+                height: item["height"].as_u64().unwrap_or(0) as u32,
+                score: 0.0,
+            });
+        }
+    }
+
+    if results.is_empty() && words.len() > 1 {
+        // Fallback: search for first word as tag (usually the character name e.g. "Furina")
+        let first_word = words[0];
+        let fallback_url = format!(
+            "https://www.zerochan.net/{}?json&l={}",
+            urlencoding::encode(first_word),
+            limit
+        );
+        let fallback_resp = client
+            .get(&fallback_url)
+            .header("User-Agent", "Norvexum - pratik_1")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+
+        if fallback_resp.status().is_success() {
+            if let Ok(fallback_data) = fallback_resp.json::<serde_json::Value>().await {
+                if let Some(items) = fallback_data["items"].as_array() {
+                    for item in items {
+                        let id = item["id"].as_u64().unwrap_or(0);
+                        let img_url = item["large"]
+                            .as_str()
+                            .or_else(|| item["full"].as_str())
+                            .or_else(|| item["preview"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        if img_url.is_empty() {
+                            continue;
+                        }
+
+                        let tags: Vec<String> = item["tags"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let title = if tags.is_empty() {
+                            format!("Zerochan Image #{}", id)
+                        } else {
+                            tags.join(", ")
+                        };
+
+                        results.push(ImageResult {
+                            image_url: img_url,
+                            title,
+                            source_url: format!("https://www.zerochan.net/{}", id),
+                            width: item["width"].as_u64().unwrap_or(0) as u32,
+                            height: item["height"].as_u64().unwrap_or(0) as u32,
+                            score: 0.0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
 }

@@ -4,7 +4,8 @@ use std::io;
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -38,12 +39,41 @@ pub struct App {
     pub theme: Theme,
     pub input_history: Vec<String>,
     pub history_pos: Option<usize>,
+    // ── Token usage tracking ─────────────────────────────────────────────
+    pub total_tokens_used: u64,
+    pub prompt_tokens_used: u64,
+    pub completion_tokens_used: u64,
+    // ── Text selection state ─────────────────────────────────────────────
+    pub selection_start: Option<(u16, u16)>,
+    pub selection_end: Option<(u16, u16)>,
+    pub is_selecting: bool,
+    // ── Approval modal ───────────────────────────────────────────────────
+    pub approval_pending: Option<ApprovalInfo>,
+    // ── Interactive Activity panel state ─────────────────────────────────
+    pub active_panel: ActivePanel,
+    pub selected_tool_index: usize,
+    pub show_tool_details: bool,
+    pub tool_details_scroll: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivePanel {
+    Chat,
+    Activity,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalInfo {
+    pub id: String,
+    pub tool_name: String,
+    pub args_preview: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct ChatLine {
     pub content: String,
     pub style: LineStyle,
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +107,7 @@ impl App {
             chat_lines: vec![ChatLine {
                 content: "Ask a question, request a change, or type /help.".into(),
                 style: LineStyle::Status,
+                tool_call_id: None,
             }],
             thinking_text: String::new(),
             is_thinking: false,
@@ -91,6 +122,17 @@ impl App {
             theme: Theme::default(),
             input_history: Vec::new(),
             history_pos: None,
+            total_tokens_used: 0,
+            prompt_tokens_used: 0,
+            completion_tokens_used: 0,
+            selection_start: None,
+            selection_end: None,
+            is_selecting: false,
+            approval_pending: None,
+            active_panel: ActivePanel::Chat,
+            selected_tool_index: 0,
+            show_tool_details: false,
+            tool_details_scroll: 0,
         }
     }
 
@@ -98,6 +140,7 @@ impl App {
         self.chat_lines.push(ChatLine {
             content: message,
             style: LineStyle::User,
+            tool_call_id: None,
         });
         self.is_processing = true;
         self.status = "Starting".into();
@@ -117,6 +160,7 @@ impl App {
                     self.chat_lines.push(ChatLine {
                         content: std::mem::take(&mut self.thinking_text),
                         style: LineStyle::Thinking,
+                        tool_call_id: None,
                     });
                 }
                 self.is_thinking = false;
@@ -133,25 +177,46 @@ impl App {
                 self.chat_lines.push(ChatLine {
                     content: text,
                     style: LineStyle::Assistant,
+                    tool_call_id: None,
                 });
                 self.auto_scroll();
             }
             AgentEvent::ToolStart { name, id } => {
                 self.status = format!("Running {name}");
                 self.tool_log.push(ToolLogEntry {
-                    id,
-                    name,
+                    id: id.clone(),
+                    name: name.clone(),
                     status: ToolStatus::Running,
-                    detail: "Waiting for arguments".into(),
+                    detail: String::new(),
                 });
+                if name == "write_file" || name == "edit_file" {
+                    self.chat_lines.push(ChatLine {
+                        content: format!("📝 Preparing to update file..."),
+                        style: LineStyle::FileWrite,
+                        tool_call_id: Some(id),
+                    });
+                }
                 self.auto_scroll();
             }
             AgentEvent::ToolArgsDelta { id, delta } => {
                 if let Some(entry) = self.tool_log.iter_mut().rev().find(|entry| entry.id == id) {
-                    if entry.detail == "Waiting for arguments" {
-                        entry.detail.clear();
-                    }
                     entry.detail.push_str(&delta);
+
+                    let is_write = entry.name == "write_file";
+                    let is_edit = entry.name == "edit_file";
+                    if is_write || is_edit {
+                        let path = extract_streaming_content(&entry.detail, "path");
+                        let path_display = if path.is_empty() { "..." } else { &path };
+                        let key = if is_write { "content" } else { "replacement" };
+                        let content = extract_streaming_content(&entry.detail, key);
+
+                        if let Some(line) = self.chat_lines.iter_mut().rev().find(|l| l.tool_call_id == Some(id.clone())) {
+                            line.content = format!(
+                                "📝 Writing file `{}`:\n```\n{}\n```",
+                                path_display, content
+                            );
+                        }
+                    }
                 }
             }
             AgentEvent::ToolResult {
@@ -169,8 +234,8 @@ impl App {
                     entry.detail = compact_detail(&result, 180);
                 } else {
                     self.tool_log.push(ToolLogEntry {
-                        id,
-                        name,
+                        id: id.clone(),
+                        name: name.clone(),
                         status: if success {
                             ToolStatus::Success
                         } else {
@@ -178,6 +243,14 @@ impl App {
                         },
                         detail: compact_detail(&result, 180),
                     });
+                }
+                // Update final code block layout if write/edit tool completed
+                if name == "write_file" || name == "edit_file" {
+                    if let Some(line) = self.chat_lines.iter_mut().rev().find(|l| l.tool_call_id == Some(id.clone())) {
+                        let prefix = if success { "✅ Successfully wrote" } else { "❌ Failed to write" };
+                        let detail = compact_detail(&result, 120);
+                        line.content = format!("{} to file:\n{}", prefix, detail);
+                    }
                 }
                 self.status = if success {
                     "Tool completed".into()
@@ -191,17 +264,28 @@ impl App {
                 content_preview,
             } => {
                 self.chat_lines.push(ChatLine {
-                    content: format!("Updated {path}\n{}", compact_detail(&content_preview, 160)),
+                    content: format!("📝 Updated {path}\n{}", compact_detail(&content_preview, 160)),
                     style: LineStyle::FileWrite,
+                    tool_call_id: None,
                 });
                 self.auto_scroll();
             }
             AgentEvent::Done { usage } => {
                 self.is_processing = false;
                 self.is_thinking = false;
+                if let Some(ref u) = usage {
+                    self.total_tokens_used += u.total_tokens as u64;
+                    self.prompt_tokens_used += u.prompt_tokens as u64;
+                    self.completion_tokens_used += u.completion_tokens as u64;
+                }
                 self.status = usage.map_or_else(
-                    || "Ready".into(),
-                    |u| format!("Done - {} tokens", u.total_tokens),
+                    || format!("Ready | {} tokens total", self.total_tokens_used),
+                    |u| {
+                        format!(
+                            "Done — {} tokens (total: {})",
+                            u.total_tokens, self.total_tokens_used
+                        )
+                    },
                 );
                 self.auto_scroll();
             }
@@ -209,6 +293,7 @@ impl App {
                 self.chat_lines.push(ChatLine {
                     content: error,
                     style: LineStyle::Error,
+                    tool_call_id: None,
                 });
                 self.is_processing = false;
                 self.is_thinking = false;
@@ -224,6 +309,17 @@ impl App {
                 self.chat_scroll = 0;
             }
             AgentEvent::Quit => self.should_quit = true,
+            AgentEvent::ApprovalRequest {
+                id,
+                tool_name,
+                args_preview,
+            } => {
+                self.approval_pending = Some(ApprovalInfo {
+                    id,
+                    tool_name,
+                    args_preview,
+                });
+            }
         }
     }
 
@@ -231,9 +327,107 @@ impl App {
         self.chat_scroll = 0;
     }
 
+    /// Copy selected text to clipboard. Returns true if something was copied.
+    pub fn copy_selection(&mut self) -> bool {
+        if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
+            // Build selected text from chat lines (simplified: copy all visible text in the range)
+            let all_text: String = self
+                .chat_lines
+                .iter()
+                .map(|line| line.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // For simplicity, copy a reasonable selection based on line positions
+            let lines: Vec<&str> = all_text.lines().collect();
+            let start_line = (start.1 as usize).min(lines.len().saturating_sub(1));
+            let end_line = (end.1 as usize).min(lines.len().saturating_sub(1));
+            let (s, e) = if start_line <= end_line {
+                (start_line, end_line)
+            } else {
+                (end_line, start_line)
+            };
+
+            let selected: String = lines[s..=e].join("\n");
+            if !selected.is_empty() {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(&selected);
+                    self.status = format!("📋 Copied {} lines", e - s + 1);
+                    self.selection_start = None;
+                    self.selection_end = None;
+                    self.is_selecting = false;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Option<String> {
+        // Tab key toggles focus between Chat input and Activity panel
+        if key == KeyCode::Tab {
+            self.active_panel = match self.active_panel {
+                ActivePanel::Chat => ActivePanel::Activity,
+                ActivePanel::Activity => ActivePanel::Chat,
+            };
+            return None;
+        }
+
+        // Handle tool details overlay modal keys
+        if self.show_tool_details {
+            match key {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.show_tool_details = false;
+                }
+                KeyCode::Up => self.tool_details_scroll = self.tool_details_scroll.saturating_sub(1),
+                KeyCode::Down => self.tool_details_scroll = self.tool_details_scroll.saturating_add(1),
+                KeyCode::PageUp => self.tool_details_scroll = self.tool_details_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.tool_details_scroll = self.tool_details_scroll.saturating_add(10),
+                _ => {}
+            }
+            return None;
+        }
+
+        // Intercept navigation keys when Activity panel is focused
+        if self.active_panel == ActivePanel::Activity {
+            match key {
+                KeyCode::Esc => {
+                    self.active_panel = ActivePanel::Chat;
+                }
+                KeyCode::Up => {
+                    self.selected_tool_index = self.selected_tool_index.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    if !self.tool_log.is_empty() {
+                        self.selected_tool_index = (self.selected_tool_index + 1).min(self.tool_log.len().saturating_sub(1));
+                    }
+                }
+                KeyCode::PageUp => {
+                    self.selected_tool_index = self.selected_tool_index.saturating_sub(5);
+                }
+                KeyCode::PageDown => {
+                    if !self.tool_log.is_empty() {
+                        self.selected_tool_index = (self.selected_tool_index + 5).min(self.tool_log.len().saturating_sub(1));
+                    }
+                }
+                KeyCode::Enter => {
+                    if !self.tool_log.is_empty() {
+                        self.show_tool_details = true;
+                        self.tool_details_scroll = 0;
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         match key {
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                // If there's a selection, copy it instead of quitting
+                if self.selection_start.is_some() && self.selection_end.is_some() {
+                    self.copy_selection();
+                    return None;
+                }
                 self.should_quit = true;
                 None
             }
@@ -244,6 +438,14 @@ impl App {
                         self.insert_text(&text);
                     }
                 }
+                None
+            }
+            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                // Select all — set selection to cover entire chat
+                self.selection_start = Some((0, 0));
+                let total_lines = self.chat_lines.len() as u16;
+                self.selection_end = Some((0, total_lines));
+                self.is_selecting = false;
                 None
             }
             KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -391,9 +593,127 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_input(frame, rows[2], app);
     draw_footer(frame, rows[3], app);
+
+    // Render approval modal if pending
+    if let Some(info) = &app.approval_pending {
+        let modal_area = centered_rect(60, 45, area);
+        frame.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let border_color = app.theme.tool_color;
+        let block = Block::default()
+            .title(Span::styled(
+                " ⚠️  TOOL RUN APPROVAL ",
+                Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .padding(Padding::new(1, 1, 1, 1));
+
+        let prompt_text = format!(
+            "The model wants to execute the following tool:\n\n\
+             Tool: {}\n\n\
+             Arguments:\n  {}\n\n\
+             Allow execution? [y]es / [n]o",
+            info.tool_name, info.args_preview
+        );
+
+        let paragraph = Paragraph::new(prompt_text)
+            .block(block)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(app.theme.fg));
+
+        frame.render_widget(paragraph, modal_area);
+    }
+
+    // Render tool details modal if show_tool_details is true
+    if app.show_tool_details {
+        if let Some(entry) = app.tool_log.iter().rev().nth(app.selected_tool_index) {
+            let modal_area = centered_rect(75, 75, area);
+            frame.render_widget(ratatui::widgets::Clear, modal_area);
+
+            let border_color = match entry.status {
+                ToolStatus::Running => app.theme.tool_color,
+                ToolStatus::Success => app.theme.success_color,
+                ToolStatus::Failed => app.theme.error_color,
+            };
+
+            let block = Block::default()
+                .title(Span::styled(
+                    format!(" 🔧  TOOL DETAILS: {} ", entry.name),
+                    Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .padding(Padding::new(2, 2, 1, 1));
+
+            // Format full details
+            let status_str = match entry.status {
+                ToolStatus::Running => "Running...",
+                ToolStatus::Success => "Success",
+                ToolStatus::Failed => "Failed",
+            };
+
+            let mut text = vec![
+                Line::from(vec![
+                    Span::styled("Tool Name: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(&entry.name),
+                ]),
+                Line::from(vec![
+                    Span::styled("Status:    ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(status_str, Style::default().fg(border_color).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::default(),
+                Line::from(Span::styled("DETAILS / OUTPUT:", Style::default().add_modifier(Modifier::BOLD).fg(app.theme.accent_color))),
+                Line::default(),
+            ];
+
+            for line in entry.detail.lines() {
+                text.push(Line::from(line));
+            }
+
+            text.push(Line::default());
+            text.push(Line::from(Span::styled(
+                "─── Use Up/Down/PageUp/PageDown to scroll | Esc/Enter to close ───",
+                Style::default().fg(app.theme.dim_color),
+            )));
+
+            let paragraph = Paragraph::new(text)
+                .block(block)
+                .scroll((app.tool_details_scroll, 0))
+                .wrap(Wrap { trim: false });
+
+            frame.render_widget(paragraph, modal_area);
+        }
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    let token_info = if app.total_tokens_used > 0 {
+        format!("  │ Tokens: {}", format_tokens(app.total_tokens_used))
+    } else {
+        String::new()
+    };
+
     let title = Line::from(vec![
         Span::styled(
             " NORVEXUM ",
@@ -407,6 +727,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::default()
                 .fg(app.theme.fg)
                 .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            token_info,
+            Style::default().fg(app.theme.dim_color),
         ),
     ]);
     let state_color = if app.status == "Error" {
@@ -459,7 +783,7 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
 
     if app.is_thinking && !app.thinking_text.is_empty() {
         lines.push(Line::from(Span::styled(
-            "REASONING  live",
+            "REASONING  ● live",
             Style::default()
                 .fg(app.theme.thinking_color)
                 .add_modifier(Modifier::BOLD),
@@ -467,7 +791,7 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
         let recent = wrap_text(&app.thinking_text, width);
         for line in recent.iter().skip(recent.len().saturating_sub(4)) {
             lines.push(Line::from(Span::styled(
-                format!("| {line}"),
+                format!("│ {line}"),
                 Style::default()
                     .fg(app.theme.thinking_color)
                     .add_modifier(Modifier::DIM),
@@ -492,10 +816,16 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
+    let title = if app.active_panel == ActivePanel::Activity {
+        "ACTIVITY (Focused)"
+    } else {
+        "ACTIVITY [Tab]"
+    };
+
     let mut lines = vec![Line::from(Span::styled(
-        "ACTIVITY",
+        title,
         Style::default()
-            .fg(app.theme.dim_color)
+            .fg(if app.active_panel == ActivePanel::Activity { app.theme.accent_color } else { app.theme.dim_color })
             .add_modifier(Modifier::BOLD),
     ))];
     lines.push(Line::default());
@@ -507,40 +837,83 @@ fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
         )));
     }
 
-    for entry in app.tool_log.iter().rev().take(8) {
+    // Render all tools in reverse order (newest first)
+    for (i, entry) in app.tool_log.iter().rev().enumerate() {
+        let is_selected = app.active_panel == ActivePanel::Activity && i == app.selected_tool_index;
+        
         let (mark, color) = match entry.status {
             ToolStatus::Running => ("~", app.theme.tool_color),
             ToolStatus::Success => ("+", app.theme.success_color),
             ToolStatus::Failed => ("!", app.theme.error_color),
         };
+
+        let cursor = if is_selected { "> " } else { "  " };
+        let style = if is_selected {
+            Style::default()
+                .bg(app.theme.accent_color)
+                .fg(app.theme.bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(app.theme.fg)
+                .add_modifier(Modifier::BOLD)
+        };
+
         lines.push(Line::from(vec![
+            Span::styled(cursor, Style::default().fg(app.theme.accent_color).add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("{mark} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                &entry.name,
-                Style::default()
-                    .fg(app.theme.fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(&entry.name, style),
         ]));
-        for detail in wrap_text(&entry.detail, area.width.saturating_sub(5) as usize)
+
+        for detail in wrap_text(&entry.detail, area.width.saturating_sub(6) as usize)
             .into_iter()
             .take(2)
         {
-            lines.push(Line::from(Span::styled(
-                format!("  {detail}"),
-                Style::default().fg(app.theme.dim_color),
-            )));
+            let detail_style = if is_selected {
+                Style::default().bg(app.theme.accent_color).fg(app.theme.bg)
+            } else {
+                Style::default().fg(app.theme.dim_color)
+            };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(detail, detail_style),
+            ]));
         }
         lines.push(Line::default());
     }
 
+    // Standard scroll calculation for tool log
+    let visible = area.height.saturating_sub(3) as usize;
+    let scroll_y = if app.active_panel == ActivePanel::Activity {
+        let mut line_offset = 0;
+        let mut selected_y = 0;
+        for (i, entry) in app.tool_log.iter().rev().enumerate() {
+            let detail_lines = wrap_text(&entry.detail, area.width.saturating_sub(6) as usize)
+                .into_iter()
+                .take(2)
+                .count();
+            let item_height = 1 + detail_lines + 1;
+            if i == app.selected_tool_index {
+                selected_y = line_offset;
+            }
+            line_offset += item_height;
+        }
+        if selected_y >= visible {
+            (selected_y - visible / 2) as u16
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(Block::default().padding(Padding::new(2, 1, 1, 0)))
-            .wrap(Wrap { trim: true }),
+            .scroll((scroll_y, 0)),
         area,
     );
 }
@@ -593,8 +966,10 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let help = if app.is_processing {
         " Esc stop  |  Ctrl+C quit "
+    } else if app.selection_start.is_some() {
+        " Ctrl+C copy selection  |  Esc clear selection  |  Ctrl+A select all "
     } else {
-        " Enter send  |  Ctrl+Up history  |  PgUp scroll  |  Ctrl+C quit "
+        " Enter send  |  Ctrl+Up history  |  PgUp scroll  |  Drag to select  |  Ctrl+C quit "
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(app.theme.dim_color)),
@@ -607,12 +982,14 @@ pub async fn run_tui(
     mut agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
     user_tx: mpsc::UnboundedSender<String>,
     cancel_tx: mpsc::UnboundedSender<()>,
+    approval_tx: mpsc::UnboundedSender<bool>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -623,6 +1000,9 @@ pub async fn run_tui(
         }
     });
 
+    // Tick interval for smooth streaming redraws (60fps)
+    let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(16));
+
     let result = async {
         loop {
             terminal.draw(|frame| draw(frame, &app))?;
@@ -630,8 +1010,29 @@ pub async fn run_tui(
                 Some(event) = agent_rx.recv() => app.handle_agent_event(event),
                 Some(event) = event_rx.recv() => match event {
                     Event::Key(key) if key.kind == event::KeyEventKind::Press => {
+                        if app.approval_pending.is_some() {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                    let _ = approval_tx.send(true);
+                                    app.approval_pending = None;
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                    let _ = approval_tx.send(false);
+                                    app.approval_pending = None;
+                                    app.is_processing = false;
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
                         if key.code == KeyCode::Esc {
-                            if app.is_processing {
+                            if app.is_selecting || app.selection_start.is_some() {
+                                // Clear selection
+                                app.selection_start = None;
+                                app.selection_end = None;
+                                app.is_selecting = false;
+                            } else if app.is_processing {
                                 let _ = cancel_tx.send(());
                             } else {
                                 app.should_quit = true;
@@ -641,6 +1042,32 @@ pub async fn run_tui(
                         }
                     }
                     Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            app.selection_start = Some((mouse.column, mouse.row));
+                            app.selection_end = Some((mouse.column, mouse.row));
+                            app.is_selecting = true;
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if app.is_selecting {
+                                app.selection_end = Some((mouse.column, mouse.row));
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            if app.is_selecting {
+                                app.selection_end = Some((mouse.column, mouse.row));
+                                app.is_selecting = false;
+                                // Auto-copy on mouse up if there's a meaningful selection
+                                if let (Some(start), Some(end)) = (app.selection_start, app.selection_end) {
+                                    if start != end {
+                                        app.copy_selection();
+                                    } else {
+                                        // Click without drag — clear selection
+                                        app.selection_start = None;
+                                        app.selection_end = None;
+                                    }
+                                }
+                            }
+                        }
                         MouseEventKind::ScrollUp => {
                             app.chat_scroll = app.chat_scroll.saturating_add(3);
                         }
@@ -650,6 +1077,9 @@ pub async fn run_tui(
                         _ => {}
                     },
                     _ => {}
+                },
+                _ = tick_interval.tick() => {
+                    // Tick for smooth streaming — just triggers a redraw
                 }
             }
             if app.should_quit {
@@ -663,12 +1093,13 @@ pub async fn run_tui(
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
     result
 }
+
+// ── Markdown-aware message rendering ──────────────────────────────────────
 
 fn render_message(
     text: &str,
@@ -678,26 +1109,69 @@ fn render_message(
 ) -> Vec<Line<'static>> {
     let mut result = Vec::new();
     let mut in_code = false;
+    let code_bg = ratatui::style::Color::Rgb(25, 28, 40);
+
     for raw in text.lines() {
         if raw.trim_start().starts_with("```") {
             in_code = !in_code;
+            if in_code {
+                // Code block start — show language label if present
+                let lang = raw.trim_start().strip_prefix("```").unwrap_or("");
+                if !lang.is_empty() {
+                    result.push(Line::from(Span::styled(
+                        format!("  ┌─ {} ", lang),
+                        Style::default()
+                            .fg(ratatui::style::Color::Rgb(100, 110, 140))
+                            .bg(code_bg),
+                    )));
+                } else {
+                    result.push(Line::from(Span::styled(
+                        "  ┌──────",
+                        Style::default()
+                            .fg(ratatui::style::Color::Rgb(60, 65, 80))
+                            .bg(code_bg),
+                    )));
+                }
+            } else {
+                // Code block end
+                result.push(Line::from(Span::styled(
+                    "  └──────",
+                    Style::default()
+                        .fg(ratatui::style::Color::Rgb(60, 65, 80))
+                        .bg(code_bg),
+                )));
+            }
             continue;
         }
-        let (prefix, content, style) = if in_code {
+
+        if in_code {
+            // Inside code block — preserve whitespace, use monospace style
+            let code_style = Style::default()
+                .fg(ratatui::style::Color::Rgb(190, 200, 220))
+                .bg(code_bg);
+            let padded = format!("  │ {}", raw);
+            result.push(Line::from(Span::styled(padded, code_style)));
+            continue;
+        }
+
+        // Parse inline markdown
+        let (prefix, content, base_style) = if let Some(heading) = raw.strip_prefix("### ") {
             (
                 "  ",
-                raw,
+                heading,
                 Style::default()
                     .fg(color)
-                    .bg(ratatui::style::Color::Rgb(25, 28, 40)),
+                    .add_modifier(Modifier::BOLD),
             )
-        } else if let Some(heading) = raw.strip_prefix("### ") {
+        } else if let Some(heading) = raw.strip_prefix("## ") {
             (
-                "",
+                " ",
                 heading,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             )
-        } else if let Some(heading) = raw.strip_prefix("## ").or_else(|| raw.strip_prefix("# ")) {
+        } else if let Some(heading) = raw.strip_prefix("# ") {
             (
                 "",
                 heading,
@@ -705,31 +1179,199 @@ fn render_message(
                     .fg(color)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             )
+        } else if raw.starts_with("> ") {
+            // Blockquote
+            (
+                "  │ ",
+                &raw[2..],
+                Style::default()
+                    .fg(ratatui::style::Color::Rgb(140, 150, 170))
+                    .add_modifier(Modifier::ITALIC),
+            )
         } else if raw.starts_with("- ") || raw.starts_with("* ") {
-            ("  - ", &raw[2..], Style::default().fg(color))
+            ("  • ", &raw[2..], Style::default().fg(color))
+        } else if raw.starts_with("---") || raw.starts_with("***") || raw.starts_with("___") {
+            // Horizontal rule
+            let hr = "─".repeat(width.min(60));
+            result.push(Line::from(Span::styled(
+                format!("  {}", hr),
+                Style::default().fg(ratatui::style::Color::Rgb(60, 65, 80)),
+            )));
+            continue;
         } else {
             ("  ", raw, Style::default().fg(color))
         };
-        let wrap_width = width.saturating_sub(char_count(prefix)).max(1);
-        let wrapped = wrap_text(content, wrap_width);
-        if wrapped.is_empty() {
+
+        // Handle numbered lists (e.g., "1. item")
+        let (final_prefix, final_content) = if content.len() > 2
+            && content.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+        {
+            if let Some(rest) = content.strip_prefix(|c: char| c.is_ascii_digit()) {
+                if let Some(rest) = rest.strip_prefix(". ") {
+                    let num: String = content.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let new_prefix = format!("{}{}. ", prefix, num);
+                    (new_prefix, rest.to_string())
+                } else {
+                    (prefix.to_string(), content.to_string())
+                }
+            } else {
+                (prefix.to_string(), content.to_string())
+            }
+        } else {
+            (prefix.to_string(), content.to_string())
+        };
+
+        let wrap_width = width.saturating_sub(char_count(&final_prefix)).max(1);
+
+        // Parse inline formatting and render
+        let spans = parse_inline_markdown(&final_content, base_style, kind);
+        if spans.is_empty() {
             result.push(Line::default());
         } else {
-            for (index, line) in wrapped.into_iter().enumerate() {
-                let marker = if index == 0 { prefix } else { "  " };
-                let line_style = if kind == LineStyle::Thinking {
-                    style.add_modifier(Modifier::ITALIC)
-                } else {
-                    style
-                };
-                result.push(Line::from(Span::styled(
-                    format!("{marker}{line}"),
-                    line_style,
-                )));
+            // Wrap the combined text
+            let plain_text: String = spans.iter().map(|s| s.content.to_string()).collect();
+            let wrapped = wrap_text(&plain_text, wrap_width);
+
+            if wrapped.is_empty() {
+                result.push(Line::default());
+            } else {
+                for (index, line) in wrapped.into_iter().enumerate() {
+                    let marker = if index == 0 { &final_prefix } else { "    " };
+                    let line_style = if kind == LineStyle::Thinking {
+                        base_style.add_modifier(Modifier::ITALIC)
+                    } else {
+                        base_style
+                    };
+                    result.push(Line::from(Span::styled(
+                        format!("{marker}{line}"),
+                        line_style,
+                    )));
+                }
             }
         }
     }
     result
+}
+
+/// Parse inline markdown: **bold**, *italic*, `code`, ~~strikethrough~~
+fn parse_inline_markdown(
+    text: &str,
+    base_style: Style,
+    _kind: LineStyle,
+) -> Vec<Span<'static>> {
+    // For performance, if there's no markdown formatting, return as-is
+    if !text.contains('*') && !text.contains('`') && !text.contains('~') {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+
+    let mut spans = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Bold: **text**
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+            if !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    base_style,
+                ));
+            }
+            i += 2;
+            let mut bold_text = String::new();
+            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '*') {
+                bold_text.push(chars[i]);
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2; // Skip closing **
+            }
+            spans.push(Span::styled(
+                bold_text,
+                base_style.add_modifier(Modifier::BOLD),
+            ));
+        }
+        // Inline code: `text`
+        else if chars[i] == '`' {
+            if !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    base_style,
+                ));
+            }
+            i += 1;
+            let mut code_text = String::new();
+            while i < len && chars[i] != '`' {
+                code_text.push(chars[i]);
+                i += 1;
+            }
+            if i < len {
+                i += 1; // Skip closing `
+            }
+            let code_bg = ratatui::style::Color::Rgb(35, 38, 55);
+            spans.push(Span::styled(
+                format!(" {} ", code_text),
+                Style::default()
+                    .fg(ratatui::style::Color::Rgb(230, 180, 80))
+                    .bg(code_bg),
+            ));
+        }
+        // Italic: *text*
+        else if chars[i] == '*' {
+            if !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    base_style,
+                ));
+            }
+            i += 1;
+            let mut italic_text = String::new();
+            while i < len && chars[i] != '*' {
+                italic_text.push(chars[i]);
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            spans.push(Span::styled(
+                italic_text,
+                base_style.add_modifier(Modifier::ITALIC),
+            ));
+        }
+        // Strikethrough: ~~text~~
+        else if i + 1 < len && chars[i] == '~' && chars[i + 1] == '~' {
+            if !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    base_style,
+                ));
+            }
+            i += 2;
+            let mut strike_text = String::new();
+            while i + 1 < len && !(chars[i] == '~' && chars[i + 1] == '~') {
+                strike_text.push(chars[i]);
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            spans.push(Span::styled(
+                strike_text,
+                base_style.add_modifier(Modifier::DIM),
+            ));
+        } else {
+            current.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    if !current.is_empty() {
+        spans.push(Span::styled(current, base_style));
+    }
+
+    spans
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -796,6 +1438,50 @@ fn clean_status(status: &str) -> String {
         .replace("⏹️ ", "")
 }
 
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn extract_streaming_content(json_accumulated: &str, key: &str) -> String {
+    let pattern = format!("\"{}\":", key);
+    if let Some(pos) = json_accumulated.find(&pattern) {
+        let rest = &json_accumulated[pos + pattern.len()..];
+        if let Some(quote_start) = rest.find('"') {
+            let val_content = &rest[quote_start + 1..];
+            let mut result = String::new();
+            let mut chars = val_content.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    if let Some(next_c) = chars.peek() {
+                        match next_c {
+                            'n' => { result.push('\n'); chars.next(); }
+                            't' => { result.push('\t'); chars.next(); }
+                            'r' => { chars.next(); }
+                            '"' => { result.push('"'); chars.next(); }
+                            '\\' => { result.push('\\'); chars.next(); }
+                            _ => { result.push(c); }
+                        }
+                    } else {
+                        result.push(c);
+                    }
+                } else if c == '"' {
+                    break;
+                } else {
+                    result.push(c);
+                }
+            }
+            return result;
+        }
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,5 +1522,17 @@ mod tests {
         let narrow_text: String = narrow.iter().map(|cell| cell.symbol()).collect();
         assert!(narrow_text.contains("NORVEXUM"));
         assert!(!narrow_text.contains("ACTIVITY"));
+    }
+
+    #[test]
+    fn inline_markdown_parses_bold() {
+        let spans = parse_inline_markdown("hello **world**", Style::default(), LineStyle::Assistant);
+        assert!(spans.len() >= 2);
+    }
+
+    #[test]
+    fn inline_markdown_parses_code() {
+        let spans = parse_inline_markdown("use `println!`", Style::default(), LineStyle::Assistant);
+        assert!(spans.len() >= 2);
     }
 }

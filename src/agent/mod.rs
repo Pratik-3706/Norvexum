@@ -1,16 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// Agent — Core reasoning loop with thinking + parallel tool calling
+// Agent — Core reasoning loop with thinking + truly parallel tool calling
 //
 // Loop:
 //   1. Send conversation + tools to AI model (streaming)
 //   2. Display thinking tokens live in TUI
-//   3. On tool calls → execute in parallel (tokio::spawn)
+//   3. On tool calls → execute in parallel (futures::join_all)
 //   4. Append results → repeat
 //   5. On content → stream text live to TUI
 //   6. On "done" → break
+//   7. Auto-compact context when approaching window limit
+//   8. Auto-save session after each turn
 // ═══════════════════════════════════════════════════════════════════════════
 
+pub mod checkpoint;
+pub mod compaction;
 pub mod history;
+pub mod session;
 pub mod vision;
 
 use eyre::Result;
@@ -20,7 +25,7 @@ use tokio::sync::mpsc;
 use crate::ai::types::*;
 use crate::ai::{self, AiClient};
 use crate::config::Settings;
-use crate::tools::{ToolContext, ToolRegistry};
+use crate::tools::{ToolContext, ToolRegistry, ToolResult};
 
 /// Events the agent sends to the UI for live rendering.
 #[derive(Debug, Clone)]
@@ -59,26 +64,39 @@ pub enum AgentEvent {
     ClearChat,
     /// Quit application event
     Quit,
+    /// Tool approval request — requires user Y/N before executing
+    ApprovalRequest {
+        id: String,
+        tool_name: String,
+        args_preview: String,
+    },
 }
 
 /// The core agent that orchestrates AI ↔ Tool interaction.
 pub struct Agent {
     client: Arc<dyn AiClient>,
-    tools: ToolRegistry,
+    tools: Arc<ToolRegistry>,
     settings: Arc<Settings>,
     messages: Vec<Message>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
+    session: Option<session::Session>,
+    /// Channel for receiving approval responses from the UI
+    approval_rx: Option<mpsc::UnboundedReceiver<bool>>,
+    /// Sender side stored so the UI can clone it
+    approval_tx: mpsc::UnboundedSender<bool>,
 }
 
 impl Agent {
     pub fn new(settings: Settings, event_tx: mpsc::UnboundedSender<AgentEvent>) -> Result<Self> {
         let client = Arc::from(ai::build_client(&settings)?);
-        let tools = ToolRegistry::new(&settings);
+        let tools = Arc::new(ToolRegistry::new(&settings));
         let settings = Arc::new(settings);
 
-        // Build system prompt
+        // Build system prompt with project context
         let system = build_system_prompt(&settings, &tools);
         let messages = vec![Message::system(system)];
+
+        let (approval_tx, approval_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             client,
@@ -86,7 +104,15 @@ impl Agent {
             settings,
             messages,
             event_tx,
+            session: None,
+            approval_rx: Some(approval_rx),
+            approval_tx,
         })
+    }
+
+    /// Get the approval sender so the UI can respond to approval requests.
+    pub fn approval_sender(&self) -> mpsc::UnboundedSender<bool> {
+        self.approval_tx.clone()
     }
 
     /// Process a user message through the full agent loop.
@@ -102,12 +128,17 @@ impl Agent {
                             "  `/clear`                - Clear TUI chat log & conversation memory",
                             "  `/copy`                 - Copy the last AI response to system clipboard",
                             "  `/copy chat`            - Copy the entire conversation history to clipboard",
+                            "  `/undo`                 - Undo the last file write/edit (restore from checkpoint)",
+                            "  `/session resume`       - Resume the last saved session",
+                            "  `/session list`         - List saved sessions",
+                            "  `/session clear`        - Delete all saved sessions",
                             "  `/provider`             - List available AI providers",
                             "  `/provider <id>`        - Switch to specified AI provider",
                             "  `/model`                - List models for the active provider",
                             "  `/model <id>`           - Switch to specified AI model",
                             "  `/exit` or `/quit`      - Quit the program cleanly",
                             "\n💡 *Tip: If the agent is executing, press `Esc` to cancel the current run immediately.*",
+                            "💡 *Tip: Drag-select text in the chat to copy it to clipboard.*",
                         ].join("\n");
                         let _ = self.event_tx.send(AgentEvent::Content(msg));
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
@@ -121,6 +152,99 @@ impl Agent {
                         let _ = self
                             .event_tx
                             .send(AgentEvent::Status("🧹 Chat cleared".into()));
+                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+                        return Ok(());
+                    }
+                    "/undo" => {
+                        match checkpoint::undo_last(&self.settings.project_root) {
+                            Ok(restored) => {
+                                let msg = if restored.is_empty() {
+                                    "No files were restored.".to_string()
+                                } else {
+                                    format!(
+                                        "✅ Restored {} file(s):\n{}",
+                                        restored.len(),
+                                        restored
+                                            .iter()
+                                            .map(|f| format!("  • {}", f))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    )
+                                };
+                                let _ = self.event_tx.send(AgentEvent::Content(msg));
+                            }
+                            Err(e) => {
+                                let _ = self
+                                    .event_tx
+                                    .send(AgentEvent::Error(format!("Undo failed: {}", e)));
+                            }
+                        }
+                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+                        return Ok(());
+                    }
+                    "/session" => {
+                        if parts.len() < 2 {
+                            let _ = self.event_tx.send(AgentEvent::Content(
+                                "Usage: `/session resume` | `/session list` | `/session clear`"
+                                    .into(),
+                            ));
+                            let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+                            return Ok(());
+                        }
+                        match parts[1] {
+                            "resume" => {
+                                if let Some(sess) =
+                                    session::Session::load_latest(&self.settings.project_root)
+                                {
+                                    self.messages = sess.messages.clone();
+                                    self.session = Some(sess);
+                                    let _ = self.event_tx.send(AgentEvent::Content(format!(
+                                        "✅ Resumed session ({} messages)",
+                                        self.messages.len()
+                                    )));
+                                } else {
+                                    let _ = self.event_tx.send(AgentEvent::Content(
+                                        "No saved sessions found.".into(),
+                                    ));
+                                }
+                            }
+                            "list" => {
+                                let sessions =
+                                    session::Session::list(&self.settings.project_root);
+                                if sessions.is_empty() {
+                                    let _ = self.event_tx.send(AgentEvent::Content(
+                                        "No saved sessions.".into(),
+                                    ));
+                                } else {
+                                    let list: Vec<String> = sessions
+                                        .iter()
+                                        .take(10)
+                                        .map(|s| {
+                                            format!(
+                                                "  • {} — {} msgs — {} — {}",
+                                                s.id, s.message_count, s.model, s.updated_at
+                                            )
+                                        })
+                                        .collect();
+                                    let _ = self.event_tx.send(AgentEvent::Content(format!(
+                                        "Saved Sessions:\n{}",
+                                        list.join("\n")
+                                    )));
+                                }
+                            }
+                            "clear" => {
+                                let _ =
+                                    session::Session::clear_all(&self.settings.project_root);
+                                let _ = self.event_tx.send(AgentEvent::Content(
+                                    "✅ All sessions cleared.".into(),
+                                ));
+                            }
+                            _ => {
+                                let _ = self.event_tx.send(AgentEvent::Content(
+                                    "Unknown session command. Use: resume, list, clear".into(),
+                                ));
+                            }
+                        }
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
                         return Ok(());
                     }
@@ -190,6 +314,8 @@ impl Agent {
                         return Ok(());
                     }
                     "/exit" | "/quit" => {
+                        // Save session before quitting
+                        self.save_session();
                         let _ = self.event_tx.send(AgentEvent::Quit);
                         return Ok(());
                     }
@@ -202,28 +328,51 @@ impl Agent {
                     }
                     "/model" => {
                         if parts.len() < 2 {
-                            let registry = crate::config::providers::build_registry();
                             let current_provider = &self.settings.active_provider;
                             let mut list =
                                 vec![format!("Available Models for {}:", current_provider)];
 
-                            if let Some(provider) =
-                                registry.iter().find(|p| &p.name == current_provider)
-                            {
-                                for model in &provider.models {
-                                    let capabilities = format!(
-                                        "{}{}{}",
-                                        if model.multimodal { " 👁️" } else { "" },
-                                        if model.tool_calling { " 🔧" } else { "" },
-                                        if model.image_gen { " 🎨" } else { "" }
-                                    );
-                                    list.push(format!(
-                                        "  • {} ({}{})",
-                                        model.id, model.family, capabilities
-                                    ));
+                            if current_provider == "ollama" {
+                                let ollama_url = self.settings
+                                    .ollama_base_url
+                                    .as_deref()
+                                    .unwrap_or(crate::ai::ollama::DEFAULT_OLLAMA_URL);
+                                if let Some(models) = crate::ai::ollama::discover_models(ollama_url).await {
+                                    for model in &models {
+                                        let capabilities = format!(
+                                            "{}{}{}",
+                                            if model.multimodal { " 👁️" } else { "" },
+                                            if model.tool_calling { " 🔧" } else { "" },
+                                            if model.image_gen { " 🎨" } else { "" }
+                                        );
+                                        list.push(format!(
+                                            "  • {} ({}{})",
+                                            model.id, model.family, capabilities
+                                        ));
+                                    }
+                                } else {
+                                    list.push("  (Ollama is unreachable or no local models installed)".to_string());
                                 }
                             } else {
-                                list.push("  (No models listed for this provider)".to_string());
+                                let registry = crate::config::providers::build_registry();
+                                if let Some(provider) =
+                                    registry.iter().find(|p| &p.name == current_provider)
+                                {
+                                    for model in &provider.models {
+                                        let capabilities = format!(
+                                            "{}{}{}",
+                                            if model.multimodal { " 👁️" } else { "" },
+                                            if model.tool_calling { " 🔧" } else { "" },
+                                            if model.image_gen { " 🎨" } else { "" }
+                                        );
+                                        list.push(format!(
+                                            "  • {} ({}{})",
+                                            model.id, model.family, capabilities
+                                        ));
+                                    }
+                                } else {
+                                    list.push("  (No models listed for this provider)".to_string());
+                                }
                             }
 
                             list.push(format!("\nActive: {}", self.settings.active_model));
@@ -297,6 +446,19 @@ impl Agent {
                             settings.active_model = "gemini-2.5-flash".into();
                         } else if provider_id == "aicredits" {
                             settings.active_model = "google/gemini-2.5-flash".into();
+                        } else if provider_id == "ollama" {
+                            // For Ollama, try to pick the first available model
+                            let ollama_url = settings
+                                .ollama_base_url
+                                .as_deref()
+                                .unwrap_or(crate::ai::ollama::DEFAULT_OLLAMA_URL);
+                            if let Some(models) =
+                                crate::ai::ollama::discover_models(ollama_url).await
+                            {
+                                if let Some(first) = models.first() {
+                                    settings.active_model = first.id.clone();
+                                }
+                            }
                         }
 
                         match ai::build_client(&settings) {
@@ -391,7 +553,33 @@ impl Agent {
         }
 
         let final_msg = user_msg.unwrap_or_else(|| Message::user(user_input));
+
+        // Check if user input triggers a skill template
+        if let Some(skill) = crate::skills::find_matching_skill(user_input, &self.settings.project_root) {
+            let _ = self.event_tx.send(AgentEvent::Status(format!("✨ Triggered skill: {}", skill.name)));
+            if let Some(system_msg) = self.messages.first_mut() {
+                if system_msg.role == Role::System {
+                    let mut text = system_msg.text();
+                    text.push_str("\n\n=== TRIGGERED SKILL: ");
+                    text.push_str(&skill.name);
+                    text.push_str(" ===\n");
+                    text.push_str(&skill.system_instructions);
+                    text.push_str("\n====================================\n");
+                    system_msg.content = vec![ContentPart::Text { text }];
+                }
+            }
+        }
+
         self.messages.push(final_msg);
+
+        // ── Context compaction check ─────────────────────────────────────
+        let context_window = self.get_context_window();
+        if compaction::should_compact(&self.messages, context_window, 80) {
+            let _ = self
+                .event_tx
+                .send(AgentEvent::Status("🗜️ Compacting context...".into()));
+            self.messages = compaction::compact(&self.messages, 4);
+        }
 
         let max_loops = self.settings.max_thinking_loops;
 
@@ -410,11 +598,9 @@ impl Agent {
             // Stream response from AI
             let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<AiStreamEvent>();
 
-            let client = &self.client;
-            let stream_handle = {
-                // We need to collect the request before spawning since AiClient isn't 'static
-                // Instead, we await inline
-                client.chat_stream(request, stream_tx)
+            let client = self.client.clone();
+            let stream_handle = async move {
+                client.chat_stream(request, stream_tx).await
             };
 
             // Process stream in background
@@ -535,15 +721,52 @@ impl Agent {
             // If no tool calls, we're done
             if !has_tool_calls {
                 let _ = self.event_tx.send(AgentEvent::Done { usage: final_usage });
+                self.save_session();
                 return Ok(());
             }
 
-            // Execute tool calls in parallel
+            // ── Check approvals ──────────────────────────────────────────
+            let mut tool_approvals = std::collections::HashMap::new();
+            if let Some(ref mut approval_rx) = self.approval_rx {
+                for tc in &pending_tool_calls {
+                    let name = tc.name.clone();
+                    let id = tc.id.clone();
+                    let args = match &tc.arguments {
+                        serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or(json!({})),
+                        other => other.clone(),
+                    };
+
+                    if self.settings.needs_approval(&name) {
+                        let _ = self.event_tx.send(AgentEvent::ApprovalRequest {
+                            id: id.clone(),
+                            tool_name: name.clone(),
+                            args_preview: args.to_string(),
+                        });
+
+                        // Wait for user input
+                        if let Some(approved) = approval_rx.recv().await {
+                            tool_approvals.insert(id, approved);
+                        } else {
+                            tool_approvals.insert(id, false);
+                        }
+                    } else {
+                        tool_approvals.insert(id, true);
+                    }
+                }
+            } else {
+                for tc in &pending_tool_calls {
+                    tool_approvals.insert(tc.id.clone(), true);
+                }
+            }
+
+            // ── Execute tool calls in PARALLEL ───────────────────────────
             let tool_ctx = ToolContext {
                 settings: self.settings.clone(),
                 cwd: self.settings.project_root.clone(),
                 client: Some(self.client.clone()),
             };
+
+            let mut handles = Vec::new();
 
             for tc in &pending_tool_calls {
                 let name = tc.name.clone();
@@ -553,37 +776,83 @@ impl Agent {
                     other => other.clone(),
                 };
                 let ctx = tool_ctx.clone();
-                let tools = &self.tools;
+                let tools = self.tools.clone();
+                let ev_tx = self.event_tx.clone();
+                let project_root = self.settings.project_root.clone();
+                let is_approved = tool_approvals.get(&id).cloned().unwrap_or(true);
 
-                // Execute the tool
-                let result = tools.execute(&name, args, &ctx).await;
+                handles.push(tokio::spawn(async move {
+                    if !is_approved {
+                        let res = ToolResult::err("⚠️ User denied execution of this tool call.");
+                        let _ = ev_tx.send(AgentEvent::ToolResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            result: res.to_message_content(),
+                            success: false,
+                        });
+                        return (id, name, res);
+                    }
 
-                // Detect file writes for live streaming
-                if name == "write_file" || name == "edit_file" {
-                    if let Some(data) = &result.data {
-                        if let Some(path) = data["path"].as_str() {
-                            let preview = result.output.chars().take(200).collect::<String>();
-                            let _ = self.event_tx.send(AgentEvent::FileWrite {
-                                path: path.to_string(),
-                                content_preview: preview,
-                            });
+                    // Snapshot files before write/edit operations
+                    if name == "write_file" || name == "edit_file" {
+                        if let Some(path_str) = args["path"].as_str() {
+                            let full_path = ctx.cwd.join(path_str);
+                            let _ = checkpoint::snapshot_file(&project_root, &full_path);
                         }
                     }
+
+                    // Execute the tool
+                    let result = tools.execute(&name, args.clone(), &ctx).await;
+
+                    // Detect file writes for live streaming
+                    if name == "write_file" || name == "edit_file" {
+                        if let Some(data) = &result.data {
+                            if let Some(path) = data["path"].as_str() {
+                                let preview =
+                                    result.output.chars().take(200).collect::<String>();
+                                let _ = ev_tx.send(AgentEvent::FileWrite {
+                                    path: path.to_string(),
+                                    content_preview: preview,
+                                });
+                            }
+                        }
+                    }
+
+                    let _ = ev_tx.send(AgentEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        result: result.to_message_content(),
+                        success: result.success,
+                    });
+
+                    (id, name, result)
+                }));
+            }
+
+            // Wait for ALL tool calls to complete in parallel
+            let results = futures::future::join_all(handles).await;
+
+            // Assemble tool result messages in the original order
+            for result in results {
+                match result {
+                    Ok((id, name, tool_result)) => {
+                        self.messages.push(Message::tool_result(
+                            &id,
+                            &name,
+                            tool_result.to_message_content(),
+                        ));
+                    }
+                    Err(e) => {
+                        let err_msg = format!("Tool execution panicked: {}", e);
+                        let _ = self.event_tx.send(AgentEvent::Error(err_msg.clone()));
+                        // Still add a result so the model doesn't get confused
+                        self.messages.push(Message::tool_result(
+                            "error",
+                            "internal",
+                            err_msg,
+                        ));
+                    }
                 }
-
-                let _ = self.event_tx.send(AgentEvent::ToolResult {
-                    id: id.clone(),
-                    name: name.clone(),
-                    result: result.to_message_content(),
-                    success: result.success,
-                });
-
-                // Add tool result to conversation
-                self.messages.push(Message::tool_result(
-                    &id,
-                    &name,
-                    result.to_message_content(),
-                ));
             }
 
             // Continue the loop — the model will see tool results and continue
@@ -594,6 +863,7 @@ impl Agent {
             max_loops
         )));
         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+        self.save_session();
 
         Ok(())
     }
@@ -602,14 +872,57 @@ impl Agent {
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
+
+    /// Save current session to disk.
+    fn save_session(&mut self) {
+        if let Some(ref mut session) = self.session {
+            session.messages = self.messages.clone();
+            let _ = session.save(&self.settings.project_root);
+        } else {
+            let mut sess = session::Session::new(
+                self.messages.clone(),
+                &self.settings.active_model,
+                &self.settings.active_provider,
+            );
+            let _ = sess.save(&self.settings.project_root);
+            self.session = Some(sess);
+        }
+    }
+
+    /// Get the context window size for the current model.
+    fn get_context_window(&self) -> usize {
+        let registry = crate::config::providers::build_registry();
+        for provider in &registry {
+            for model in &provider.models {
+                if model.id == self.settings.active_model {
+                    return model.context_window;
+                }
+            }
+        }
+        // Default fallback
+        128_000
+    }
 }
 
 fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
     let tool_names = tools.tool_names().join(", ");
+
+    // Try to load project context for richer prompts
+    let project_ctx = history::ProjectContext::load(&settings.project_root)
+        .or_else(|_| Ok::<_, eyre::Report>(history::ProjectContext::scan(&settings.project_root)))
+        .unwrap_or_else(|_| history::ProjectContext::scan(&settings.project_root));
+
+    let project_info = project_ctx.to_prompt_summary();
+
+    // Try to include README summary
+    let readme_summary = load_readme_summary(&settings.project_root);
+
     format!(
         "You are Norvexum, an advanced AI coding assistant running inside a project directory.\n\n\
-         Project root: {}\n\
-         Available tools: {}\n\n\
+         {project_info}\n\
+         Project root: {root}\n\
+         Available tools: {tool_names}\n\
+         {readme}\n\
          RULES:\n\
          - You can ONLY access files within the project directory (sandbox)\n\
          - Think step by step before acting\n\
@@ -619,11 +932,30 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          - Check packages for safety before installing (check_package tool)\n\
          - Create Python venvs when pip packages are needed\n\
          - When an image is relevant, check if you can see it (vision) or use OCR\n\
+         - For batch image analysis, use batch_view_images (up to 10 at once)\n\
+         - Use git tools (git_status, git_diff, git_commit, git_log) for version control\n\
          - Be concise but thorough in your responses\n\
          - If generating images, decide whether to generate (create) or search (find existing)\n",
-        settings.project_root.display(),
-        tool_names,
+        root = settings.project_root.display(),
+        readme = readme_summary,
     )
+}
+
+fn load_readme_summary(root: &std::path::Path) -> String {
+    for name in &["README.md", "readme.md", "README.txt", "README"] {
+        let path = root.join(name);
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let summary: String = content.chars().take(500).collect();
+                return format!(
+                    "\nPROJECT README (first 500 chars):\n{}{}\n",
+                    summary,
+                    if content.len() > 500 { "..." } else { "" }
+                );
+            }
+        }
+    }
+    String::new()
 }
 
 fn detect_image(user_input: &str, project_root: &std::path::Path) -> Option<std::path::PathBuf> {

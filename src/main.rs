@@ -72,14 +72,42 @@ enum ConfigAction {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    // Initialize tracing (logs to stderr so TUI stdout is clean)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "norvexum=info,warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Check if running in headless mode
+    let is_headless = std::env::args().any(|arg| arg == "--headless");
+
+    if is_headless {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "norvexum=info,warn".into()),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        // TUI mode: write logs to file to prevent console pollution/corruption
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("norvexum.log")
+        {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "norvexum=info,warn".into()),
+                )
+                .with_writer(file)
+                .init();
+        } else {
+            // Discard logs if we cannot open the log file
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "norvexum=info,warn".into()),
+                )
+                .with_writer(std::io::sink)
+                .init();
+        }
+    }
 
     // Load local .env file (silently ignore if missing)
     dotenvy::dotenv().ok();
