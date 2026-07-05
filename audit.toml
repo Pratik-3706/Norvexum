@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+  "RUSTSEC-2026-0009", # time - Denial of Service via Stack Exhaustion (requires Rust 1.88.0)
+  "RUSTSEC-2025-0057", # fxhash - no longer maintained (transitive dependency)
+  "RUSTSEC-2025-0119", # number_prefix - no longer maintained (transitive dependency)
+  "RUSTSEC-2024-0436", # paste - no longer maintained (transitive dependency)
+  "RUSTSEC-2026-0002"  # lru - unsoundness in IterMut (transitive dependency)
+]

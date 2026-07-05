@@ -150,8 +150,8 @@ fn scan_skills_dir(dir: &Path, skills: &mut Vec<Skill>) {
     }
 }
 
-/// Load default and all custom skills, checking trigger patterns against query.
-pub fn find_matching_skill(query: &str, project_root: &Path) -> Option<Skill> {
+/// Load default and all custom skills from project and home paths
+pub fn load_all_skills(project_root: &Path) -> Vec<Skill> {
     let mut skills = load_default_skills();
 
     // 1. Scan <project_root>/src/skills/
@@ -168,6 +168,12 @@ pub fn find_matching_skill(query: &str, project_root: &Path) -> Option<Skill> {
         scan_skills_dir(&home.join(".norvexum").join("skills"), &mut skills);
     }
 
+    skills
+}
+
+/// Load default and all custom skills, checking trigger patterns against query.
+pub fn find_matching_skill(query: &str, project_root: &Path) -> Option<Skill> {
+    let skills = load_all_skills(project_root);
     let query_lower = query.to_lowercase();
     for skill in skills {
         for pattern in &skill.trigger_patterns {

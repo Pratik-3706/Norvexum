@@ -939,6 +939,21 @@ impl Agent {
 fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
     let tool_names = tools.tool_names().join(", ");
 
+    // Load available skills dynamically so the AI knows about its capabilities
+    let skills = crate::skills::load_all_skills(&settings.project_root);
+    let mut skills_info = String::new();
+    if !skills.is_empty() {
+        skills_info.push_str("\nAvailable Specialized Skills (will automatically append detailed instructions when triggered):\n");
+        for skill in &skills {
+            skills_info.push_str(&format!(
+                "- **{}**: {} (Triggers on: {})\n",
+                skill.name,
+                skill.description,
+                skill.trigger_patterns.join(", ")
+            ));
+        }
+    }
+
     // Try to load project context for richer prompts
     let project_ctx = history::ProjectContext::load(&settings.project_root)
         .or_else(|_| Ok::<_, eyre::Report>(history::ProjectContext::scan(&settings.project_root)))
@@ -954,6 +969,7 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          {project_info}\n\
          Project root: {root}\n\
          Available tools: {tool_names}\n\
+         {skills}\n\
          {readme}\n\
          RULES:\n\
          - You can ONLY access files within the project directory (sandbox)\n\
@@ -973,6 +989,7 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          - Save/download/generate images to the user's desired/requested folder or the current working directory, not a hardcoded 'assets' folder\n",
         root = settings.project_root.display(),
         readme = readme_summary,
+        skills = skills_info,
     )
 }
 
