@@ -90,6 +90,7 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
         println!("Press Ctrl+C to exit.\n");
 
         let agent_rx_print = agent_rx;
+        let approval_tx_print = approval_tx.clone();
         let print_task = tokio::spawn(async move {
             let mut rx = agent_rx_print;
             while let Some(event) = rx.recv().await {
@@ -146,10 +147,29 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
                         tool_name,
                         args_preview,
                     } => {
+                        let mut approved = true;
+                        let mut reason = "[Auto-approved in headless mode]".to_string();
+
+                        if tool_name == "run_command" {
+                            if let Ok(args_val) =
+                                serde_json::from_str::<serde_json::Value>(&args_preview)
+                            {
+                                if let Some(cmd_str) =
+                                    args_val.get("command").and_then(|v| v.as_str())
+                                {
+                                    if crate::tools::shell::is_unparseable_or_fallback(cmd_str) {
+                                        approved = false;
+                                        reason = "[Auto-denied in headless mode: forced shell fallback containing wildcards/metacharacters is blocked]".to_string();
+                                    }
+                                }
+                            }
+                        }
+
                         println!(
-                            "\n⚠️  Tool '{}' wants to execute:\n  {}\n  [Auto-approved in headless mode]",
-                            tool_name, args_preview
+                            "\n⚠️  Tool '{}' wants to execute:\n  {}\n  {}",
+                            tool_name, args_preview, reason
                         );
+                        let _ = approval_tx_print.send(approved);
                     }
                     _ => {}
                 }

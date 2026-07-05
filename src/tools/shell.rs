@@ -64,7 +64,8 @@ fn clean_path_string(s: &str) -> &str {
 
 fn extract_paths(token: &str) -> Vec<&str> {
     let mut paths = Vec::new();
-    if let Some((_, right)) = token.split_once('=') {
+    if let Some((left, right)) = token.split_once('=') {
+        paths.push(left);
         paths.push(right);
     } else if token.starts_with('-') {
         if let Some(idx) = token.find(['/', '\\', '.', '~']) {
