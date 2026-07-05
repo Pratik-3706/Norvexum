@@ -583,6 +583,12 @@ impl Agent {
 
         let max_loops = self.settings.max_thinking_loops;
 
+        let mut accumulated_usage = UsageStats {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
+
         for loop_num in 0..max_loops {
             let _ = self.event_tx.send(AgentEvent::Status(format!(
                 "Thinking (loop {}/{})...",
@@ -650,6 +656,11 @@ impl Agent {
                                 pending_tool_calls.push(tc);
                             }
                             AiStreamEvent::Done { finish_reason: _, usage } => {
+                                if let Some(ref u) = usage {
+                                    accumulated_usage.prompt_tokens += u.prompt_tokens;
+                                    accumulated_usage.completion_tokens += u.completion_tokens;
+                                    accumulated_usage.total_tokens += u.total_tokens;
+                                }
                                 final_usage = usage;
                             }
                             AiStreamEvent::Error(e) => {
@@ -696,6 +707,11 @@ impl Agent {
                         finish_reason: _,
                         usage,
                     } => {
+                        if let Some(ref u) = usage {
+                            accumulated_usage.prompt_tokens += u.prompt_tokens;
+                            accumulated_usage.completion_tokens += u.completion_tokens;
+                            accumulated_usage.total_tokens += u.total_tokens;
+                        }
                         final_usage = usage;
                     }
                     AiStreamEvent::Error(e) => {
@@ -720,7 +736,7 @@ impl Agent {
 
             // If no tool calls, we're done
             if !has_tool_calls {
-                let _ = self.event_tx.send(AgentEvent::Done { usage: final_usage });
+                let _ = self.event_tx.send(AgentEvent::Done { usage: Some(accumulated_usage.clone()) });
                 self.save_session();
                 return Ok(());
             }
@@ -862,7 +878,7 @@ impl Agent {
             "Max thinking loops ({}) reached",
             max_loops
         )));
-        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+        let _ = self.event_tx.send(AgentEvent::Done { usage: Some(accumulated_usage) });
         self.save_session();
 
         Ok(())
