@@ -201,7 +201,7 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
         print_task.abort();
     } else {
         // Run standard interactive TUI mode
-        let mut app = App::new(&model_info);
+        let mut app = App::new(&model_info, settings.project_root.clone());
         if let Some(message) = initial_for_ui {
             app.add_user_message(message);
         }

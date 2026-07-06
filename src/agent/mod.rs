@@ -691,9 +691,9 @@ impl Agent {
             )));
 
             let mut active_messages = self.messages.clone();
-            if loop_num >= max_loops.saturating_sub(2) {
+            if loop_num >= max_loops.saturating_sub(1) {
                 active_messages.push(Message::system(format!(
-                    "⚠️ SYSTEM WARNING: You are on cycle {} of {}. You are about to reach the loop limit. \
+                    "⚠️ SYSTEM WARNING: You are on the final cycle ({} of {}). You are about to reach the loop limit. \
                      You MUST stop calling tools now, summarize your current progress, and ask the user to type 'continue' to let you proceed in the next turn.",
                     loop_num + 1, max_loops
                 )));

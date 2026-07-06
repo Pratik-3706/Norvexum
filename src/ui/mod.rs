@@ -55,6 +55,8 @@ pub struct App {
     pub show_tool_details: bool,
     pub tool_details_scroll: u16,
     pub active_skill: Option<String>,
+    pub project_root: std::path::PathBuf,
+    pub user_backlog: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +105,7 @@ pub enum ToolStatus {
 }
 
 impl App {
-    pub fn new(model_info: &str) -> Self {
+    pub fn new(model_info: &str, project_root: std::path::PathBuf) -> Self {
         Self {
             chat_lines: vec![ChatLine {
                 content: "Ask a question, request a change, or type /help.".into(),
@@ -135,6 +137,8 @@ impl App {
             show_tool_details: false,
             tool_details_scroll: 0,
             active_skill: None,
+            project_root,
+            user_backlog: Vec::new(),
         }
     }
 
@@ -487,7 +491,7 @@ impl App {
                 self.cursor_pos = 0;
                 None
             }
-            KeyCode::Enter if !self.is_processing => {
+            KeyCode::Enter => {
                 let message = self.input.trim().to_string();
                 if message.is_empty() {
                     return None;
@@ -496,39 +500,52 @@ impl App {
                 self.history_pos = None;
                 self.input.clear();
                 self.cursor_pos = 0;
-                self.add_user_message(message.clone());
-                Some(message)
+
+                if self.is_processing {
+                    // Queue the message to backlog
+                    self.chat_lines.push(ChatLine {
+                        content: message.clone(),
+                        style: LineStyle::User,
+                        tool_call_id: None,
+                    });
+                    self.user_backlog.push(message);
+                    self.auto_scroll();
+                    None
+                } else {
+                    self.add_user_message(message.clone());
+                    Some(message)
+                }
             }
-            KeyCode::Char(c) if !self.is_processing => {
+            KeyCode::Char(c) => {
                 self.insert_text(&c.to_string());
                 None
             }
-            KeyCode::Backspace if !self.is_processing && self.cursor_pos > 0 => {
+            KeyCode::Backspace if self.cursor_pos > 0 => {
                 let start = byte_index(&self.input, self.cursor_pos - 1);
                 let end = byte_index(&self.input, self.cursor_pos);
                 self.input.replace_range(start..end, "");
                 self.cursor_pos -= 1;
                 None
             }
-            KeyCode::Delete if !self.is_processing && self.cursor_pos < char_count(&self.input) => {
+            KeyCode::Delete if self.cursor_pos < char_count(&self.input) => {
                 let start = byte_index(&self.input, self.cursor_pos);
                 let end = byte_index(&self.input, self.cursor_pos + 1);
                 self.input.replace_range(start..end, "");
                 None
             }
-            KeyCode::Left if !self.is_processing => {
+            KeyCode::Left => {
                 self.cursor_pos = self.cursor_pos.saturating_sub(1);
                 None
             }
-            KeyCode::Right if !self.is_processing => {
+            KeyCode::Right => {
                 self.cursor_pos = (self.cursor_pos + 1).min(char_count(&self.input));
                 None
             }
-            KeyCode::Home if !self.is_processing => {
+            KeyCode::Home => {
                 self.cursor_pos = 0;
                 None
             }
-            KeyCode::End if !self.is_processing => {
+            KeyCode::End => {
                 self.cursor_pos = char_count(&self.input);
                 None
             }
@@ -875,6 +892,35 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(chat, area);
 }
 
+fn clean_paths(text: &str, project_root: &std::path::Path) -> String {
+    let mut cleaned = text.to_string();
+    if let Some(parent) = project_root.parent() {
+        let parent_str_forward = parent.to_string_lossy().replace('\\', "/");
+        let parent_str_backward = parent.to_string_lossy().replace('/', "\\");
+
+        // Ensure trailing slash is included to strip prefix cleanly
+        let p_forward = if parent_str_forward.ends_with('/') {
+            parent_str_forward
+        } else {
+            parent_str_forward + "/"
+        };
+        let p_backward = if parent_str_backward.ends_with('\\') {
+            parent_str_backward
+        } else {
+            parent_str_backward + "\\"
+        };
+
+        cleaned = cleaned.replace(&p_forward, "");
+        cleaned = cleaned.replace(&p_backward, "");
+    } else {
+        let root_str_forward = project_root.to_string_lossy().replace('\\', "/");
+        let root_str_backward = project_root.to_string_lossy().replace('/', "\\");
+        cleaned = cleaned.replace(&root_str_forward, ".");
+        cleaned = cleaned.replace(&root_str_backward, ".");
+    }
+    cleaned
+}
+
 fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
     let title = if app.active_panel == ActivePanel::Activity {
         "ACTIVITY (Focused)"
@@ -937,7 +983,8 @@ fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(&entry.name, style),
         ]));
 
-        for detail in wrap_text(&entry.detail, area.width.saturating_sub(6) as usize)
+        let cleaned_detail = clean_paths(&entry.detail, &app.project_root);
+        for detail in wrap_text(&cleaned_detail, area.width.saturating_sub(6) as usize)
             .into_iter()
             .take(2)
         {
@@ -960,7 +1007,8 @@ fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
         let mut line_offset = 0;
         let mut selected_y = 0;
         for (i, entry) in app.tool_log.iter().rev().enumerate() {
-            let detail_lines = wrap_text(&entry.detail, area.width.saturating_sub(6) as usize)
+            let cleaned_detail = clean_paths(&entry.detail, &app.project_root);
+            let detail_lines = wrap_text(&cleaned_detail, area.width.saturating_sub(6) as usize)
                 .into_iter()
                 .take(2)
                 .count();
@@ -997,14 +1045,16 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let cursor = app.cursor_pos;
     let offset = cursor.saturating_sub(available.saturating_sub(1));
     let visible: String = app.input.chars().skip(offset).take(available).collect();
-    let display = if app.is_processing {
-        "Working... press Esc to stop".to_string()
-    } else if visible.is_empty() {
-        "What should we build?".to_string()
+    let display = if visible.is_empty() {
+        if app.is_processing {
+            "Working... (type message to queue)".to_string()
+        } else {
+            "What should we build?".to_string()
+        }
     } else {
         visible
     };
-    let color = if app.input.is_empty() || app.is_processing {
+    let color = if app.input.is_empty() {
         app.theme.dim_color
     } else {
         app.theme.input_color
@@ -1076,7 +1126,15 @@ pub async fn run_tui(
         loop {
             terminal.draw(|frame| draw(frame, &app))?;
             tokio::select! {
-                Some(event) = agent_rx.recv() => app.handle_agent_event(event),
+                Some(event) = agent_rx.recv() => {
+                    app.handle_agent_event(event);
+                    if !app.is_processing && !app.user_backlog.is_empty() {
+                        let next_msg = app.user_backlog.remove(0);
+                        app.is_processing = true;
+                        app.status = "Starting next task".into();
+                        let _ = user_tx.send(next_msg);
+                    }
+                }
                 Some(event) = event_rx.recv() => match event {
                     Event::Key(key) if key.kind == event::KeyEventKind::Press => {
                         if app.approval_pending.is_some() {
@@ -1102,6 +1160,7 @@ pub async fn run_tui(
                                 app.selection_end = None;
                                 app.is_selecting = false;
                             } else if app.is_processing {
+                                app.user_backlog.clear();
                                 let _ = cancel_tx.send(());
                             } else {
                                 app.should_quit = true;
@@ -1138,10 +1197,25 @@ pub async fn run_tui(
                             }
                         }
                         MouseEventKind::ScrollUp => {
-                            app.chat_scroll = app.chat_scroll.saturating_add(3);
+                            let size = terminal.size().unwrap_or_default();
+                            let is_on_tools = size.width >= 100 && mouse.column >= (size.width * 72 / 100);
+                            if is_on_tools || app.active_panel == ActivePanel::Activity {
+                                app.selected_tool_index = app.selected_tool_index.saturating_sub(1);
+                            } else {
+                                app.chat_scroll = app.chat_scroll.saturating_add(3);
+                            }
                         }
                         MouseEventKind::ScrollDown => {
-                            app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                            let size = terminal.size().unwrap_or_default();
+                            let is_on_tools = size.width >= 100 && mouse.column >= (size.width * 72 / 100);
+                            if is_on_tools || app.active_panel == ActivePanel::Activity {
+                                if !app.tool_log.is_empty() {
+                                    app.selected_tool_index = (app.selected_tool_index + 1)
+                                        .min(app.tool_log.len().saturating_sub(1));
+                                }
+                            } else {
+                                app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                            }
                         }
                         _ => {}
                     },
@@ -1557,7 +1631,7 @@ mod tests {
 
     #[test]
     fn unicode_input_editing_uses_character_boundaries() {
-        let mut app = App::new("test");
+        let mut app = App::new("test", std::path::PathBuf::new());
         app.handle_key(KeyCode::Char('日'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Char('本'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Left, KeyModifiers::NONE);
@@ -1573,7 +1647,7 @@ mod tests {
 
     #[test]
     fn layout_is_responsive() {
-        let app = App::new("test-model / test-provider");
+        let app = App::new("test-model / test-provider", std::path::PathBuf::new());
 
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
