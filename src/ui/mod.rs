@@ -57,6 +57,8 @@ pub struct App {
     pub active_skill: Option<String>,
     pub project_root: std::path::PathBuf,
     pub user_backlog: Vec<String>,
+    pub terminal_width: u16,
+    pub terminal_height: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +141,8 @@ impl App {
             active_skill: None,
             project_root,
             user_backlog: Vec::new(),
+            terminal_width: 0,
+            terminal_height: 0,
         }
     }
 
@@ -1103,7 +1107,7 @@ pub async fn run_tui(
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -1204,7 +1208,7 @@ pub async fn run_tui(
                         }
                         MouseEventKind::ScrollUp => {
                             let size = terminal.size().unwrap_or_default();
-                            let is_on_tools = size.width >= 100 && mouse.column >= (size.width * 72 / 100);
+                            let is_on_tools = size.width >= 100 && mouse.column >= (size.width * 70 / 100);
                             if is_on_tools || app.active_panel == ActivePanel::Activity {
                                 app.selected_tool_index = app.selected_tool_index.saturating_sub(1);
                             } else {
@@ -1213,7 +1217,7 @@ pub async fn run_tui(
                         }
                         MouseEventKind::ScrollDown => {
                             let size = terminal.size().unwrap_or_default();
-                            let is_on_tools = size.width >= 100 && mouse.column >= (size.width * 72 / 100);
+                            let is_on_tools = size.width >= 100 && mouse.column >= (size.width * 70 / 100);
                             if is_on_tools || app.active_panel == ActivePanel::Activity {
                                 if !app.tool_log.is_empty() {
                                     app.selected_tool_index = (app.selected_tool_index + 1)
@@ -1240,7 +1244,7 @@ pub async fn run_tui(
     .await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     result
 }
