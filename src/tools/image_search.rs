@@ -445,7 +445,7 @@ impl Tool for ZerochanSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search for high-quality anime, game, manga, and fictional character artwork on Zerochan. \
+        "Search for high-quality artwork of anime and anime games characters only (like gacha games) on Zerochan. \
          Supports comma-separated tag search (e.g. 'Genshin Impact, Furina')."
     }
 
@@ -453,7 +453,7 @@ impl Tool for ZerochanSearchTool {
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Fictional/anime character search query (e.g. 'Genshin Impact, Furina' or just 'Furina')" },
+                "query": { "type": "string", "description": "Anime/anime game character search query (e.g. 'Genshin Impact, Furina' or just 'Furina')" },
                 "num_results": { "type": "integer", "description": "Results to return (default: 5, max: 20)" }
             },
             "required": ["query"]
