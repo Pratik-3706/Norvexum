@@ -160,13 +160,15 @@ impl Agent {
                             match parts[1] {
                                 "off" => {
                                     self.approval_disabled = true;
-                                    let _ = self.event_tx.send(AgentEvent::Status("🔓 Dynamic tool approval requirements disabled (warning: commands will execute automatically).".into()));
+                                    let msg = "🔓 Dynamic tool approval requirements disabled (warning: commands will execute automatically).".to_string();
+                                    let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
+                                    let _ = self.event_tx.send(AgentEvent::Content(msg));
                                 }
                                 "on" => {
                                     self.approval_disabled = false;
-                                    let _ = self.event_tx.send(AgentEvent::Status(
-                                        "🔒 Dynamic tool approval requirements enabled.".into(),
-                                    ));
+                                    let msg = "🔒 Dynamic tool approval requirements enabled.".to_string();
+                                    let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
+                                    let _ = self.event_tx.send(AgentEvent::Content(msg));
                                 }
                                 _ => {
                                     let _ = self.event_tx.send(AgentEvent::Error(
@@ -193,10 +195,9 @@ impl Agent {
                             if let Ok(num) = parts[1].parse::<usize>() {
                                 if num > 0 {
                                     self.max_loops = num;
-                                    let _ = self.event_tx.send(AgentEvent::Status(format!(
-                                        "🔄 Maximum thinking loop cycles set to {}.",
-                                        num
-                                    )));
+                                    let msg = format!("🔄 Maximum thinking loop cycles set to {}.", num);
+                                    let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
+                                    let _ = self.event_tx.send(AgentEvent::Content(msg));
                                 } else {
                                     let _ = self.event_tx.send(AgentEvent::Error(
                                         "Loop limit must be greater than 0".into(),
@@ -221,9 +222,9 @@ impl Agent {
                             self.messages.truncate(1); // Retain only system prompt
                         }
                         let _ = self.event_tx.send(AgentEvent::ClearChat);
-                        let _ = self
-                            .event_tx
-                            .send(AgentEvent::Status("🧹 Chat cleared".into()));
+                        let msg = "🧹 Chat cleared".to_string();
+                        let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
+                        let _ = self.event_tx.send(AgentEvent::Content(msg));
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
                         return Ok(());
                     }
@@ -390,9 +391,9 @@ impl Agent {
                         return Ok(());
                     }
                     "/stop" => {
-                        let _ = self
-                            .event_tx
-                            .send(AgentEvent::Status("⏹️ Already stopped".into()));
+                        let msg = "⏹️ Already stopped".to_string();
+                        let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
+                        let _ = self.event_tx.send(AgentEvent::Content(msg));
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
                         return Ok(());
                     }
