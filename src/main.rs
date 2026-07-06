@@ -172,5 +172,5 @@ async fn main() -> Result<()> {
         }
     }
 
-    Ok(())
+    std::process::exit(0);
 }
