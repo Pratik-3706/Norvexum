@@ -1003,7 +1003,7 @@ fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
 
     // Standard scroll calculation for tool log
     let visible = area.height.saturating_sub(3) as usize;
-    let scroll_y = if app.active_panel == ActivePanel::Activity {
+    let scroll_y = {
         let mut line_offset = 0;
         let mut selected_y = 0;
         for (i, entry) in app.tool_log.iter().rev().enumerate() {
@@ -1023,8 +1023,6 @@ fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             0
         }
-    } else {
-        0
     };
 
     frame.render_widget(
@@ -1171,6 +1169,14 @@ pub async fn run_tui(
                     }
                     Event::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
+                            let size = terminal.size().unwrap_or_default();
+                            let is_on_tools = size.width >= 100 && mouse.column >= (size.width * 72 / 100);
+                            if is_on_tools {
+                                app.active_panel = ActivePanel::Activity;
+                            } else {
+                                app.active_panel = ActivePanel::Chat;
+                            }
+
                             app.selection_start = Some((mouse.column, mouse.row));
                             app.selection_end = Some((mouse.column, mouse.row));
                             app.is_selecting = true;
