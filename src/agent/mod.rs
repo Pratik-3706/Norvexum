@@ -1071,7 +1071,7 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          - Media files (such as images, icons, logos, background artwork) SHOULD go in dedicated subdirectories like 'media/', 'static/', etc. (though this is not a strict requirement, it is best practice for professional layouts).\n\
          - When an image is relevant, check if you can see it (vision) or use OCR\n\
          - For batch image analysis, use batch_view_images (up to 10 at once)\n\
-         - If the website or web application holds media, you MUST use the view_image or batch_view_images tools to verify that the images look proper, align well, are not cropped due to aspect ratio differences, and perform any necessary image editing or adjustments using the available tools.\n\
+         - If the website or web application holds media, you MUST use the view_image or batch_view_images tools to verify that the images look proper, align well, are not cropped due to aspect ratio differences, and perform any necessary image editing or adjustments using the available tools (such as by writing and executing Python scripts using libraries like Pillow/PIL via the run_command tool).\n\
          - Use git tools (git_status, git_diff, git_commit, git_log) for version control\n\
          - Be concise but thorough in your responses\n\
          - If the user asks to generate, create, or make an image, use the generate_image tool.\n\
