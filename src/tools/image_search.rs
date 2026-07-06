@@ -384,20 +384,13 @@ async fn fetch_zerochan_images(
 }
 
 async fn query_zerochan_raw(
-    _client: &reqwest::Client,
+    client: &reqwest::Client,
     search_path: &str,
     limit: usize,
 ) -> Option<Vec<serde_json::Value>> {
     // Zerochan API docs: User-Agent MUST be "ProjectName - Username", NOT a browser UA.
     // Browser-like UAs trigger their nginx anti-bot challenge (503).
     let user_agent = "Norvexum - ZerochanAPIUser";
-
-    // Disable auto-redirect so we can manually preserve the JSON query parameters
-    let api_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .ok()?;
 
     // Encode spaces as + for Zerochan tag URLs, but keep commas intact for multi-tag search
     let encoded_path = search_path.replace(' ', "+");
@@ -408,7 +401,7 @@ async fn query_zerochan_raw(
 
     let mut attempts = 0;
     while attempts < 3 {
-        let response = api_client
+        let response = client
             .get(&current_url)
             .header("User-Agent", user_agent)
             .header("Accept", "application/json")
@@ -476,7 +469,8 @@ impl Tool for ZerochanSearchTool {
         }
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -491,3 +485,6 @@ impl Tool for ZerochanSearchTool {
         ToolResult::err(format!("No image results found on Zerochan for: {}", query))
     }
 }
+
+
+
