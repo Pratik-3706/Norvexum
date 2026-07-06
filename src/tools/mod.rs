@@ -17,6 +17,7 @@ pub mod image_inspect;
 pub mod image_search;
 pub mod package_safety;
 pub mod shell;
+pub mod skills;
 pub mod web_fetch;
 pub mod web_search;
 
@@ -160,6 +161,8 @@ impl ToolRegistry {
         registry.register(Arc::new(image_download::BatchDownloadImageTool));
         registry.register(Arc::new(image_inspect::InspectImageTool));
         registry.register(Arc::new(image_gen::GenerateImageTool));
+        registry.register(Arc::new(skills::ListSkillsTool));
+        registry.register(Arc::new(skills::ReadSkillTool));
 
         // ── Batch image analysis ─────────────────────────────────────────
         registry.register(Arc::new(batch_image_inspect::BatchViewImageTool));

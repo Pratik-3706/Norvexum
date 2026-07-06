@@ -6,6 +6,7 @@ use base64::Engine;
 use eyre::Result;
 
 /// Encode a local image file to base64 for the AI model.
+/// Compresses and resizes large images to speed up upload for vision models.
 pub fn encode_image_file(path: &std::path::Path) -> Result<(String, String)> {
     let bytes = std::fs::read(path)?;
     let mime = match path.extension().and_then(|e| e.to_str()) {
@@ -17,6 +18,31 @@ pub fn encode_image_file(path: &std::path::Path) -> Result<(String, String)> {
         Some("bmp") => "image/bmp",
         _ => "image/jpeg",
     };
+
+    // If the image is large (> 300 KB) and not a gif (which loses animation on resize), resize/compress it
+    if bytes.len() > 300_000 && mime != "image/gif" {
+        if let Ok(img) = image::load_from_memory(&bytes) {
+            let max_dim = 1024;
+            let w = img.width();
+            let h = img.height();
+
+            if w > max_dim || h > max_dim {
+                let resized = img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle);
+                let mut compressed = std::io::Cursor::new(Vec::new());
+                if resized.write_to(&mut compressed, image::ImageFormat::Jpeg).is_ok() {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(compressed.get_ref());
+                    return Ok((b64, "image/jpeg".to_string()));
+                }
+            } else {
+                let mut compressed = std::io::Cursor::new(Vec::new());
+                if img.write_to(&mut compressed, image::ImageFormat::Jpeg).is_ok() {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(compressed.get_ref());
+                    return Ok((b64, "image/jpeg".to_string()));
+                }
+            }
+        }
+    }
+
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok((b64, mime.to_string()))
 }

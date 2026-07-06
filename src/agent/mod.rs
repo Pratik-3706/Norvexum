@@ -1066,8 +1066,12 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          - For web content, prefer web_fetch. Use browser_open only when blocked\n\
          - Check packages for safety before installing (check_package tool)\n\
          - Create Python venvs **inside** the project directory (e.g., `./.venv` or `./pdfenv`). Never create or reference paths outside the project root (such as `../.venv`), as they will be blocked by the security sandbox.\n\
+         - At the start of any new coding, design, or implementation task, you MUST first view the available specialized skills using the list_skills tool, and then read the guidelines for any relevant skill(s) (such as Frontend Specialist or Backend Engineer) using the read_skill tool, so that the TUI activity panel logs your inspection of these templates.\n\
+         - When executing skills, you MUST prioritize professional-grade implementations: write robust, production-ready, clean, well-commented code, structure directory layouts logically, and enforce high-end responsive visual design and layout principles.\n\
+         - Media files (such as images, icons, logos, background artwork) SHOULD go in dedicated subdirectories like 'media/', 'static/', etc. (though this is not a strict requirement, it is best practice for professional layouts).\n\
          - When an image is relevant, check if you can see it (vision) or use OCR\n\
          - For batch image analysis, use batch_view_images (up to 10 at once)\n\
+         - If the website or web application holds media, you MUST use the view_image or batch_view_images tools to verify that the images look proper, align well, are not cropped due to aspect ratio differences, and perform any necessary image editing or adjustments using the available tools.\n\
          - Use git tools (git_status, git_diff, git_commit, git_log) for version control\n\
          - Be concise but thorough in your responses\n\
          - If the user asks to generate, create, or make an image, use the generate_image tool.\n\
