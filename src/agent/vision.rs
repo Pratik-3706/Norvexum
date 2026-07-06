@@ -29,14 +29,22 @@ pub fn encode_image_file(path: &std::path::Path) -> Result<(String, String)> {
             if w > max_dim || h > max_dim {
                 let resized = img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle);
                 let mut compressed = std::io::Cursor::new(Vec::new());
-                if resized.write_to(&mut compressed, image::ImageFormat::Jpeg).is_ok() {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(compressed.get_ref());
+                if resized
+                    .write_to(&mut compressed, image::ImageFormat::Jpeg)
+                    .is_ok()
+                {
+                    let b64 =
+                        base64::engine::general_purpose::STANDARD.encode(compressed.get_ref());
                     return Ok((b64, "image/jpeg".to_string()));
                 }
             } else {
                 let mut compressed = std::io::Cursor::new(Vec::new());
-                if img.write_to(&mut compressed, image::ImageFormat::Jpeg).is_ok() {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(compressed.get_ref());
+                if img
+                    .write_to(&mut compressed, image::ImageFormat::Jpeg)
+                    .is_ok()
+                {
+                    let b64 =
+                        base64::engine::general_purpose::STANDARD.encode(compressed.get_ref());
                     return Ok((b64, "image/jpeg".to_string()));
                 }
             }

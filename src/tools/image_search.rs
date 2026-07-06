@@ -485,6 +485,3 @@ impl Tool for ZerochanSearchTool {
         ToolResult::err(format!("No image results found on Zerochan for: {}", query))
     }
 }
-
-
-

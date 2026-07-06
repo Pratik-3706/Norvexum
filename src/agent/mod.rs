@@ -166,7 +166,8 @@ impl Agent {
                                 }
                                 "on" => {
                                     self.approval_disabled = false;
-                                    let msg = "🔒 Dynamic tool approval requirements enabled.".to_string();
+                                    let msg = "🔒 Dynamic tool approval requirements enabled."
+                                        .to_string();
                                     let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
                                     let _ = self.event_tx.send(AgentEvent::Content(msg));
                                 }
@@ -195,7 +196,8 @@ impl Agent {
                             if let Ok(num) = parts[1].parse::<usize>() {
                                 if num > 0 {
                                     self.max_loops = num;
-                                    let msg = format!("🔄 Maximum thinking loop cycles set to {}.", num);
+                                    let msg =
+                                        format!("🔄 Maximum thinking loop cycles set to {}.", num);
                                     let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
                                     let _ = self.event_tx.send(AgentEvent::Content(msg));
                                 } else {

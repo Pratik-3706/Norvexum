@@ -43,7 +43,7 @@ impl Tool for ListSkillsTool {
 
         ToolResult::ok_with_data(
             lines.join("\n"),
-            json!({ "skills": skills.iter().map(|s| s.name.clone()).collect::<Vec<_>>() })
+            json!({ "skills": skills.iter().map(|s| s.name.clone()).collect::<Vec<_>>() }),
         )
     }
 }
@@ -85,19 +85,17 @@ impl Tool for ReadSkillTool {
         let found = skills.iter().find(|s| s.name.to_lowercase() == name);
 
         match found {
-            Some(skill) => {
-                ToolResult::ok_with_data(
-                    format!(
-                        "--- Skill: {} ---\nDescription: {}\n\nSystem Instructions:\n{}",
-                        skill.name, skill.description, skill.system_instructions
-                    ),
-                    json!({
-                        "name": skill.name,
-                        "description": skill.description,
-                        "instructions": skill.system_instructions
-                    })
-                )
-            }
+            Some(skill) => ToolResult::ok_with_data(
+                format!(
+                    "--- Skill: {} ---\nDescription: {}\n\nSystem Instructions:\n{}",
+                    skill.name, skill.description, skill.system_instructions
+                ),
+                json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "instructions": skill.system_instructions
+                }),
+            ),
             None => {
                 let available: Vec<_> = skills.iter().map(|s| s.name.clone()).collect();
                 ToolResult::err(format!(
