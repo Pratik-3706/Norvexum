@@ -414,11 +414,13 @@ impl App {
                 .min(rendered.len().saturating_sub(1));
 
             let slice_chars = |st: &str, start_idx: usize, end_idx: usize| -> String {
-                st.chars().skip(start_idx).take(end_idx.saturating_sub(start_idx) + 1).collect()
+                st.chars()
+                    .skip(start_idx)
+                    .take(end_idx.saturating_sub(start_idx) + 1)
+                    .collect()
             };
-            let slice_chars_from = |st: &str, start_idx: usize| -> String {
-                st.chars().skip(start_idx).collect()
-            };
+            let slice_chars_from =
+                |st: &str, start_idx: usize| -> String { st.chars().skip(start_idx).collect() };
 
             let mut selected_lines = Vec::new();
             for idx in s..=e {
@@ -702,7 +704,11 @@ fn highlight_selection(frame: &mut Frame, start: (u16, u16), end: (u16, u16), _t
         }
 
         let start_col = if row == p1_row { p1_col } else { 0 };
-        let end_col = if row == p2_row { p2_col } else { area.width.saturating_sub(1) };
+        let end_col = if row == p2_row {
+            p2_col
+        } else {
+            area.width.saturating_sub(1)
+        };
 
         for col in start_col..=end_col {
             if col >= area.width {
