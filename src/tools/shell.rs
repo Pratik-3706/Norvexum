@@ -342,13 +342,17 @@ impl Tool for ShellCommandTool {
                 ("sh", vec!["-c", command_str])
             };
 
-            let output_res = tokio::process::Command::new(shell)
-                .args(&command_args)
-                .current_dir(&ctx.cwd)
-                .kill_on_drop(true)
-                .output()
-                .await;
+            let mut cmd = tokio::process::Command::new(shell);
+            cmd.args(&command_args)
+               .current_dir(&ctx.cwd)
+               .kill_on_drop(true);
 
+            #[cfg(windows)]
+            {
+                cmd.creation_flags(0x08000000);
+            }
+
+            let output_res = cmd.output().await;
             return handle_output(output_res);
         }
 
@@ -358,13 +362,17 @@ impl Tool for ShellCommandTool {
             return ToolResult::err("Parsed command is empty");
         }
 
-        let output_res = tokio::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .current_dir(&ctx.cwd)
-            .kill_on_drop(true)
-            .output()
-            .await;
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+           .current_dir(&ctx.cwd)
+           .kill_on_drop(true);
 
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(0x08000000);
+        }
+
+        let output_res = cmd.output().await;
         handle_output(output_res)
     }
 }

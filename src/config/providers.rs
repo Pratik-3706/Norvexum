@@ -317,6 +317,43 @@ pub fn build_registry() -> Vec<ProviderInfo> {
     ]
 }
 
+/// Build registry including custom user-added models
+pub fn build_registry_with_settings(settings: &crate::config::Settings) -> Vec<ProviderInfo> {
+    let mut registry = build_registry();
+    for custom in &settings.custom_models {
+        // Expected format: "provider_name:model_id" (e.g., "openai:gpt-6")
+        if let Some((prov_name, model_id)) = custom.split_once(':') {
+            if let Some(prov) = registry.iter_mut().find(|p| p.name == prov_name) {
+                // Check if already exists
+                if !prov.models.iter().any(|m| m.id == model_id) {
+                    let family = if model_id.contains("gpt-") {
+                        "gpt"
+                    } else if model_id.contains("claude") {
+                        "claude"
+                    } else if model_id.contains("gemini") {
+                        "gemini"
+                    } else {
+                        prov_name
+                    };
+
+                    prov.models.push(ModelInfo {
+                        id: model_id.to_string(),
+                        family: family.to_string(),
+                        multimodal: true,
+                        image_gen: false,
+                        tool_calling: true,
+                        streaming: true,
+                        context_window: 128_000,
+                        cost_per_1k_input: 0.0,
+                        cost_per_1k_output: 0.0,
+                    });
+                }
+            }
+        }
+    }
+    registry
+}
+
 /// Look up a provider by name.
 pub fn find_provider(name: &str) -> Option<ProviderInfo> {
     build_registry().into_iter().find(|p| p.name == name)

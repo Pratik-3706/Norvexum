@@ -38,18 +38,37 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
 
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<String>();
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
+    let (inst_tx, inst_rx) = mpsc::unbounded_channel::<String>();
 
     // Instantiate the agent
     let mut agent = Agent::new(settings.clone(), agent_tx.clone())?;
+    agent.set_instruction_receiver(inst_rx);
     let approval_tx = agent.approval_sender();
 
-    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
+    let (active_user_tx, mut active_user_rx) = mpsc::unbounded_channel::<String>();
+    let is_processing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let is_processing_router = is_processing.clone();
+    let inst_tx_router = inst_tx.clone();
+    let active_user_tx_router = active_user_tx.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = user_rx.recv().await {
+            if is_processing_router.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = inst_tx_router.send(msg);
+            } else {
+                let _ = active_user_tx_router.send(msg);
+            }
+        }
+    });
 
     // Spawn agent processing task
     let agent_tx_err = agent_tx.clone();
+    let is_processing_task = is_processing.clone();
     let process_task = tokio::spawn(async move {
         // Send initial message if provided
         if let Some(msg) = initial_msg {
+            is_processing_task.store(true, std::sync::atomic::Ordering::SeqCst);
             tokio::select! {
                 res = agent.process_message(&msg) => {
                     if let Err(e) = res {
@@ -61,12 +80,14 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
                     let _ = agent_tx_err.send(AgentEvent::Done { usage: None });
                 }
             }
+            is_processing_task.store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
-        while let Some(msg) = user_rx.recv().await {
-            // Discard any leftover/buffered cancel signals before starting the next processing run
+        while let Some(msg) = {
             while cancel_rx.try_recv().is_ok() {}
-
+            active_user_rx.recv().await
+        } {
+            is_processing_task.store(true, std::sync::atomic::Ordering::SeqCst);
             tokio::select! {
                 res = agent.process_message(&msg) => {
                     if let Err(e) = res {
@@ -78,6 +99,7 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
                     let _ = agent_tx_err.send(AgentEvent::Done { usage: None });
                 }
             }
+            is_processing_task.store(false, std::sync::atomic::Ordering::SeqCst);
         }
     });
 

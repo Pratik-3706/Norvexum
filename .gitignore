@@ -19,3 +19,8 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Temp & log files
+gui (1).rs
+norvexum.log
+

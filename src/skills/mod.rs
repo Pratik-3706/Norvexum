@@ -184,3 +184,11 @@ pub fn find_matching_skill(query: &str, project_root: &Path) -> Option<Skill> {
     }
     None
 }
+
+/// Helper to get the global skills folder (~/.norvexum/skills)
+pub fn get_global_skills_dir() -> PathBuf {
+    get_home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".norvexum")
+        .join("skills")
+}

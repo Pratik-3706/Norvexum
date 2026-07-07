@@ -90,6 +90,8 @@ pub struct Agent {
     pub approval_disabled: bool,
     /// Maximum thinking loop cycle limit
     pub max_loops: usize,
+    /// Unbounded receiver for dynamic instructions sent mid-run
+    pub instruction_rx: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 impl Agent {
@@ -116,12 +118,38 @@ impl Agent {
             approval_tx,
             approval_disabled: false,
             max_loops,
+            instruction_rx: None,
         })
+    }
+
+    pub fn set_instruction_receiver(&mut self, rx: mpsc::UnboundedReceiver<String>) {
+        self.instruction_rx = Some(rx);
     }
 
     /// Get the approval sender so the UI can respond to approval requests.
     pub fn approval_sender(&self) -> mpsc::UnboundedSender<bool> {
         self.approval_tx.clone()
+    }
+
+    /// Update the settings, AiClient, tools, and system prompt dynamically without losing message history.
+    pub fn update_settings(&mut self, settings: Settings) -> Result<()> {
+        let client = Arc::from(ai::build_client(&settings)?);
+        let tools = Arc::new(ToolRegistry::new(&settings));
+        let settings = Arc::new(settings);
+
+        // Build system prompt with project context
+        let system = build_system_prompt(&settings, &tools);
+
+        self.client = client;
+        self.tools = tools;
+        self.settings = settings;
+
+        // Replace the first message (which is always the system prompt)
+        if !self.messages.is_empty() && self.messages[0].role == Role::System {
+            self.messages[0] = Message::system(system);
+        }
+
+        Ok(())
     }
 
     /// Process a user message through the full agent loop.
@@ -260,13 +288,36 @@ impl Agent {
                     "/session" => {
                         if parts.len() < 2 {
                             let _ = self.event_tx.send(AgentEvent::Content(
-                                "Usage: `/session resume` | `/session list` | `/session clear`"
+                                "Usage: `/session resume` | `/session load <id>` | `/session list` | `/session clear`"
                                     .into(),
                             ));
                             let _ = self.event_tx.send(AgentEvent::Done { usage: None });
                             return Ok(());
                         }
                         match parts[1] {
+                            "load" => {
+                                if parts.len() >= 3 {
+                                    let id = parts[2];
+                                    if let Some(sess) = session::Session::load_by_id(&self.settings.project_root, id) {
+                                        self.messages = sess.messages.clone();
+                                        self.session = Some(sess);
+                                        let model = self.session.as_ref().unwrap().model.clone();
+                                        let provider = self.session.as_ref().unwrap().provider.clone();
+                                        let _ = self.event_tx.send(AgentEvent::ModelSwitched { model, provider });
+                                        let _ = self.event_tx.send(AgentEvent::Content(format!(
+                                            "✅ Loaded session {} ({} messages)",
+                                            &id[..6.min(id.len())],
+                                            self.messages.len()
+                                        )));
+                                    } else {
+                                        let _ = self.event_tx.send(AgentEvent::Content(format!("Session {} not found.", id)));
+                                    }
+                                } else {
+                                    let _ = self.event_tx.send(AgentEvent::Content("Usage: `/session load <id>`".into()));
+                                }
+                                let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+                                return Ok(());
+                            }
                             "resume" => {
                                 if let Some(sess) =
                                     session::Session::load_latest(&self.settings.project_root)
@@ -433,7 +484,7 @@ impl Agent {
                                     );
                                 }
                             } else {
-                                let registry = crate::config::providers::build_registry();
+                                let registry = crate::config::providers::build_registry_with_settings(&self.settings);
                                 if let Some(provider) =
                                     registry.iter().find(|p| &p.name == current_provider)
                                 {
@@ -640,6 +691,9 @@ impl Agent {
 
         let final_msg = user_msg.unwrap_or_else(|| Message::user(user_input));
 
+        let root_str = self.settings.project_root.to_string_lossy().to_string();
+        let _ = self.event_tx.send(AgentEvent::Status(format!("📂 Agent root: {root_str}")));
+
         // Check if user input triggers a skill template
         if let Some(skill) =
             crate::skills::find_matching_skill(user_input, &self.settings.project_root)
@@ -684,6 +738,14 @@ impl Agent {
         };
 
         for loop_num in 0..max_loops {
+            // Check for new user instructions sent dynamically mid-run
+            if let Some(ref mut rx) = self.instruction_rx {
+                while let Ok(new_prompt) = rx.try_recv() {
+                    let _ = self.event_tx.send(AgentEvent::Status(format!("📥 Received instruction: {}", new_prompt)));
+                    self.messages.push(Message::user(new_prompt));
+                }
+            }
+
             let _ = self.event_tx.send(AgentEvent::Status(format!(
                 "Thinking (loop {}/{})...",
                 loop_num + 1,
@@ -927,15 +989,14 @@ impl Agent {
                     let result = tools.execute(&name, args.clone(), &ctx).await;
 
                     // Detect file writes for live streaming
-                    if name == "write_file" || name == "edit_file" {
-                        if let Some(data) = &result.data {
-                            if let Some(path) = data["path"].as_str() {
-                                let preview = result.output.chars().take(200).collect::<String>();
-                                let _ = ev_tx.send(AgentEvent::FileWrite {
-                                    path: path.to_string(),
-                                    content_preview: preview,
-                                });
-                            }
+                    if result.success && (name == "write_file" || name == "edit_file") {
+                        if let Some(path_str) = args["path"].as_str() {
+                            let full_path = ctx.cwd.join(path_str);
+                            let preview = result.output.chars().take(200).collect::<String>();
+                            let _ = ev_tx.send(AgentEvent::FileWrite {
+                                path: full_path.to_string_lossy().to_string(),
+                                content_preview: preview,
+                            });
                         }
                     }
 
@@ -1011,7 +1072,7 @@ impl Agent {
 
     /// Get the context window size for the current model.
     fn get_context_window(&self) -> usize {
-        let registry = crate::config::providers::build_registry();
+        let registry = crate::config::providers::build_registry_with_settings(&self.settings);
         for provider in &registry {
             for model in &provider.models {
                 if model.id == self.settings.active_model {
@@ -1067,7 +1128,9 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          - Use tools to accomplish tasks — don't just describe what you'd do\n\
          - For web content, prefer web_fetch. Use browser_open only when blocked\n\
          - Check packages for safety before installing (check_package tool)\n\
-         - Create Python venvs **inside** the project directory (e.g., `./.venv` or `./pdfenv`). Never create or reference paths outside the project root (such as `../.venv`), as they will be blocked by the security sandbox.\n\
+         - Before installing any package or dependency (e.g., via pip, npm, cargo, etc.), you MUST check if a local environment or virtual environment exists (e.g. `./.venv` for python/pip, or creating/initializing one first if it doesn't exist). You MUST activate/use and install package dependencies inside that project-local virtual environment, never installing them globally. Create Python venvs **inside** the project directory (e.g., `./.venv` or `./pdfenv`). Never create or reference paths outside the project root (such as `../.venv`), as they will be blocked by the security sandbox.\n\
+         - Prioritize editing existing files (using the edit_file tool with specific line ranges or search target text) rather than recreating them or writing brand new files from scratch when modifying code. Note that you can edit a bulk/multiple lines of code at once by specifying target content with multiple lines or specifying a start_line and end_line block to replace.\n\
+         - Once you read a file (via read_file or view_file), save its contents in your memory context. Do NOT read the same file again in the same session unless it has been modified on disk, to prevent redundant file reads and token wastage.\n\
          - At the start of any new coding, design, or implementation task, you MUST first view the available specialized skills using the list_skills tool, and then read the guidelines for any relevant skill(s) (such as Frontend Specialist or Backend Engineer) using the read_skill tool, so that the TUI activity panel logs your inspection of these templates.\n\
          - When executing skills, you MUST prioritize professional-grade implementations: write robust, production-ready, clean, well-commented code, structure directory layouts logically, and enforce high-end responsive visual design and layout principles.\n\
          - Media files (such as images, icons, logos, background artwork) SHOULD go in dedicated subdirectories like 'media/', 'static/', etc. (though this is not a strict requirement, it is best practice for professional layouts).\n\
@@ -1132,6 +1195,9 @@ fn detect_image(user_input: &str, project_root: &std::path::Path) -> Option<std:
 use serde_json::json;
 
 fn tool_needs_approval(settings: &Settings, tool_name: &str, args: &serde_json::Value) -> bool {
+    if !settings.ask_perms {
+        return false;
+    }
     let mut needs_app = settings.needs_approval(tool_name);
     if tool_name == "run_command" {
         let command_str = args["command"].as_str().unwrap_or("");

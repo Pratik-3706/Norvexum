@@ -27,19 +27,12 @@ pub struct Settings {
     pub active_model: String,
 
     // ── API Keys (loaded from env) ───────────────────────────────────────
-    #[serde(skip)]
     pub aicredits_api_key: Option<String>,
-    #[serde(skip)]
     pub google_ai_api_key: Option<String>,
-    #[serde(skip)]
     pub openai_api_key: Option<String>,
-    #[serde(skip)]
     pub anthropic_api_key: Option<String>,
-    #[serde(skip)]
     pub tavily_api_key: Option<String>,
-    #[serde(skip)]
     pub ocr_space_api_key: Option<String>,
-    #[serde(skip)]
     pub pollinations_api_key: Option<String>,
 
     // ── Ollama (local models) ────────────────────────────────────────────
@@ -58,6 +51,18 @@ pub struct Settings {
     // ── Paths ────────────────────────────────────────────────────────────
     /// Project root (where .norvexum/ lives)
     pub project_root: PathBuf,
+
+    // ── GUI Settings ──────────────────────────────────────────────────────
+    #[serde(default)]
+    pub fullscreen: bool,
+    #[serde(default)]
+    pub maximized: bool,
+    #[serde(default)]
+    pub ask_perms: bool,
+    #[serde(default)]
+    pub custom_system_prompt: Option<String>,
+    #[serde(default)]
+    pub custom_models: Vec<String>,
 }
 
 impl Default for Settings {
@@ -79,6 +84,11 @@ impl Default for Settings {
             max_content_chars: 12000,
             require_approval: vec!["run_command".to_string()],
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            fullscreen: false,
+            maximized: false,
+            ask_perms: true,
+            custom_system_prompt: None,
+            custom_models: Vec::new(),
         }
     }
 }
@@ -146,6 +156,9 @@ impl Settings {
             if let Some(url) = file_settings.ollama_base_url {
                 settings.ollama_base_url = Some(url);
             }
+            if let Some(custom) = file_settings.custom_models {
+                settings.custom_models = custom;
+            }
         }
 
         // Auto-select provider based on available keys if using defaults
@@ -182,6 +195,11 @@ impl Settings {
                 Some(self.require_approval.clone())
             },
             ollama_base_url: self.ollama_base_url.clone(),
+            custom_models: if self.custom_models.is_empty() {
+                None
+            } else {
+                Some(self.custom_models.clone())
+            },
         };
 
         let content = toml::to_string_pretty(&file_settings)?;
@@ -241,4 +259,5 @@ struct FileSettings {
     max_content_chars: Option<usize>,
     require_approval: Option<Vec<String>>,
     ollama_base_url: Option<String>,
+    custom_models: Option<Vec<String>>,
 }
