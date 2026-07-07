@@ -59,6 +59,12 @@ pub struct App {
     pub user_backlog: Vec<String>,
     pub terminal_width: u16,
     pub terminal_height: u16,
+    pub rendered_chat_lines: std::cell::RefCell<Vec<String>>,
+    pub chat_visible_y: std::cell::Cell<u16>,
+    pub chat_visible_height: std::cell::Cell<u16>,
+    pub chat_scroll_offset: std::cell::Cell<u16>,
+    pub chat_visible_x: std::cell::Cell<u16>,
+    pub chat_visible_width: std::cell::Cell<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +149,12 @@ impl App {
             user_backlog: Vec::new(),
             terminal_width: 0,
             terminal_height: 0,
+            rendered_chat_lines: std::cell::RefCell::new(Vec::new()),
+            chat_visible_y: std::cell::Cell::new(0),
+            chat_visible_height: std::cell::Cell::new(0),
+            chat_scroll_offset: std::cell::Cell::new(0),
+            chat_visible_x: std::cell::Cell::new(0),
+            chat_visible_width: std::cell::Cell::new(0),
         }
     }
 
@@ -360,31 +372,81 @@ impl App {
     }
 
     /// Copy selected text to clipboard. Returns true if something was copied.
-    pub fn copy_selection(&mut self) -> bool {
-        if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
-            // Build selected text from chat lines (simplified: copy all visible text in the range)
-            let all_text: String = self
-                .chat_lines
-                .iter()
-                .map(|line| line.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
+    pub fn copy_selection(&mut self, _buffer: Option<&ratatui::buffer::Buffer>) -> bool {
+        if self.active_panel != ActivePanel::Chat {
+            self.selection_start = None;
+            self.selection_end = None;
+            self.is_selecting = false;
+            return false;
+        }
 
-            // For simplicity, copy a reasonable selection based on line positions
-            let lines: Vec<&str> = all_text.lines().collect();
-            let start_line = (start.1 as usize).min(lines.len().saturating_sub(1));
-            let end_line = (end.1 as usize).min(lines.len().saturating_sub(1));
-            let (s, e) = if start_line <= end_line {
-                (start_line, end_line)
+        if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
+            let rendered = self.rendered_chat_lines.borrow();
+            if rendered.is_empty() {
+                self.selection_start = None;
+                self.selection_end = None;
+                self.is_selecting = false;
+                return false;
+            }
+
+            let chat_y = self.chat_visible_y.get();
+            let chat_h = self.chat_visible_height.get();
+            let chat_scroll = self.chat_scroll_offset.get();
+            let chat_x = self.chat_visible_x.get();
+            let chat_w = self.chat_visible_width.get();
+
+            let (p1, p2) = if start.1 < end.1 || (start.1 == end.1 && start.0 <= end.0) {
+                (start, end)
             } else {
-                (end_line, start_line)
+                (end, start)
             };
 
-            let selected: String = lines[s..=e].join("\n");
-            if !selected.is_empty() {
+            let r1 = p1.1.clamp(chat_y, chat_y + chat_h.saturating_sub(1));
+            let r2 = p2.1.clamp(chat_y, chat_y + chat_h.saturating_sub(1));
+
+            let s = (r1 as usize)
+                .saturating_sub(chat_y as usize)
+                .saturating_add(chat_scroll as usize)
+                .min(rendered.len().saturating_sub(1));
+            let e = (r2 as usize)
+                .saturating_sub(chat_y as usize)
+                .saturating_add(chat_scroll as usize)
+                .min(rendered.len().saturating_sub(1));
+
+            let slice_chars = |st: &str, start_idx: usize, end_idx: usize| -> String {
+                st.chars().skip(start_idx).take(end_idx.saturating_sub(start_idx) + 1).collect()
+            };
+            let slice_chars_from = |st: &str, start_idx: usize| -> String {
+                st.chars().skip(start_idx).collect()
+            };
+
+            let mut selected_lines = Vec::new();
+            for idx in s..=e {
+                let line = &rendered[idx];
+
+                let sliced = if s == e {
+                    let col_start = (p1.0 as usize).saturating_sub(chat_x as usize);
+                    let col_end = (p2.0 as usize).saturating_sub(chat_x as usize);
+                    slice_chars(line, col_start, col_end)
+                } else if idx == s {
+                    let col_start = (p1.0 as usize).saturating_sub(chat_x as usize);
+                    slice_chars_from(line, col_start)
+                } else if idx == e {
+                    let col_end = (p2.0 as usize).saturating_sub(chat_x as usize);
+                    slice_chars(line, 0, col_end)
+                } else {
+                    line.to_string()
+                };
+
+                selected_lines.push(sliced);
+            }
+
+            let selected = selected_lines.join("\n");
+            let selected_trimmed = selected.trim().to_string();
+
+            if !selected_trimmed.is_empty() {
                 if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    let _ = clipboard.set_text(&selected);
-                    self.status = format!("📋 Copied {} lines", e - s + 1);
+                    let _ = clipboard.set_text(&selected_trimmed);
                     self.selection_start = None;
                     self.selection_end = None;
                     self.is_selecting = false;
@@ -467,7 +529,7 @@ impl App {
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 // If there's a selection, copy it instead of quitting
                 if self.selection_start.is_some() && self.selection_end.is_some() {
-                    self.copy_selection();
+                    self.copy_selection(None);
                     return None;
                 }
                 self.should_quit = true;
@@ -615,6 +677,43 @@ impl App {
     }
 }
 
+fn highlight_selection(frame: &mut Frame, start: (u16, u16), end: (u16, u16), _theme: &Theme) {
+    let (s_col, s_row) = start;
+    let (e_col, e_row) = end;
+
+    // Normalize start/end so start is earlier in the document than end
+    let (p1_col, p1_row, p2_col, p2_row) = if s_row < e_row || (s_row == e_row && s_col <= e_col) {
+        (s_col, s_row, e_col, e_row)
+    } else {
+        (e_col, e_row, s_col, s_row)
+    };
+
+    let area = frame.area();
+    let buffer = frame.buffer_mut();
+
+    // Highlighting style: reversed or deep navy/blue block selection
+    let selection_style = Style::default()
+        .bg(ratatui::style::Color::Rgb(40, 60, 110))
+        .fg(ratatui::style::Color::Rgb(240, 244, 255));
+
+    for row in p1_row..=p2_row {
+        if row >= area.height {
+            continue;
+        }
+
+        let start_col = if row == p1_row { p1_col } else { 0 };
+        let end_col = if row == p2_row { p2_col } else { area.width.saturating_sub(1) };
+
+        for col in start_col..=end_col {
+            if col >= area.width {
+                continue;
+            }
+            let cell = &mut buffer[(col, row)];
+            cell.set_style(selection_style);
+        }
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let theme = &app.theme;
     let area = frame.area();
@@ -754,6 +853,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
             frame.render_widget(paragraph, modal_area);
         }
     }
+
+    if let (Some(start), Some(end)) = (app.selection_start, app.selection_end) {
+        highlight_selection(frame, start, end, &app.theme);
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -885,6 +988,24 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
         .len()
         .saturating_sub(visible)
         .saturating_sub(app.chat_scroll as usize) as u16;
+
+    // Store the rendered plain text lines for clean copy selection
+    let plain_lines: Vec<String> = lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        })
+        .collect();
+    *app.rendered_chat_lines.borrow_mut() = plain_lines;
+    app.chat_visible_y.set(area.y + 1); // 1 line for top padding
+    app.chat_visible_height.set(area.height.saturating_sub(2));
+    app.chat_scroll_offset.set(scroll);
+    app.chat_visible_x.set(area.x + 2); // 2 columns of left padding
+    app.chat_visible_width.set(width as u16);
+
     let chat = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
@@ -893,6 +1014,7 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
                 .padding(Padding::new(2, 1, 1, 0)),
         )
         .scroll((scroll, 0));
+
     frame.render_widget(chat, area);
 }
 
@@ -1185,21 +1307,27 @@ pub async fn run_tui(
                             app.selection_end = Some((mouse.column, mouse.row));
                             app.is_selecting = true;
                         }
-                        MouseEventKind::Drag(MouseButton::Left) => {
+                        MouseEventKind::Down(MouseButton::Right) => {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                if let Ok(text) = clipboard.get_text() {
+                                    let text = text.replace(['\r', '\n'], " ");
+                                    app.insert_text(&text);
+                                }
+                            }
+                        }
+                        MouseEventKind::Drag(_) => {
                             if app.is_selecting {
                                 app.selection_end = Some((mouse.column, mouse.row));
                             }
                         }
-                        MouseEventKind::Up(MouseButton::Left) => {
+                        MouseEventKind::Up(_) => {
                             if app.is_selecting {
                                 app.selection_end = Some((mouse.column, mouse.row));
                                 app.is_selecting = false;
-                                // Auto-copy on mouse up if there's a meaningful selection
                                 if let (Some(start), Some(end)) = (app.selection_start, app.selection_end) {
                                     if start != end {
-                                        app.copy_selection();
+                                        app.copy_selection(None);
                                     } else {
-                                        // Click without drag — clear selection
                                         app.selection_start = None;
                                         app.selection_end = None;
                                     }

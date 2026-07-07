@@ -187,6 +187,13 @@ struct SseChoice {
 #[derive(Debug, Deserialize)]
 struct SseDelta {
     content: Option<String>,
+    #[serde(
+        alias = "reasoning",
+        alias = "thought",
+        alias = "thoughts",
+        alias = "thinking",
+        alias = "thinking_content"
+    )]
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<SseToolCallDelta>>,
 }
@@ -226,6 +233,7 @@ impl AiClient for OpenAiCompatClient {
             "stream": true,
             "temperature": request.temperature,
             "stream_options": { "include_usage": true },
+            "include_reasoning": true,
         });
 
         if let Some(max_tokens) = request.max_tokens {
@@ -261,6 +269,9 @@ impl AiClient for OpenAiCompatClient {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut in_thinking = false;
+        let mut think_buf = String::new();
+        let mut scan_think_tags = true;
+        let mut using_reasoning_field = false;
 
         // Track tool calls being assembled across chunks
         let mut pending_tool_calls: std::collections::HashMap<usize, ToolCall> =
@@ -287,6 +298,15 @@ impl AiClient for OpenAiCompatClient {
                 }
 
                 if line == "data: [DONE]" {
+                    if !think_buf.is_empty() {
+                        if in_thinking {
+                            let _ = tx.send(AiStreamEvent::ThinkingDelta(think_buf.clone()));
+                            let _ = tx.send(AiStreamEvent::ThinkingDone);
+                        } else {
+                            let _ = tx.send(AiStreamEvent::ContentDelta(think_buf.clone()));
+                        }
+                        think_buf.clear();
+                    }
                     if in_thinking {
                         let _ = tx.send(AiStreamEvent::ThinkingDone);
                     }
@@ -324,6 +344,15 @@ impl AiClient for OpenAiCompatClient {
                         for choice in choices {
                             // Handle finish reason
                             if let Some(reason) = &choice.finish_reason {
+                                if !think_buf.is_empty() {
+                                    if in_thinking {
+                                        let _ = tx.send(AiStreamEvent::ThinkingDelta(think_buf.clone()));
+                                        let _ = tx.send(AiStreamEvent::ThinkingDone);
+                                    } else {
+                                        let _ = tx.send(AiStreamEvent::ContentDelta(think_buf.clone()));
+                                    }
+                                    think_buf.clear();
+                                }
                                 if in_thinking {
                                     let _ = tx.send(AiStreamEvent::ThinkingDone);
                                     in_thinking = false;
@@ -341,6 +370,7 @@ impl AiClient for OpenAiCompatClient {
                                 // ── Thinking / reasoning tokens ──────
                                 if let Some(reasoning) = &delta.reasoning_content {
                                     if !reasoning.is_empty() {
+                                        using_reasoning_field = true;
                                         if !in_thinking {
                                             in_thinking = true;
                                         }
@@ -349,17 +379,68 @@ impl AiClient for OpenAiCompatClient {
                                     }
                                 }
 
-                                // ── Content tokens ───────────────────
-                                if let Some(content) = &delta.content {
-                                    if !content.is_empty() {
-                                        if in_thinking {
-                                            let _ = tx.send(AiStreamEvent::ThinkingDone);
-                                            in_thinking = false;
-                                        }
-                                        let _ =
-                                            tx.send(AiStreamEvent::ContentDelta(content.clone()));
-                                    }
-                                }
+                                 // ── Content tokens ───────────────────
+                                 if let Some(content) = &delta.content {
+                                     if !content.is_empty() {
+                                         if using_reasoning_field {
+                                             if in_thinking {
+                                                 let _ = tx.send(AiStreamEvent::ThinkingDone);
+                                                 in_thinking = false;
+                                             }
+                                             let _ = tx.send(AiStreamEvent::ContentDelta(content.clone()));
+                                         } else if !scan_think_tags {
+                                             // Already past the thinking phase — emit as content
+                                             let _ = tx.send(AiStreamEvent::ContentDelta(content.clone()));
+                                         } else {
+                                             think_buf.push_str(content);
+                                             // Try to drain as much as we can safely classify.
+                                             loop {
+                                                 if !in_thinking {
+                                                     if let Some(pos) = think_buf.find("<think>") {
+                                                         if pos > 0 {
+                                                             let _ = tx.send(AiStreamEvent::ContentDelta(
+                                                                 think_buf[..pos].to_string()
+                                                             ));
+                                                         }
+                                                         think_buf.drain(..pos + 7);
+                                                         in_thinking = true;
+                                                     } else if think_buf.len() > 7 {
+                                                         // Keep the last 7 chars (could be start of "<think>")
+                                                         let safe = think_buf.len() - 7;
+                                                         let _ = tx.send(AiStreamEvent::ContentDelta(
+                                                             think_buf[..safe].to_string()
+                                                         ));
+                                                         think_buf.drain(..safe);
+                                                         break;
+                                                     } else {
+                                                         break; // wait for more data
+                                                     }
+                                                 } else {
+                                                     if let Some(pos) = think_buf.find("</think>") {
+                                                         if pos > 0 {
+                                                             let _ = tx.send(AiStreamEvent::ThinkingDelta(
+                                                                 think_buf[..pos].to_string()
+                                                             ));
+                                                         }
+                                                         think_buf.drain(..pos + 8);
+                                                         let _ = tx.send(AiStreamEvent::ThinkingDone);
+                                                         in_thinking = false;
+                                                         scan_think_tags = false; // models only emit one think block
+                                                     } else if think_buf.len() > 8 {
+                                                         let safe = think_buf.len() - 8;
+                                                         let _ = tx.send(AiStreamEvent::ThinkingDelta(
+                                                             think_buf[..safe].to_string()
+                                                         ));
+                                                         think_buf.drain(..safe);
+                                                         break;
+                                                     } else {
+                                                         break;
+                                                     }
+                                                 }
+                                             }
+                                         }
+                                     }
+                                 }
 
                                 // ── Tool calls ──────────────────────
                                 if let Some(tool_calls) = &delta.tool_calls {
@@ -465,5 +546,19 @@ mod tests {
             "read_file"
         );
         assert_eq!(formatted[1]["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn test_sse_delta_deserialization() {
+        let cases = vec![
+            (r#"{"content": "hello", "reasoning_content": "why"}"#, "why"),
+            (r#"{"content": "hello", "reasoning": "why"}"#, "why"),
+            (r#"{"content": "hello", "thought": "why"}"#, "why"),
+        ];
+
+        for (json_str, expected) in cases {
+            let delta: SseDelta = serde_json::from_str(json_str).unwrap();
+            assert_eq!(delta.reasoning_content.as_deref(), Some(expected));
+        }
     }
 }

@@ -107,6 +107,17 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     cost_per_1k_output: 0.00028,
                 },
                 ModelInfo {
+                    id: "deepseek/deepseek-r1".into(),
+                    family: "deepseek".into(),
+                    multimodal: false,
+                    image_gen: false,
+                    tool_calling: false,
+                    streaming: true,
+                    context_window: 164_000,
+                    cost_per_1k_input: 0.0,
+                    cost_per_1k_output: 0.0,
+                },
+                ModelInfo {
                     id: "minimax/minimax-m3".into(),
                     family: "minimax".into(),
                     multimodal: true,
