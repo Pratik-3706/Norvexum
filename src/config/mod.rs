@@ -125,10 +125,18 @@ impl Settings {
             .filter(|s| !s.is_empty());
 
         // ── 2. Project-local config ──────────────────────────────────────
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        settings.project_root = cwd.clone();
+        let mut target_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        let config_path = cwd.join(NORVEXUM_DIR).join(CONFIG_FILE);
+        // If the current directory ends with target\release or target\debug, default to two levels up (project root)
+        if target_dir.ends_with("target/release") || target_dir.ends_with("target/debug") || target_dir.ends_with("target\\release") || target_dir.ends_with("target\\debug") {
+            if let Some(parent) = target_dir.parent().and_then(|p| p.parent()) {
+                target_dir = parent.to_path_buf();
+            }
+        }
+
+        settings.project_root = target_dir.clone();
+
+        let config_path = target_dir.join(NORVEXUM_DIR).join(CONFIG_FILE);
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)
                 .wrap_err_with(|| format!("Failed to read config: {}", config_path.display()))?;
@@ -178,6 +186,58 @@ impl Settings {
         Ok(settings)
     }
 
+    /// Load settings, restoring the last-used project root from global config.
+    /// Use this ONLY at GUI startup to remember the last workspace.
+    /// CLI and explicit folder changes should use `load()` which is CWD-based.
+    pub fn load_remembered() -> Result<Self> {
+        let mut settings = Self::load()?;
+
+        // Check global config for last-used project root
+        if let Some(home) = dirs::home_dir() {
+            let global_path = home.join(".norvexum_global.json");
+            if global_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&global_path) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(saved_root) = val["last_project_root"].as_str() {
+                            let saved_path = PathBuf::from(saved_root);
+                            if saved_path.exists() && saved_path.is_dir() {
+                                // Override project root and set CWD
+                                let _ = std::env::set_current_dir(&saved_path);
+                                settings.project_root = saved_path.clone();
+
+                                // Also load directory-specific config.toml from the remembered dir
+                                let config_path = saved_path.join(NORVEXUM_DIR).join(CONFIG_FILE);
+                                if config_path.exists() {
+                                    if let Ok(cfg_content) = std::fs::read_to_string(&config_path) {
+                                        if let Ok(file_settings) = toml::from_str::<FileSettings>(&cfg_content) {
+                                            if let Some(provider) = file_settings.active_provider {
+                                                settings.active_provider = provider;
+                                            }
+                                            if let Some(model) = file_settings.active_model {
+                                                settings.active_model = model;
+                                            }
+                                            if let Some(url) = file_settings.ollama_base_url {
+                                                settings.ollama_base_url = Some(url);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Load .env from remembered dir
+                                let env_path = saved_path.join(".env");
+                                if env_path.exists() {
+                                    let _ = dotenvy::from_path(&env_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(settings)
+    }
+
     /// Save current config to .norvexum/config.toml
     pub fn save(&self) -> Result<()> {
         let config_dir = self.project_root.join(NORVEXUM_DIR);
@@ -205,6 +265,18 @@ impl Settings {
         let content = toml::to_string_pretty(&file_settings)?;
         let config_path = config_dir.join(CONFIG_FILE);
         std::fs::write(&config_path, content)?;
+
+        // Save last_project_root to global config file
+        let global_config_path = dirs::home_dir().map(|h| h.join(".norvexum_global.json"));
+        if let Some(ref path) = global_config_path {
+            let global_val = serde_json::json!({
+                "last_project_root": self.project_root.to_string_lossy().to_string()
+            });
+            if let Ok(content) = serde_json::to_string_pretty(&global_val) {
+                let _ = std::fs::write(path, content);
+            }
+        }
+
         Ok(())
     }
 

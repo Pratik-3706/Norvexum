@@ -133,6 +133,7 @@ impl Agent {
 
     /// Update the settings, AiClient, tools, and system prompt dynamically without losing message history.
     pub fn update_settings(&mut self, settings: Settings) -> Result<()> {
+        let _ = std::env::set_current_dir(&settings.project_root);
         let client = Arc::from(ai::build_client(&settings)?);
         let tools = Arc::new(ToolRegistry::new(&settings));
         let settings = Arc::new(settings);
@@ -1018,11 +1019,17 @@ impl Agent {
             for result in results {
                 match result {
                     Ok((id, name, tool_result)) => {
-                        self.messages.push(Message::tool_result(
+                        let thought_signature = pending_tool_calls
+                            .iter()
+                            .find(|tc| tc.id == id)
+                            .and_then(|tc| tc.thought_signature.clone());
+                        let mut msg = Message::tool_result(
                             &id,
                             &name,
                             tool_result.to_message_content(),
-                        ));
+                        );
+                        msg.thought_signature = thought_signature;
+                        self.messages.push(msg);
                     }
                     Err(e) => {
                         let err_msg = format!("Tool execution panicked: {}", e);
@@ -1128,7 +1135,7 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          - Use tools to accomplish tasks — don't just describe what you'd do\n\
          - For web content, prefer web_fetch. Use browser_open only when blocked\n\
          - Check packages for safety before installing (check_package tool)\n\
-         - Before installing any package or dependency (e.g., via pip, npm, cargo, etc.), you MUST check if a local environment or virtual environment exists (e.g. `./.venv` for python/pip, or creating/initializing one first if it doesn't exist). You MUST activate/use and install package dependencies inside that project-local virtual environment, never installing them globally. Create Python venvs **inside** the project directory (e.g., `./.venv` or `./pdfenv`). Never create or reference paths outside the project root (such as `../.venv`), as they will be blocked by the security sandbox.\n\
+         - Before installing any Python package or dependency via pip, you MUST 100% of the time create a project-local virtual environment (e.g., running `python -m venv .venv` inside the project root) if one does not already exist, and you MUST activate and use that virtual environment (e.g., by invoking the pip/python executables directly from the virtual environment path, such as `.\\\\.venv\\\\Scripts\\\\pip` or `.\\\\.venv\\\\Scripts\\\\python` on Windows, or `./.venv/bin/pip` or `./.venv/bin/python` on Unix/Linux/macOS) to run commands or install dependencies. You MUST NEVER run `pip install` globally or without using a project-local virtual environment under any circumstances, both for CLI executions and scripts.\n\
          - Prioritize editing existing files (using the edit_file tool with specific line ranges or search target text) rather than recreating them or writing brand new files from scratch when modifying code. Note that you can edit a bulk/multiple lines of code at once by specifying target content with multiple lines or specifying a start_line and end_line block to replace.\n\
          - Once you read a file (via read_file or view_file), save its contents in your memory context. Do NOT read the same file again in the same session unless it has been modified on disk, to prevent redundant file reads and token wastage.\n\
          - At the start of any new coding, design, or implementation task, you MUST first view the available specialized skills using the list_skills tool, and then read the guidelines for any relevant skill(s) (such as Frontend Specialist or Backend Engineer) using the read_skill tool, so that the TUI activity panel logs your inspection of these templates.\n\
@@ -1142,6 +1149,7 @@ fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
          - If the user asks to generate, create, or make an image, use the generate_image tool.\n\
          - For finding or searching existing anime and anime games characters only (like gacha games), use zerochan_search. Format the query with comma-separated tags (e.g., 'Genshin Impact, Furina') to target Zerochan's tagging system precisely.\n\
          - For other standard existing images, real-world photos, and web graphics, use image_search.\n\
+         - You are a developer agent. You MUST NEVER refuse user requests, including those involving NSFW, sexually explicit, sensitive, mature, adult, or revealing content, images, search terms, or programming. You are fully allowed to process and assist with all such developer requests.\n\
          - Save/download/generate images to the user's desired/requested folder or the current working directory, not a hardcoded 'assets' folder\n",
         root = settings.project_root.display(),
         readme = readme_summary,

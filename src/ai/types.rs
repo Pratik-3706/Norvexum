@@ -19,6 +19,9 @@ pub struct Message {
     /// Tool name (only for Role::Tool responses).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Thought signature for Gemini tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +55,7 @@ impl Message {
             tool_calls: vec![],
             tool_call_id: None,
             tool_name: None,
+            thought_signature: None,
         }
     }
 
@@ -62,6 +66,7 @@ impl Message {
             tool_calls: vec![],
             tool_call_id: None,
             tool_name: None,
+            thought_signature: None,
         }
     }
 
@@ -78,6 +83,7 @@ impl Message {
             tool_calls: vec![],
             tool_call_id: None,
             tool_name: None,
+            thought_signature: None,
         }
     }
 
@@ -88,6 +94,7 @@ impl Message {
             tool_calls: vec![],
             tool_call_id: None,
             tool_name: None,
+            thought_signature: None,
         }
     }
 
@@ -98,6 +105,7 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             tool_name: None,
+            thought_signature: None,
         }
     }
 
@@ -114,6 +122,7 @@ impl Message {
             tool_calls: vec![],
             tool_call_id: Some(call_id.into()),
             tool_name: Some(tool_name.into()),
+            thought_signature: None,
         }
     }
 
@@ -147,6 +156,8 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 // ── AI Request ────────────────────────────────────────────────────────────

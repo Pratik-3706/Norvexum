@@ -236,6 +236,10 @@ impl AiClient for OpenAiCompatClient {
             "include_reasoning": true,
         });
 
+        if self.base_url.contains("ollama") || self.base_url.contains(":11434") {
+            body["keep_alive"] = json!(-1);
+        }
+
         if let Some(max_tokens) = request.max_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
@@ -468,6 +472,7 @@ impl AiClient for OpenAiCompatClient {
                                                     id: String::new(),
                                                     name: String::new(),
                                                     arguments: serde_json::Value::Null,
+                                                    thought_signature: None,
                                                 }
                                             });
 

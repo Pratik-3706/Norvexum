@@ -71,16 +71,20 @@ impl GeminiClient {
                 Role::Tool => {
                     let text = msg.text();
                     let tool_name = msg.tool_name.clone().unwrap_or_default();
+                    let mut part = json!({
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": {
+                                "result": text
+                            }
+                        }
+                    });
+                    if let Some(ref sig) = msg.thought_signature {
+                        part["thoughtSignature"] = json!(sig);
+                    }
                     contents.push(json!({
                         "role": "user",
-                        "parts": [{
-                            "functionResponse": {
-                                "name": tool_name,
-                                "response": {
-                                    "result": text
-                                }
-                            }
-                        }]
+                        "parts": [part]
                     }));
                     continue;
                 }
@@ -101,12 +105,16 @@ impl GeminiClient {
                 })
                 .collect();
             parts.extend(msg.tool_calls.iter().map(|call| {
-                json!({
+                let mut fc_part = json!({
                     "functionCall": {
                         "name": call.name,
                         "args": call.arguments
                     }
-                })
+                });
+                if let Some(ref sig) = call.thought_signature {
+                    fc_part["thoughtSignature"] = json!(sig);
+                }
+                fc_part
             }));
 
             contents.push(json!({
@@ -187,6 +195,8 @@ struct GeminiPart {
     function_call: Option<GeminiFunctionCall>,
     #[serde(rename = "inlineData")]
     inline_data: Option<GeminiInlineData>,
+    #[serde(alias = "thought_signature", alias = "thoughtSignature")]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,7 +243,29 @@ impl AiClient for GeminiClient {
                 "thinkingConfig": {
                     "thinkingBudget": 2048
                 }
-            }
+            },
+            "safetySettings": [
+                {
+                    "category": "HARM_CATEGORY_HARASSMENT",
+                    "threshold": "BLOCK_NONE"
+                },
+                {
+                    "category": "HARM_CATEGORY_HATE_SPEECH",
+                    "threshold": "BLOCK_NONE"
+                },
+                {
+                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "threshold": "BLOCK_NONE"
+                },
+                {
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "threshold": "BLOCK_NONE"
+                },
+                {
+                    "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
+                    "threshold": "BLOCK_NONE"
+                }
+            ]
         });
 
         if let Some(sys) = system_instruction {
@@ -358,6 +390,7 @@ impl AiClient for GeminiClient {
                                                         serde_json::Map::new(),
                                                     ),
                                                 ),
+                                                thought_signature: part.thought_signature.clone(),
                                             };
                                             let _ =
                                                 tx.send(AiStreamEvent::ToolCallStart(tc.clone()));

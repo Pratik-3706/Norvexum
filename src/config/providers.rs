@@ -288,31 +288,57 @@ pub fn build_registry() -> Vec<ProviderInfo> {
             base_url: "http://localhost:11434/v1".into(),
             api_style: ApiStyle::OpenAiCompat,
             env_key: "OLLAMA_BASE_URL".into(),
-            models: vec![
-                // Default models that will be shown if query fails
-                ModelInfo {
-                    id: "llama3".into(),
-                    family: "llama".into(),
-                    multimodal: false,
-                    image_gen: false,
-                    tool_calling: true,
-                    streaming: true,
-                    context_window: 8192,
-                    cost_per_1k_input: 0.0,
-                    cost_per_1k_output: 0.0,
-                },
-                ModelInfo {
-                    id: "mistral".into(),
-                    family: "mistral".into(),
-                    multimodal: false,
-                    image_gen: false,
-                    tool_calling: true,
-                    streaming: true,
-                    context_window: 32768,
-                    cost_per_1k_input: 0.0,
-                    cost_per_1k_output: 0.0,
-                },
-            ],
+            models: if let Ok(cache) = crate::ai::ollama::DISCOVERED_OLLAMA_MODELS.lock() {
+                cache.clone().unwrap_or_else(|| vec![
+                    ModelInfo {
+                        id: "llama3".into(),
+                        family: "llama".into(),
+                        multimodal: false,
+                        image_gen: false,
+                        tool_calling: true,
+                        streaming: true,
+                        context_window: 8192,
+                        cost_per_1k_input: 0.0,
+                        cost_per_1k_output: 0.0,
+                    },
+                    ModelInfo {
+                        id: "mistral".into(),
+                        family: "mistral".into(),
+                        multimodal: false,
+                        image_gen: false,
+                        tool_calling: true,
+                        streaming: true,
+                        context_window: 32768,
+                        cost_per_1k_input: 0.0,
+                        cost_per_1k_output: 0.0,
+                    },
+                ])
+            } else {
+                vec![
+                    ModelInfo {
+                        id: "llama3".into(),
+                        family: "llama".into(),
+                        multimodal: false,
+                        image_gen: false,
+                        tool_calling: true,
+                        streaming: true,
+                        context_window: 8192,
+                        cost_per_1k_input: 0.0,
+                        cost_per_1k_output: 0.0,
+                    },
+                    ModelInfo {
+                        id: "mistral".into(),
+                        family: "mistral".into(),
+                        multimodal: false,
+                        image_gen: false,
+                        tool_calling: true,
+                        streaming: true,
+                        context_window: 32768,
+                        cost_per_1k_input: 0.0,
+                        cost_per_1k_output: 0.0,
+                    },
+                ]
+            },
         },
     ]
 }

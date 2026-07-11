@@ -271,6 +271,7 @@ impl AiClient for AnthropicClient {
                                             id: current_tool_id.clone(),
                                             name: current_tool_name.clone(),
                                             arguments: serde_json::Value::Null,
+                                            thought_signature: None,
                                         };
                                         let _ = tx.send(AiStreamEvent::ToolCallStart(tc));
                                     }
@@ -317,6 +318,7 @@ impl AiClient for AnthropicClient {
                                     id: current_tool_id.clone(),
                                     name: current_tool_name.clone(),
                                     arguments: args,
+                                    thought_signature: None,
                                 };
                                 let _ = tx.send(AiStreamEvent::ToolCallComplete(tc));
                                 current_tool_id.clear();

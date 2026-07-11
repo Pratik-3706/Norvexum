@@ -127,6 +127,7 @@ impl Tool for BatchViewImageTool {
                 tool_calls: vec![],
                 tool_call_id: None,
                 tool_name: None,
+                thought_signature: None,
             };
 
             if let Some(client) = &ctx.client {

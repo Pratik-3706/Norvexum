@@ -12,18 +12,17 @@ use crate::config::providers::{ApiStyle, ModelInfo, ProviderInfo};
 /// Default Ollama API base URL.
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
-/// Response from Ollama's /api/tags endpoint.
+pub static DISCOVERED_OLLAMA_MODELS: std::sync::Mutex<Option<Vec<ModelInfo>>> = std::sync::Mutex::new(None);
+
 #[derive(Debug, Deserialize)]
-struct OllamaTagsResponse {
-    models: Option<Vec<OllamaModel>>,
+struct TagsResponse {
+    models: Option<Vec<ModelTag>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct OllamaModel {
+struct ModelTag {
     name: String,
-    #[serde(default)]
     size: u64,
-    #[serde(default)]
     details: Option<OllamaModelDetails>,
 }
 
@@ -33,58 +32,80 @@ struct OllamaModelDetails {
     parameter_size: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ShowResponse {
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
 /// Discover locally available Ollama models.
 /// Returns None if Ollama is not running or unreachable.
 pub async fn discover_models(base_url: &str) -> Option<Vec<ModelInfo>> {
-    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let tags_url = format!("{}/api/tags", base_url.trim_end_matches('/'));
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;
 
-    let response = client.get(&url).send().await.ok()?;
+    let response = client.get(&tags_url).send().await.ok()?;
 
     if !response.status().is_success() {
         return None;
     }
 
-    let tags: OllamaTagsResponse = response.json().await.ok()?;
+    let tags: TagsResponse = response.json().await.ok()?;
     let models = tags.models?;
 
     if models.is_empty() {
         return None;
     }
 
-    let model_infos: Vec<ModelInfo> = models
-        .into_iter()
-        .map(|m| {
-            let family = m
-                .details
-                .as_ref()
-                .and_then(|d| d.family.clone())
-                .unwrap_or_else(|| extract_family(&m.name));
+    let mut model_infos = Vec::new();
+    for model in models {
+        let show_url = format!("{}/api/show", base_url.trim_end_matches('/'));
+        let show: ShowResponse = if let Ok(resp) = client
+            .post(&show_url)
+            .json(&serde_json::json!({ "model": model.name }))
+            .send()
+            .await
+        {
+            resp.json().await.unwrap_or(ShowResponse { capabilities: vec![] })
+        } else {
+            ShowResponse { capabilities: vec![] }
+        };
 
-            let is_vision = m.name.contains("llava")
-                || m.name.contains("vision")
-                || m.name.contains("bakllava")
-                || m.name.contains("moondream");
+        let is_vision = show.capabilities.iter().any(|c| c.to_lowercase() == "vision")
+            || model.name.contains("llava")
+            || model.name.contains("vision")
+            || model.name.contains("bakllava")
+            || model.name.contains("moondream");
 
-            let context_window = estimate_context_window(&m.name, m.size);
+        let family = model
+            .details
+            .as_ref()
+            .and_then(|d| d.family.clone())
+            .unwrap_or_else(|| extract_family(&model.name));
 
-            ModelInfo {
-                id: m.name,
-                family,
-                multimodal: is_vision,
-                image_gen: false,
-                tool_calling: true, // Most recent Ollama models support tool calling
-                streaming: true,
-                context_window,
-                cost_per_1k_input: 0.0,
-                cost_per_1k_output: 0.0,
-            }
-        })
-        .collect();
+        let context_window = estimate_context_window(&model.name, model.size);
+
+        model_infos.push(ModelInfo {
+            id: model.name.clone(),
+            family,
+            multimodal: is_vision,
+            image_gen: false,
+            tool_calling: true,
+            streaming: true,
+            context_window,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
+        });
+    }
+
+    // Cache the discovered models globally
+    if let Ok(mut cache) = DISCOVERED_OLLAMA_MODELS.lock() {
+        *cache = Some(model_infos.clone());
+    }
 
     Some(model_infos)
 }

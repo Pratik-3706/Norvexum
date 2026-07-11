@@ -22,6 +22,8 @@ pub struct Session {
     pub updated_at: String,
     pub model: String,
     pub provider: String,
+    #[serde(default)]
+    pub project_root: Option<String>,
 }
 
 /// Lightweight summary for listing sessions.
@@ -46,12 +48,14 @@ impl Session {
             updated_at: now,
             model: model.to_string(),
             provider: provider.to_string(),
+            project_root: None,
         }
     }
 
     /// Save the session to disk.
     pub fn save(&mut self, root: &Path) -> Result<()> {
         self.updated_at = chrono::Utc::now().to_rfc3339();
+        self.project_root = Some(root.to_string_lossy().to_string());
         let dir = sessions_dir(root);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.json", self.id));

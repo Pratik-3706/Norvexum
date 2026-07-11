@@ -90,6 +90,8 @@ pub struct GuiApp {
     session_written_files: Vec<String>,
     current_writing_file: Option<(String, usize, usize)>,
     current_writing_status: Option<String>,
+    /// Persisted diff stats per file: filename → (total_added, total_deleted)
+    file_diff_stats: std::collections::HashMap<String, (usize, usize)>,
     current_tool_name: Option<String>,
     current_tool_args: String,
     current_tool_id: Option<String>,
@@ -121,6 +123,11 @@ pub struct GuiApp {
     last_scrolled_range: Option<(usize, usize)>,
     should_scroll_to_line: Option<usize>,
     agent_active_session_id: Option<String>,
+    left_sidebar_width: f32,
+    right_sidebar_width: f32,
+    ctx: Option<egui::Context>,
+    last_active_provider: String,
+    last_active_model: String,
 }
 
 #[derive(Default)]
@@ -410,6 +417,8 @@ impl GuiApp {
         let skills_list = crate::skills::load_all_skills(&config.settings.project_root);
 
         let history_sessions = crate::agent::session::Session::list(&config.settings.project_root);
+        let initial_provider = config.settings.active_provider.clone();
+        let initial_model = config.settings.active_model.clone();
 
         let mut app = Self {
             settings: config.settings,
@@ -451,6 +460,7 @@ impl GuiApp {
             session_written_files: Vec::new(),
             current_writing_file: None,
             current_writing_status: None,
+            file_diff_stats: std::collections::HashMap::new(),
             current_tool_name: None,
             current_tool_args: String::new(),
             current_tool_id: None,
@@ -475,6 +485,11 @@ impl GuiApp {
             last_scrolled_range: None,
             should_scroll_to_line: None,
             agent_active_session_id: None,
+            left_sidebar_width: 280.0,
+            right_sidebar_width: 270.0,
+            ctx: None,
+            last_active_provider: initial_provider,
+            last_active_model: initial_model,
         };
 
         if let Some(msg) = config.initial_message {
@@ -494,6 +509,21 @@ impl GuiApp {
 
         // Trigger loading the workspace files list in the background immediately
         app.trigger_load_files();
+
+        // Scan for local Ollama models in background on startup
+        {
+            let ollama_url = app.settings.ollama_base_url.clone()
+                .unwrap_or_else(|| crate::ai::ollama::DEFAULT_OLLAMA_URL.to_string());
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    rt.block_on(async {
+                        let _ = crate::ai::ollama::discover_models(&ollama_url).await;
+                        ctx.request_repaint();
+                    });
+                }
+            });
+        }
 
         app
     }
@@ -650,6 +680,56 @@ impl GuiApp {
         if let Ok(json) = serde_json::to_string(&self.settings) {
             let _ = self.user_tx.send(format!("/config_update {json}"));
         }
+
+        // Unload Ollama model from memory if we changed the active provider from Ollama to something else,
+        // or if we changed the Ollama model itself.
+        let last_provider = self.last_active_provider.clone();
+        let last_model = self.last_active_model.clone();
+        let current_provider = self.settings.active_provider.clone();
+        let current_model = self.settings.active_model.clone();
+
+        if (last_provider == "ollama" && current_provider != "ollama") || (last_provider == "ollama" && last_model != current_model) {
+            let ollama_url = self.settings.ollama_base_url.clone()
+                .unwrap_or_else(|| crate::ai::ollama::DEFAULT_OLLAMA_URL.to_string());
+            let client = reqwest::Client::new();
+            let unload_url = format!("{}/api/generate", ollama_url.trim_end_matches('/'));
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    let _ = rt.block_on(async {
+                        let payload = serde_json::json!({
+                            "model": last_model,
+                            "keep_alive": 0
+                        });
+                        let _ = client.post(&unload_url).json(&payload).send().await;
+                    });
+                }
+            });
+        }
+
+        self.last_active_provider = current_provider;
+        self.last_active_model = current_model;
+        // Sync local Ollama models in background in case the endpoint URL changed
+        let ollama_url = self.settings.ollama_base_url.clone()
+            .unwrap_or_else(|| crate::ai::ollama::DEFAULT_OLLAMA_URL.to_string());
+        if let Some(ref ctx) = self.ctx {
+            let ctx_clone = ctx.clone();
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    rt.block_on(async {
+                        let _ = crate::ai::ollama::discover_models(&ollama_url).await;
+                        ctx_clone.request_repaint();
+                    });
+                }
+            });
+        } else {
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    rt.block_on(async {
+                        let _ = crate::ai::ollama::discover_models(&ollama_url).await;
+                    });
+                }
+            });
+        }
     }
 
     fn load_project_folder(&mut self, path: &std::path::Path, ctx: egui::Context) {
@@ -675,6 +755,8 @@ impl GuiApp {
 
         // Reload settings from the new directory
         if let Ok(mut loaded_settings) = crate::config::Settings::load() {
+            // Force project_root to the explicitly chosen path (defensive safety net)
+            loaded_settings.project_root = path_buf.clone();
             loaded_settings.fullscreen = self.settings.fullscreen;
             loaded_settings.maximized = self.settings.maximized;
             // Retain keyring values in memory
@@ -707,6 +789,7 @@ impl GuiApp {
         // Clear chat to prevent LLM memory contamination from the old workspace
         self.messages.clear();
         self.session_written_files.clear();
+        self.file_diff_stats.clear();
         self.current_session_id = None;
         self.active_messages_backup = None;
         let _ = self.user_tx.send("/clear".to_string());
@@ -720,14 +803,14 @@ impl GuiApp {
         let name = self.current_tool_name.as_deref()?;
         let args = &self.current_tool_args;
         if name == "replace_file_content" || name == "multi_replace_file_content" || name == "edit_file" {
-            let start_str = extract_streaming_content(args, "StartLine");
-            let end_str = extract_streaming_content(args, "EndLine");
-            if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>()) {
+            let start_opt = extract_streaming_number(args, "StartLine");
+            let end_opt = extract_streaming_number(args, "EndLine");
+            if let (Some(start), Some(end)) = (start_opt, end_opt) {
                 return Some((start, end));
             }
-            let start_str2 = extract_streaming_content(args, "start_line");
-            let end_str2 = extract_streaming_content(args, "end_line");
-            if let (Ok(start), Ok(end)) = (start_str2.parse::<usize>(), end_str2.parse::<usize>()) {
+            let start_opt2 = extract_streaming_number(args, "start_line");
+            let end_opt2 = extract_streaming_number(args, "end_line");
+            if let (Some(start), Some(end)) = (start_opt2, end_opt2) {
                 return Some((start, end));
             }
 
@@ -1054,8 +1137,21 @@ impl GuiApp {
                             let relative_path =
                                 get_relative_path(&path, &self.settings.project_root);
 
-                            let (added, deleted) =
-                                get_file_diff_stats(&self.settings.project_root, &relative_path);
+                            // Prefer live stats from estimate_live_diff_stats (computed during
+                            // streaming from TargetContent/ReplacementContent) because they are
+                            // more accurate — git diff runs AFTER the write, so for untracked
+                            // files it can never see deleted lines.
+                            let (added, deleted) = if let Some((ref live_file, live_add, live_del)) =
+                                self.current_writing_file
+                            {
+                                if live_file == &relative_path && (live_add > 0 || live_del > 0) {
+                                    (live_add as i32, live_del as i32)
+                                } else {
+                                    get_file_diff_stats(&self.settings.project_root, &relative_path)
+                                }
+                            } else {
+                                get_file_diff_stats(&self.settings.project_root, &relative_path)
+                            };
                             let icon = get_file_icon(&relative_path);
 
                             let msg = self.get_or_create_assistant_message();
@@ -1076,8 +1172,12 @@ impl GuiApp {
                                 self.session_written_files.push(relative_path.clone());
                             }
                             self.current_writing_file =
-                                Some((relative_path, added as usize, deleted as usize));
+                                Some((relative_path.clone(), added as usize, deleted as usize));
                             self.current_writing_status = Some("writing".to_string());
+                            // Persist diff stats so they remain visible after the edit completes
+                            let entry = self.file_diff_stats.entry(relative_path).or_insert((0, 0));
+                            entry.0 = added as usize;
+                            entry.1 = deleted as usize;
 
                             if self.selected_file.as_deref()
                                 == self
@@ -1136,6 +1236,7 @@ impl GuiApp {
                         AgentEvent::ClearChat => {
                             self.messages.clear();
                             self.session_written_files.clear();
+                            self.file_diff_stats.clear();
                             self.current_session_id = None;
                             self.active_messages_backup = None;
                             self.status_text = "Chat cleared".to_string();
@@ -1240,6 +1341,7 @@ impl GuiApp {
         // If this is the start of a conversation, clear session files
         if self.messages.len() == 1 {
             self.session_written_files.clear();
+            self.file_diff_stats.clear();
         }
 
         if self.is_processing {
@@ -1546,6 +1648,9 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.ctx.is_none() {
+            self.ctx = Some(ctx.clone());
+        }
         let active_range = self.get_active_editing_range();
         if let Some((start, end)) = active_range {
             if self.last_scrolled_range != Some((start, end)) {
@@ -1785,9 +1890,17 @@ impl eframe::App for GuiApp {
                 });
             });
 
-        // Left Panel (Sidebar Settings)
-        if self.left_sidebar_open {
-            egui::SidePanel::left("left_sidebar")
+        // Left Panel (Sidebar Settings) — animated open/close + generously
+        // wide resize range so the user can pull/push the panel freely.
+        let target_left_t = if self.left_sidebar_open { 1.0 } else { 0.0 };
+        let left_t_raw =
+            ctx.animate_value_with_time(egui::Id::new("left_sidebar_anim"), target_left_t, 0.18);
+        // ease-out-cubic for a snappy, premium feel
+        let left_t = 1.0 - (1.0 - left_t_raw.clamp(0.0, 1.0)).powi(3);
+        let left_animating = (left_t_raw - target_left_t).abs() > 0.005;
+
+        if left_t > 0.005 {
+            let mut left_panel = egui::SidePanel::left("left_sidebar")
                 .frame(
                     egui::Frame::default()
                         .inner_margin(16.0)
@@ -1797,12 +1910,18 @@ impl eframe::App for GuiApp {
                             egui::Color32::WHITE
                         }),
                 )
-                .resizable(true)
-                .width_range(220.0..=450.0)
-                .default_width(280.0)
-                .show(ctx, |ui| {
-                    let logo_height = 70.0;
-                    let scroll_height = ui.available_height() - logo_height;
+                // Disable resize only while the open/close tween is running;
+                // once settled we let egui remember & control the user width.
+                .resizable(!left_animating && self.left_sidebar_open)
+                .width_range(60.0..=1200.0);
+            if left_animating {
+                left_panel = left_panel.exact_width(self.left_sidebar_width * left_t);
+            } else {
+                left_panel = left_panel.default_width(self.left_sidebar_width);
+            }
+            let panel_response = left_panel.show(ctx, |ui| {
+                    let pinned_bottom_h = 124.0;
+                    let scroll_height = (ui.available_height() - pinned_bottom_h).max(80.0);
 
                     egui::ScrollArea::vertical()
                         .max_height(scroll_height)
@@ -1995,6 +2114,7 @@ impl eframe::App for GuiApp {
 
                 // Render previous sessions
                 let mut session_to_delete = None;
+                let mut session_to_load = None;
                 for summary in &self.history_sessions {
                     let title = format!("Chat ({})", &summary.id[..6.min(summary.id.len())]);
                     let display_text = format!("💬 {}", title);
@@ -2005,32 +2125,7 @@ impl eframe::App for GuiApp {
                             .on_hover_text(format!("Model: {}\nMessages: {}", summary.model, summary.message_count))
                             .clicked()
                         {
-                            if let Some(loaded_sess) = crate::agent::session::Session::load_by_id(&self.settings.project_root, &summary.id) {
-                                if self.current_session_id.is_none() {
-                                    self.active_messages_backup = Some(self.messages.clone());
-                                }
-                                self.current_session_id = Some(summary.id.clone());
-                                self.messages = loaded_sess.messages.iter().filter_map(|m| {
-                                    let role = match m.role {
-                                        crate::ai::types::Role::User => "user",
-                                        crate::ai::types::Role::Assistant => "assistant",
-                                        crate::ai::types::Role::System | crate::ai::types::Role::Tool => return None,
-                                    };
-                                    let content = m.text();
-                                    if content.trim().is_empty() {
-                                        return None;
-                                    }
-                                    Some(GuiMessage {
-                                        role: role.to_string(),
-                                        content,
-                                        thinking: None,
-                                        is_thinking_done: true,
-                                        tool_logs: Vec::new(),
-                                    })
-                                }).collect();
-                                self.session_written_files.clear();
-                                self.status_text = format!("Loaded conversation: {}", title);
-                            }
+                            session_to_load = Some(summary.id.clone());
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2044,6 +2139,44 @@ impl eframe::App for GuiApp {
                     });
                 }
 
+                if let Some(id) = session_to_load {
+                    if let Some(loaded_sess) = crate::agent::session::Session::load_by_id(&self.settings.project_root, &id) {
+                        if let Some(ref saved_root) = loaded_sess.project_root {
+                            let saved_path = std::path::PathBuf::from(saved_root);
+                            if saved_path.exists() && saved_path.is_dir() && saved_path != self.settings.project_root {
+                                let ctx = ui.ctx().clone();
+                                self.load_project_folder(&saved_path, ctx);
+                            }
+                        }
+                        if self.current_session_id.is_none() {
+                            self.active_messages_backup = Some(self.messages.clone());
+                        }
+                        self.current_session_id = Some(id.clone());
+                        self.messages = loaded_sess.messages.iter().filter_map(|m| {
+                            let role = match m.role {
+                                crate::ai::types::Role::User => "user",
+                                crate::ai::types::Role::Assistant => "assistant",
+                                crate::ai::types::Role::System | crate::ai::types::Role::Tool => return None,
+                            };
+                            let content = m.text();
+                            if content.trim().is_empty() {
+                                return None;
+                            }
+                            Some(GuiMessage {
+                                role: role.to_string(),
+                                content,
+                                thinking: None,
+                                is_thinking_done: true,
+                                tool_logs: Vec::new(),
+                            })
+                        }).collect();
+                        self.session_written_files.clear();
+                        self.file_diff_stats.clear();
+                        let title = format!("Chat ({})", &id[..6.min(id.len())]);
+                        self.status_text = format!("Loaded conversation: {}", title);
+                    }
+                }
+
                 if let Some(id) = session_to_delete {
                     let session_dir = self.settings.project_root.join(".norvexum").join("sessions");
                     let file_path = session_dir.join(format!("{}.json", id));
@@ -2054,6 +2187,7 @@ impl eframe::App for GuiApp {
                             }
                             self.current_session_id = None;
                             self.session_written_files.clear();
+                            self.file_diff_stats.clear();
                         }
                         self.history_sessions = crate::agent::session::Session::list(&self.settings.project_root);
                         self.status_text = "Session deleted.".to_string();
@@ -2101,11 +2235,22 @@ impl eframe::App for GuiApp {
                         });
                     });
                 });
+            if !left_animating && self.left_sidebar_open {
+                self.left_sidebar_width = panel_response.response.rect.width();
+            }
         }
 
         // Right Panel (Workspace Files explorer - styled premium file tree)
-        if self.right_sidebar_open {
-            egui::SidePanel::right("right_sidebar")
+        // Animated open/close + widened resize range so the user can pull it
+        // out wide enough to actually read code previews without scroll-back.
+        let target_right_t = if self.right_sidebar_open { 1.0 } else { 0.0 };
+        let right_t_raw =
+            ctx.animate_value_with_time(egui::Id::new("right_sidebar_anim"), target_right_t, 0.18);
+        let right_t = 1.0 - (1.0 - right_t_raw.clamp(0.0, 1.0)).powi(3);
+        let right_animating = (right_t_raw - target_right_t).abs() > 0.005;
+
+        if right_t > 0.005 {
+            let mut right_panel = egui::SidePanel::right("right_sidebar")
                 .frame(
                     egui::Frame::default()
                         .inner_margin(14.0)
@@ -2115,10 +2260,14 @@ impl eframe::App for GuiApp {
                             egui::Color32::WHITE
                         }),
                 )
-                .resizable(true)
-                .width_range(220.0..=480.0)
-                .default_width(270.0)
-                .show(ctx, |ui| {
+                .resizable(!right_animating && self.right_sidebar_open)
+                .width_range(60.0..=1200.0);
+            if right_animating {
+                right_panel = right_panel.exact_width(self.right_sidebar_width * right_t);
+            } else {
+                right_panel = right_panel.default_width(self.right_sidebar_width);
+            }
+            let panel_response = right_panel.show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("Workspace files")
@@ -2216,32 +2365,45 @@ impl eframe::App for GuiApp {
                                         file_to_inspect = Some(filename.clone());
                                     }
 
-                                    if let Some((active_file, added, deleted)) =
+                                    // Show diff stats: prefer live current_writing_file, fall back to persisted file_diff_stats
+                                    let (show_added, show_deleted) = if let Some((active_file, added, deleted)) =
                                         &self.current_writing_file
                                     {
                                         if active_file == filename {
-                                            ui.horizontal(|ui| {
-                                                ui.add_space(22.0);
-                                                if *added > 0 {
-                                                    ui.label(
-                                                        egui::RichText::new(format!("+{added}"))
-                                                            .small()
-                                                            .color(egui::Color32::from_rgb(
-                                                                16, 185, 129,
-                                                            )),
-                                                    );
-                                                }
-                                                if *deleted > 0 {
-                                                    ui.label(
-                                                        egui::RichText::new(format!("-{deleted}"))
-                                                            .small()
-                                                            .color(egui::Color32::from_rgb(
-                                                                239, 68, 68,
-                                                            )),
-                                                    );
-                                                }
-                                            });
+                                            (*added, *deleted)
+                                        } else if let Some(&(a, d)) = self.file_diff_stats.get(filename.as_str()) {
+                                            (a, d)
+                                        } else {
+                                            (0, 0)
                                         }
+                                    } else if let Some(&(a, d)) = self.file_diff_stats.get(filename.as_str()) {
+                                        (a, d)
+                                    } else {
+                                        (0, 0)
+                                    };
+
+                                    if show_added > 0 || show_deleted > 0 {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(22.0);
+                                            if show_added > 0 {
+                                                ui.label(
+                                                    egui::RichText::new(format!("+{show_added}"))
+                                                        .small()
+                                                        .color(egui::Color32::from_rgb(
+                                                            16, 185, 129,
+                                                        )),
+                                                );
+                                            }
+                                            if show_deleted > 0 {
+                                                ui.label(
+                                                    egui::RichText::new(format!("-{show_deleted}"))
+                                                        .small()
+                                                        .color(egui::Color32::from_rgb(
+                                                            239, 68, 68,
+                                                        )),
+                                                );
+                                            }
+                                        });
                                     }
                                 }
                             }
@@ -2412,6 +2574,9 @@ impl eframe::App for GuiApp {
                         }
                     }
                 });
+            if !right_animating && self.right_sidebar_open {
+                self.right_sidebar_width = panel_response.response.rect.width();
+            }
         }
 
         // Bottom Chat Input panel docked at the bottom of the center area (below the main chat, between sidebars)
@@ -2790,6 +2955,7 @@ impl eframe::App for GuiApp {
                             let _ = self.user_tx.send("/clear".to_string());
                             self.messages.clear();
                             self.session_written_files.clear();
+                            self.file_diff_stats.clear();
                             self.current_session_id = None;
                             self.active_messages_backup = None;
                             self.selected_file = None;
@@ -2888,93 +3054,118 @@ impl eframe::App for GuiApp {
                                     };
 
                                     ui.allocate_ui_with_layout(
-                                        egui::vec2(available_chat_width, 0.0),
-                                        egui::Layout::top_down(alignment),
-                                        |ui| {
-                                            let msg_response = ui
-                                                .vertical(|ui| {
-                                                    if is_user {
-                                                        // User speech bubble: clean slate background
-                                                        let bubble_width = (available_chat_width
-                                                            * 0.72)
-                                                            .clamp(260.0, 760.0);
-                                                        let max_line_len = msg.content.lines().map(|l| l.chars().count()).max().unwrap_or(0);
-                                                        let approx_width = (max_line_len as f32 * 8.0 + 32.0).clamp(120.0, bubble_width);
+                                         egui::vec2(available_chat_width, 0.0),
+                                         egui::Layout::top_down(alignment),
+                                         |ui| {
+                                             let msg_response = ui
+                                                 .with_layout(egui::Layout::top_down(alignment), |ui| {
+                                                     if is_user {
+                                                         // User speech bubble: clean slate background
+                                                         let max_bubble_width =
+                                                             (available_chat_width * 0.72)
+                                                                 .clamp(260.0, 760.0);
+                                                         let inner_pad_x = 16.0;
+                                                         let inner_pad_total = inner_pad_x * 2.0;
+                                                         let text_max_width =
+                                                             (max_bubble_width - inner_pad_total)
+                                                                 .max(60.0);
 
-                                                        let theme_color = if self.dark_mode {
-                                                            egui::Color32::from_rgb(47, 37, 72)
-                                                        } else {
-                                                            egui::Color32::from_rgb(237, 233, 254)
-                                                        };
-                                                        let text_color = if self.dark_mode {
-                                                            egui::Color32::WHITE
-                                                        } else {
-                                                            egui::Color32::from_rgb(30, 41, 59)
-                                                        };
-                                                        ui.with_layout(
-                                                            egui::Layout::top_down(
-                                                                egui::Align::Max,
-                                                            ),
-                                                            |ui| {
-                                                                ui.label(
-                                                                    egui::RichText::new("YOU")
-                                                                        .size(9.0)
-                                                                        .strong()
-                                                                        .color(
-                                                                            egui::Color32::from_rgb(
-                                                                                167, 139, 250,
-                                                                            ),
-                                                                        ),
-                                                                );
-                                                                ui.add_space(4.0);
-                                                                egui::Frame::default()
-                                                                    .fill(theme_color)
-                                                                    .stroke(egui::Stroke::new(
-                                                                        1.0,
-                                                                        if self.dark_mode {
-                                                                            egui::Color32::from_rgb(
-                                                                                91, 70, 145,
-                                                                            )
-                                                                        } else {
-                                                                            egui::Color32::from_rgb(
-                                                                                196, 181, 253,
-                                                                            )
-                                                                        },
-                                                                    ))
-                                                                    .inner_margin(
-                                                                        egui::Margin::symmetric(
-                                                                            16.0, 12.0,
-                                                                        ),
-                                                                    )
-                                                                    .rounding(14.0)
-                                                                    .show(ui, |ui| {
-                                                                        ui.with_layout(
-                                                                            egui::Layout::top_down(egui::Align::LEFT),
-                                                                            |ui| {
-                                                                                ui.set_max_width(approx_width);
-                                                                                if msg.content.len() > 1000 {
-                                                                                    egui::ScrollArea::vertical()
-                                                                                        .max_height(220.0)
-                                                                                        .id_salt(format!("user_scroll_{}", msg_idx))
-                                                                                        .show(ui, |ui| {
-                                                                                            render_formatted_markdown(
-                                                                                                ui,
-                                                                                                &msg.content,
-                                                                                                self.dark_mode,
-                                                                                            );
-                                                                                        });
-                                                                                } else {
-                                                                                    render_formatted_markdown(
-                                                                                        ui,
-                                                                                        &msg.content,
-                                                                                        self.dark_mode,
-                                                                                    );
-                                                                                }
-                                                                            }
-                                                                        );
-                                                                    });
-                                                            },
-                                                        );
+                                                         let theme_color = if self.dark_mode {
+                                                             egui::Color32::from_rgb(47, 37, 72)
+                                                         } else {
+                                                             egui::Color32::from_rgb(237, 233, 254)
+                                                         };
+                                                         let text_color = if self.dark_mode {
+                                                             egui::Color32::WHITE
+                                                         } else {
+                                                             egui::Color32::from_rgb(30, 41, 59)
+                                                         };
+                                                         let stroke_color = if self.dark_mode {
+                                                             egui::Color32::from_rgb(91, 70, 145)
+                                                         } else {
+                                                             egui::Color32::from_rgb(196, 181, 253)
+                                                         };
+
+                                                         // Smooth fade-in animation for newly-arriving user bubble
+                                                         let entry_t = ui
+                                                             .ctx()
+                                                             .animate_value_with_time(
+                                                                 egui::Id::new(format!("user_bubble_in_{msg_idx}")),
+                                                                 1.0,
+                                                                 0.16,
+                                                             )
+                                                             .clamp(0.0, 1.0);
+                                                         let entry_alpha = 1.0 - (1.0 - entry_t).powi(3);
+
+                                                         // Measure the exact rendered text width with the proportional font
+                                                         let galley = ui.fonts(|f| {
+                                                             f.layout(
+                                                                 msg.content.clone(),
+                                                                 egui::FontId::proportional(13.0),
+                                                                 text_color,
+                                                                 text_max_width,
+                                                             )
+                                                         });
+                                                         let text_w = galley.size().x.ceil();
+                                                         let bubble_w = (text_w + inner_pad_total)
+                                                             .min(max_bubble_width)
+                                                             .max(120.0);
+
+                                                         ui.label(
+                                                             egui::RichText::new("YOU")
+                                                                 .size(9.0)
+                                                                 .strong()
+                                                                 .color(
+                                                                     egui::Color32::from_rgb(
+                                                                         167, 139, 250,
+                                                                     )
+                                                                     .linear_multiply(entry_alpha),
+                                                                 ),
+                                                         );
+                                                         ui.add_space(4.0);
+
+                                                         let tinted_fill = theme_color.linear_multiply(entry_alpha);
+                                                         let tinted_stroke = egui::Stroke::new(
+                                                             1.0,
+                                                             stroke_color.linear_multiply(entry_alpha),
+                                                         );
+
+                                                         ui.allocate_ui_with_layout(
+                                                             egui::vec2(bubble_w, 0.0),
+                                                             egui::Layout::top_down(egui::Align::LEFT),
+                                                             |ui| {
+                                                                 ui.set_max_width(bubble_w);
+                                                                 egui::Frame::default()
+                                                                     .fill(tinted_fill)
+                                                                     .stroke(tinted_stroke)
+                                                                     .inner_margin(
+                                                                         egui::Margin::symmetric(
+                                                                             inner_pad_x, 12.0,
+                                                                         ),
+                                                                     )
+                                                                     .rounding(14.0)
+                                                                     .show(ui, |ui| {
+                                                                         if msg.content.len() > 1000 {
+                                                                             egui::ScrollArea::vertical()
+                                                                                 .max_height(220.0)
+                                                                                 .id_salt(format!("user_scroll_{}", msg_idx))
+                                                                                 .show(ui, |ui| {
+                                                                                     render_formatted_markdown(
+                                                                                         ui,
+                                                                                         &msg.content,
+                                                                                         self.dark_mode,
+                                                                                     );
+                                                                                 });
+                                                                         } else {
+                                                                             render_formatted_markdown(
+                                                                                 ui,
+                                                                                 &msg.content,
+                                                                                 self.dark_mode,
+                                                                             );
+                                                                         }
+                                                                     });
+                                                             },
+                                                         );
                                                     } else {
                                                         // Agent response: NO bubble! Laid out directly on chat background
                                                         ui.set_width(
@@ -3034,8 +3225,10 @@ impl eframe::App for GuiApp {
                                                 })
                                                 .response;
 
-                                            let hover_rect =
-                                                msg_response.rect.expand2(egui::vec2(2.0, 32.0));
+                                            let mut hover_rect = msg_response.rect;
+                                            hover_rect.min.x = ui.max_rect().min.x;
+                                            hover_rect.max.x = ui.max_rect().max.x;
+                                            let hover_rect = hover_rect.expand2(egui::vec2(0.0, 32.0));
                                             let is_hovered = ui
                                                 .ctx()
                                                 .pointer_hover_pos()
@@ -3043,78 +3236,90 @@ impl eframe::App for GuiApp {
                                                 .unwrap_or(false)
                                                 || msg_response.hovered();
 
-                                            if is_user && is_hovered {
-                                                ui.add_space(4.0);
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        if ui.small_button("Copy").clicked() {
-                                                            ui.ctx().copy_text(msg.content.clone());
-                                                        }
-                                                        if ui.small_button("Edit").clicked() {
-                                                            pending_action =
-                                                                Some(PendingAction::Edit(
-                                                                    msg.content.clone(),
-                                                                ));
-                                                        }
-                                                        if ui
-                                                            .small_button("Re-run")
-                                                            .on_hover_text("Send this prompt again")
-                                                            .clicked()
-                                                        {
-                                                            pending_action =
-                                                                Some(PendingAction::Reroll(
-                                                                    msg.content.clone(),
-                                                                ));
-                                                        }
-                                                        if ui
-                                                            .small_button("Undo")
-                                                            .on_hover_text(
-                                                                "Undo the last tool change",
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            pending_action =
-                                                                Some(PendingAction::Undo);
-                                                        }
-                                                    },
-                                                );
-                                            } else if !is_user {
-                                                ui.add_space(4.0);
-                                                ui.horizontal(|ui| {
-                                                    let is_latest_agent =
-                                                        Some(msg_idx) == last_agent_idx;
-                                                    if is_latest_agent && !self.is_processing {
-                                                        draw_layered_logo_loader(
-                                                            ui,
-                                                            &self.last_layer_tex,
-                                                            &self.middle_layer_tex,
-                                                            &self.top_layer_tex,
-                                                            false,
-                                                            22.0,
-                                                        );
-                                                    }
-                                                    if is_hovered {
-                                                        if ui.small_button("Copy").clicked() {
-                                                            ui.ctx().copy_text(msg.content.clone());
-                                                        }
-                                                        if ui
-                                                            .small_button("Undo")
-                                                            .on_hover_text(
-                                                                "Undo the last tool change",
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            pending_action =
-                                                                Some(PendingAction::Undo);
-                                                        }
-                                                    }
-                                                });
-                                            } else {
-                                                ui.add_space(18.0);
-                                            }
+                                             if is_user {
+                                                 ui.allocate_ui_with_layout(
+                                                     egui::vec2(ui.available_width(), 22.0),
+                                                     egui::Layout::top_down(egui::Align::LEFT),
+                                                     |ui| {
+                                                         ui.set_height(22.0);
+                                                         if is_hovered {
+                                                             ui.with_layout(
+                                                                 egui::Layout::right_to_left(
+                                                                     egui::Align::Center,
+                                                                 ),
+                                                                 |ui| {
+                                                                     if ui.small_button("Copy").clicked() {
+                                                                         ui.ctx().copy_text(msg.content.clone());
+                                                                     }
+                                                                     if ui.small_button("Edit").clicked() {
+                                                                         pending_action =
+                                                                             Some(PendingAction::Edit(
+                                                                                 msg.content.clone(),
+                                                                             ));
+                                                                     }
+                                                                     if ui
+                                                                         .small_button("Re-run")
+                                                                         .on_hover_text("Send this prompt again")
+                                                                         .clicked()
+                                                                     {
+                                                                         pending_action =
+                                                                             Some(PendingAction::Reroll(
+                                                                                 msg.content.clone(),
+                                                                             ));
+                                                                     }
+                                                                     if ui
+                                                                         .small_button("Undo")
+                                                                         .on_hover_text(
+                                                                             "Undo the last tool change",
+                                                                         )
+                                                                         .clicked()
+                                                                     {
+                                                                         pending_action =
+                                                                             Some(PendingAction::Undo);
+                                                                     }
+                                                                 },
+                                                             );
+                                                         }
+                                                     },
+                                                 );
+                                             } else {
+                                                 ui.allocate_ui_with_layout(
+                                                     egui::vec2(ui.available_width(), 22.0),
+                                                     egui::Layout::top_down(egui::Align::LEFT),
+                                                     |ui| {
+                                                         ui.set_height(22.0);
+                                                         ui.horizontal(|ui| {
+                                                             let is_latest_agent =
+                                                                 Some(msg_idx) == last_agent_idx;
+                                                             if is_latest_agent && !self.is_processing {
+                                                                 draw_layered_logo_loader(
+                                                                     ui,
+                                                                     &self.last_layer_tex,
+                                                                     &self.middle_layer_tex,
+                                                                     &self.top_layer_tex,
+                                                                     false,
+                                                                     22.0,
+                                                                 );
+                                                             }
+                                                             if is_hovered {
+                                                                 if ui.small_button("Copy").clicked() {
+                                                                     ui.ctx().copy_text(msg.content.clone());
+                                                                 }
+                                                                 if ui
+                                                                     .small_button("Undo")
+                                                                     .on_hover_text(
+                                                                         "Undo the last tool change",
+                                                                     )
+                                                                     .clicked()
+                                                                 {
+                                                                     pending_action =
+                                                                         Some(PendingAction::Undo);
+                                                                 }
+                                                             }
+                                                         });
+                                                     },
+                                                 );
+                                             }
                                         },
                                     );
                                 }
@@ -3361,39 +3566,46 @@ pub fn run_gui(config: GuiConfig) -> Result<(), eframe::Error> {
 }
 
 fn get_file_diff_stats(project_root: &std::path::Path, file_path: &str) -> (i32, i32) {
-    #[cfg(windows)]
-    {
-        if let Ok(output) = spawn_silent_command(
-            "git",
-            &["diff", "--numstat", "--", file_path],
-            project_root,
-        ) {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            let parts: Vec<&str> = out_str.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let (Ok(add), Ok(del)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
-                    return (add, del);
-                }
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        if let Ok(output) = std::process::Command::new("git")
-            .args(&["diff", "--numstat", "--", file_path])
+    // Helper: run `git diff` with the given arguments and parse numstat output
+    let try_git_diff = |extra_args: &[&str]| -> Option<(i32, i32)> {
+        let mut args = vec!["diff", "--numstat"];
+        args.extend_from_slice(extra_args);
+        args.push("--");
+        args.push(file_path);
+
+        #[cfg(windows)]
+        let output_result = spawn_silent_command("git", &args, project_root);
+        #[cfg(not(windows))]
+        let output_result = std::process::Command::new("git")
+            .args(&args)
             .current_dir(project_root)
-            .output()
-        {
+            .output();
+
+        if let Ok(output) = output_result {
             let out_str = String::from_utf8_lossy(&output.stdout);
             let parts: Vec<&str> = out_str.split_whitespace().collect();
             if parts.len() >= 2 {
                 if let (Ok(add), Ok(del)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
-                    return (add, del);
+                    if add > 0 || del > 0 {
+                        return Some((add, del));
+                    }
                 }
             }
         }
+        None
+    };
+
+    // 1. Try unstaged changes (working tree vs index)
+    if let Some(stats) = try_git_diff(&[]) {
+        return stats;
     }
 
+    // 2. Try vs HEAD (catches staged changes and edits to committed files)
+    if let Some(stats) = try_git_diff(&["HEAD"]) {
+        return stats;
+    }
+
+    // 3. Fallback for untracked/new files — count current lines as added
     let full_path = project_root.join(file_path);
     if let Ok(content) = std::fs::read_to_string(&full_path) {
         let lines = content.lines().count() as i32;
@@ -3926,6 +4138,34 @@ fn count_lines(s: &str) -> usize {
     if s.is_empty() { 0 } else { s.lines().count() }
 }
 
+fn extract_streaming_number(json_accumulated: &str, key: &str) -> Option<usize> {
+    let key_pattern = format!("\"{}\"", key);
+    if let Some(key_pos) = json_accumulated.find(&key_pattern) {
+        let after_key = &json_accumulated[key_pos + key_pattern.len()..];
+        if let Some(colon_pos) = after_key.find(':') {
+            let after_colon = &after_key[colon_pos + 1..];
+            let mut val_str = String::new();
+            for c in after_colon.chars() {
+                if c.is_ascii_digit() {
+                    val_str.push(c);
+                } else if c.is_whitespace() {
+                    if !val_str.is_empty() {
+                        break;
+                    }
+                } else {
+                    if !val_str.is_empty() {
+                        break;
+                    }
+                }
+            }
+            if let Ok(num) = val_str.parse::<usize>() {
+                return Some(num);
+            }
+        }
+    }
+    None
+}
+
 fn extract_streaming_content(json_accumulated: &str, key: &str) -> String {
     let key_pattern = format!("\"{}\"", key);
     if let Some(key_pos) = json_accumulated.find(&key_pattern) {
@@ -4072,7 +4312,16 @@ fn estimate_live_diff_stats(
         "edit_file" => {
             let target = extract_streaming_content(args_json, "target");
             let replacement = extract_streaming_content(args_json, "replacement");
-            if !target.is_empty() || !replacement.is_empty() {
+            let start_line = extract_streaming_number(args_json, "start_line");
+            let end_line = extract_streaming_number(args_json, "end_line");
+
+            if let (Some(start), Some(end)) = (start_line, end_line) {
+                if end >= start {
+                    (count_lines(&replacement), end - start + 1)
+                } else {
+                    (count_lines(&replacement), 0)
+                }
+            } else if !target.is_empty() || !replacement.is_empty() {
                 (count_lines(&replacement), count_lines(&target))
             } else {
                 let mut content = extract_streaming_content(args_json, "content");
