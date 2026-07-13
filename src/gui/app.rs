@@ -1941,10 +1941,11 @@ impl eframe::App for GuiApp {
                     let screen_width = ui.ctx().screen_rect().width();
                     let show_text_labels = screen_width >= 1100.0;
                     let show_brand_name = screen_width >= 850.0;
-                    let spacing = if screen_width < 700.0 { 6.0 } else { 12.0 };
+                    let compact_buttons = screen_width < 900.0;
+                    let spacing = if screen_width < 700.0 { 4.0 } else { 12.0 };
 
                     ui.add(egui::Image::new(&self.logo_tex).max_width(30.0));
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
                     if show_brand_name {
                         ui.label(
                             egui::RichText::new("NORVEXUM")
@@ -1957,7 +1958,9 @@ impl eframe::App for GuiApp {
                                 }),
                         );
                     }
-                    let left_sidebar_btn = if self.left_sidebar_open {
+                    let left_sidebar_btn = if compact_buttons {
+                        "⚙"
+                    } else if self.left_sidebar_open {
                         "◀ Settings"
                     } else {
                         "▶ Settings"
@@ -1970,104 +1973,9 @@ impl eframe::App for GuiApp {
                         self.left_sidebar_open = !self.left_sidebar_open;
                     }
 
-                    ui.add_space(if screen_width < 700.0 { 8.0 } else { 16.0 });
+                    ui.add_space(if screen_width < 700.0 { 4.0 } else { 16.0 });
 
-                    // Provider & Model Pickers
-                    let registry = build_registry();
-                    let mut current_provider_idx = registry
-                        .iter()
-                        .position(|p| p.name == self.settings.active_provider)
-                        .unwrap_or(0);
-
-                    let provider_label = &registry[current_provider_idx].display_name;
-                    if show_text_labels {
-                        ui.label(egui::RichText::new("Provider:").strong());
-                    }
-                    egui::ComboBox::from_id_salt("provider_select")
-                        .selected_text(provider_label)
-                        .show_ui(ui, |ui| {
-                            for (idx, provider) in registry.iter().enumerate() {
-                                if ui
-                                    .selectable_value(
-                                        &mut current_provider_idx,
-                                        idx,
-                                        &provider.display_name,
-                                    )
-                                    .clicked()
-                                {
-                                    self.settings.active_provider = provider.name.clone();
-                                    if let Some(first_model) = provider.models.first() {
-                                        self.settings.active_model = first_model.id.clone();
-                                    }
-                                    self.sync_settings();
-                                }
-                            }
-                        });
-
-                    ui.add_space(spacing);
-
-                    let active_provider = &registry[current_provider_idx];
-                    if show_text_labels {
-                        ui.label(egui::RichText::new("Model:").strong());
-                    }
-                    egui::ComboBox::from_id_salt("model_select")
-                        .selected_text(&self.settings.active_model)
-                        .show_ui(ui, |ui| {
-                            for model in &active_provider.models {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.settings.active_model,
-                                        model.id.clone(),
-                                        &model.id,
-                                    )
-                                    .clicked()
-                                {
-                                    self.sync_settings();
-                                }
-                            }
-                        });
-
-                    if let Some(_reasoning_type) = self.model_reasoning_type {
-                        ui.add_space(spacing);
-                        if show_text_labels {
-                            ui.label(egui::RichText::new("Thinking:").strong());
-                        }
-                        let budget = self.settings.thinking_budget.unwrap_or(2048);
-                        let label = match budget {
-                            0 => "Off",
-                            1024 => "Minimal (1K)",
-                            2048 => "Low (2K)",
-                            4096 => "Medium (4K)",
-                            8192 => "High (8K)",
-                            16384 => "Max (16K)",
-                            32768 => "UltraCode (32K)",
-                            _ => "Custom",
-                        };
-                        egui::ComboBox::from_id_salt("thinking_select")
-                            .selected_text(label)
-                            .show_ui(ui, |ui| {
-                                let options = [
-                                    (0, "Off"),
-                                    (1024, "Minimal (1K)"),
-                                    (2048, "Low (2K)"),
-                                    (4096, "Medium (4K)"),
-                                    (8192, "High (8K)"),
-                                    (16384, "Max (16K)"),
-                                    (32768, "UltraCode (32K)"),
-                                ];
-                                for (val, text) in options {
-                                    if ui.selectable_value(&mut self.settings.thinking_budget, Some(val), text).clicked() {
-                                        self.sync_settings();
-                                    }
-                                }
-                            });
-                    } else if self.probing_in_progress {
-                        ui.add_space(spacing);
-                        if show_text_labels {
-                            ui.label(egui::RichText::new("Thinking:").strong());
-                        }
-                        ui.label(egui::RichText::new("Checking support...").italics().color(egui::Color32::from_rgb(120, 120, 140)));
-                    }
+                    // Pickers moved to chat box layout
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -2081,7 +1989,13 @@ impl eframe::App for GuiApp {
                         ui.add_space(4.0);
 
                         // Terminal toggle
-                        let term_label = if self.show_terminal_panel { "▼ Terminal" } else { "▲ Terminal" };
+                        let term_label = if compact_buttons {
+                            "💻"
+                        } else if self.show_terminal_panel {
+                            "▼ Terminal"
+                        } else {
+                            "▲ Terminal"
+                        };
                         let term_btn = egui::Button::new(
                             egui::RichText::new(term_label)
                                 .size(12.0)
@@ -2123,7 +2037,9 @@ impl eframe::App for GuiApp {
 
                         ui.add_space(4.0);
 
-                        let right_sidebar_btn = if self.right_sidebar_open {
+                        let right_sidebar_btn = if compact_buttons {
+                            "📁"
+                        } else if self.right_sidebar_open {
                             "Files ▶"
                         } else {
                             "◀ Files"
@@ -3042,7 +2958,8 @@ impl eframe::App for GuiApp {
                         })
                         .show(ui, |ui| {
                             ui.set_width(chat_width - 24.0);
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.vertical(|ui| {
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 if attachment_button(ui, self.dark_mode).clicked() {
                                     if let Some(path) = rfd::FileDialog::new().pick_file() {
                                         self.attached_image = Some(path);
@@ -3146,6 +3063,88 @@ impl eframe::App for GuiApp {
                                     self.send_message();
                                     edit_response.request_focus();
                                 }
+                            });
+
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("✨").color(egui::Color32::from_rgb(167, 139, 250)));
+                                
+                                let registry = build_registry();
+                                let mut current_provider_idx = registry
+                                    .iter()
+                                    .position(|p| p.name == self.settings.active_provider)
+                                    .unwrap_or(0);
+                                    
+                                egui::ComboBox::from_id_salt("provider_select_bottom")
+                                    .selected_text(&registry[current_provider_idx].display_name)
+                                    .show_ui(ui, |ui| {
+                                        for (idx, provider) in registry.iter().enumerate() {
+                                            if ui.selectable_value(&mut current_provider_idx, idx, &provider.display_name).clicked() {
+                                                self.settings.active_provider = provider.name.clone();
+                                                if let Some(first_model) = provider.models.first() {
+                                                    self.settings.active_model = first_model.id.clone();
+                                                }
+                                                self.sync_settings();
+                                            }
+                                        }
+                                    });
+
+                                ui.add_space(4.0);
+                                let active_provider = &registry[current_provider_idx];
+
+                                let mut model_display = self.settings.active_model.clone();
+                                if model_display.len() > 30 {
+                                    model_display = format!("{}…", &model_display[..27]);
+                                }
+
+                                egui::ComboBox::from_id_salt("model_select_bottom")
+                                    .selected_text(&model_display)
+                                    .show_ui(ui, |ui| {
+                                        for model in &active_provider.models {
+                                            if ui.selectable_value(&mut self.settings.active_model, model.id.clone(), &model.id).clicked() {
+                                                self.sync_settings();
+                                            }
+                                        }
+                                    });
+
+                                if let Some(_reasoning_type) = self.model_reasoning_type {
+                                    ui.add_space(4.0);
+                                    let budget = self.settings.thinking_budget.unwrap_or(2048);
+                                    let label = match budget {
+                                        0 => "Thinking: Off",
+                                        1024 => "Thinking: 1K",
+                                        2048 => "Thinking: 2K",
+                                        4096 => "Thinking: 4K",
+                                        8192 => "Thinking: 8K",
+                                        16384 => "Thinking: 16K",
+                                        32768 => "Thinking: 32K",
+                                        _ => "Thinking: Custom",
+                                    };
+                                    egui::ComboBox::from_id_salt("thinking_select_bottom")
+                                        .selected_text(label)
+                                        .show_ui(ui, |ui| {
+                                            let options = [
+                                                (0, "Off"),
+                                                (1024, "1K"),
+                                                (2048, "2K"),
+                                                (4096, "4K"),
+                                                (8192, "8K"),
+                                                (16384, "16K"),
+                                                (32768, "32K"),
+                                            ];
+                                            for (val, text) in options {
+                                                if ui.selectable_value(&mut self.settings.thinking_budget, Some(val), text).clicked() {
+                                                    self.sync_settings();
+                                                }
+                                            }
+                                        });
+                                } else if self.probing_in_progress {
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("Checking...").italics().color(egui::Color32::from_rgb(120, 120, 140)));
+                                }
+                            });
+                            ui.add_space(4.0);
                             });
                         });
 
