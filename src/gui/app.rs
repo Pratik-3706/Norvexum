@@ -1939,8 +1939,8 @@ impl eframe::App for GuiApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let screen_width = ui.ctx().screen_rect().width();
-                    let show_text_labels = screen_width >= 960.0;
-                    let show_brand_name = screen_width >= 800.0;
+                    let show_text_labels = screen_width >= 1100.0;
+                    let show_brand_name = screen_width >= 850.0;
                     let spacing = if screen_width < 700.0 { 6.0 } else { 12.0 };
 
                     ui.add(egui::Image::new(&self.logo_tex).max_width(30.0));
