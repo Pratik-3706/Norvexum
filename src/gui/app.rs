@@ -1938,18 +1938,25 @@ impl eframe::App for GuiApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    let screen_width = ui.ctx().screen_rect().width();
+                    let show_text_labels = screen_width >= 960.0;
+                    let show_brand_name = screen_width >= 800.0;
+                    let spacing = if screen_width < 700.0 { 6.0 } else { 12.0 };
+
                     ui.add(egui::Image::new(&self.logo_tex).max_width(30.0));
                     ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new("NORVEXUM")
-                            .font(egui::FontId::proportional(20.0))
-                            .strong()
-                            .color(if self.dark_mode {
-                                egui::Color32::from_rgb(244, 241, 255)
-                            } else {
-                                egui::Color32::from_rgb(31, 25, 45)
-                            }),
-                    );
+                    if show_brand_name {
+                        ui.label(
+                            egui::RichText::new("NORVEXUM")
+                                .font(egui::FontId::proportional(20.0))
+                                .strong()
+                                .color(if self.dark_mode {
+                                    egui::Color32::from_rgb(244, 241, 255)
+                                } else {
+                                    egui::Color32::from_rgb(31, 25, 45)
+                                }),
+                        );
+                    }
                     let left_sidebar_btn = if self.left_sidebar_open {
                         "◀ Settings"
                     } else {
@@ -1963,7 +1970,7 @@ impl eframe::App for GuiApp {
                         self.left_sidebar_open = !self.left_sidebar_open;
                     }
 
-                    ui.add_space(16.0);
+                    ui.add_space(if screen_width < 700.0 { 8.0 } else { 16.0 });
 
                     // Provider & Model Pickers
                     let registry = build_registry();
@@ -1973,7 +1980,9 @@ impl eframe::App for GuiApp {
                         .unwrap_or(0);
 
                     let provider_label = &registry[current_provider_idx].display_name;
-                    ui.label(egui::RichText::new("Provider:").strong());
+                    if show_text_labels {
+                        ui.label(egui::RichText::new("Provider:").strong());
+                    }
                     egui::ComboBox::from_id_salt("provider_select")
                         .selected_text(provider_label)
                         .show_ui(ui, |ui| {
@@ -1995,10 +2004,12 @@ impl eframe::App for GuiApp {
                             }
                         });
 
-                    ui.add_space(12.0);
+                    ui.add_space(spacing);
 
                     let active_provider = &registry[current_provider_idx];
-                    ui.label(egui::RichText::new("Model:").strong());
+                    if show_text_labels {
+                        ui.label(egui::RichText::new("Model:").strong());
+                    }
                     egui::ComboBox::from_id_salt("model_select")
                         .selected_text(&self.settings.active_model)
                         .show_ui(ui, |ui| {
@@ -2017,8 +2028,10 @@ impl eframe::App for GuiApp {
                         });
 
                     if let Some(_reasoning_type) = self.model_reasoning_type {
-                        ui.add_space(12.0);
-                        ui.label(egui::RichText::new("Thinking:").strong());
+                        ui.add_space(spacing);
+                        if show_text_labels {
+                            ui.label(egui::RichText::new("Thinking:").strong());
+                        }
                         let budget = self.settings.thinking_budget.unwrap_or(2048);
                         let label = match budget {
                             0 => "Off",
@@ -2049,8 +2062,10 @@ impl eframe::App for GuiApp {
                                 }
                             });
                     } else if self.probing_in_progress {
-                        ui.add_space(12.0);
-                        ui.label(egui::RichText::new("Thinking:").strong());
+                        ui.add_space(spacing);
+                        if show_text_labels {
+                            ui.label(egui::RichText::new("Thinking:").strong());
+                        }
                         ui.label(egui::RichText::new("Checking support...").italics().color(egui::Color32::from_rgb(120, 120, 140)));
                     }
 
