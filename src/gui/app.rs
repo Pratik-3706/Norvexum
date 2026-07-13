@@ -34,6 +34,14 @@ pub struct GuiMessage {
     pub tool_logs: Vec<String>,
 }
 
+#[derive(Clone)]
+pub struct TerminalEntry {
+    pub command: String,
+    pub output: String,
+    pub success: bool,
+    pub timestamp: std::time::Instant,
+}
+
 pub struct GuiApp {
     settings: Settings,
     agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
@@ -128,6 +136,11 @@ pub struct GuiApp {
     ctx: Option<egui::Context>,
     last_active_provider: String,
     last_active_model: String,
+
+    // Terminal panel
+    show_terminal_panel: bool,
+    terminal_entries: Vec<TerminalEntry>,
+    pending_terminal_command: Option<String>,
 }
 
 #[derive(Default)]
@@ -490,6 +503,9 @@ impl GuiApp {
             ctx: None,
             last_active_provider: initial_provider,
             last_active_model: initial_model,
+            show_terminal_panel: false,
+            terminal_entries: Vec::new(),
+            pending_terminal_command: None,
         };
 
         if let Some(msg) = config.initial_message {
@@ -790,6 +806,7 @@ impl GuiApp {
         self.messages.clear();
         self.session_written_files.clear();
         self.file_diff_stats.clear();
+        self.terminal_entries.clear();
         self.current_session_id = None;
         self.active_messages_backup = None;
         let _ = self.user_tx.send("/clear".to_string());
@@ -1071,7 +1088,7 @@ impl GuiApp {
                             }
                         }
                         AgentEvent::ToolResult {
-                            id, name, success, ..
+                            id, name, result, success,
                         } => {
                             let args_summary = if Some(&id) == self.current_tool_id.as_ref() {
                                 format_tool_args_summary(&name, &self.current_tool_args)
@@ -1093,6 +1110,30 @@ impl GuiApp {
                             } else {
                                 None
                             };
+
+                            // Capture terminal entry for run_command/shell
+                            if name == "run_command" || name == "shell" || name == "shell_command" || name == "execute" {
+                                let cmd = if Some(&id) == self.current_tool_id.as_ref() {
+                                    let mut c = extract_streaming_content(&self.current_tool_args, "command");
+                                    if c.is_empty() {
+                                        c = extract_streaming_content(&self.current_tool_args, "CommandLine");
+                                    }
+                                    if c.is_empty() {
+                                        c = extract_streaming_content(&self.current_tool_args, "cmd");
+                                    }
+                                    c
+                                } else {
+                                    self.pending_terminal_command.take().unwrap_or_default()
+                                };
+                                if !cmd.is_empty() {
+                                    self.terminal_entries.push(TerminalEntry {
+                                        command: cmd,
+                                        output: result.clone(),
+                                        success,
+                                        timestamp: std::time::Instant::now(),
+                                    });
+                                }
+                            }
 
                             if Some(&id) == self.current_tool_id.as_ref() {
                                 self.current_tool_name = None;
@@ -1237,6 +1278,7 @@ impl GuiApp {
                             self.messages.clear();
                             self.session_written_files.clear();
                             self.file_diff_stats.clear();
+                            self.terminal_entries.clear();
                             self.current_session_id = None;
                             self.active_messages_backup = None;
                             self.status_text = "Chat cleared".to_string();
@@ -1342,6 +1384,7 @@ impl GuiApp {
         if self.messages.len() == 1 {
             self.session_written_files.clear();
             self.file_diff_stats.clear();
+            self.terminal_entries.clear();
         }
 
         if self.is_processing {
@@ -1872,7 +1915,50 @@ impl eframe::App for GuiApp {
                             self.dark_mode = !self.dark_mode;
                         }
 
-                        ui.add_space(8.0);
+                        ui.add_space(4.0);
+
+                        // Terminal toggle
+                        let term_label = if self.show_terminal_panel { "▼ Terminal" } else { "▲ Terminal" };
+                        let term_btn = egui::Button::new(
+                            egui::RichText::new(term_label)
+                                .size(12.0)
+                                .color(if self.show_terminal_panel {
+                                    egui::Color32::from_rgb(52, 211, 153)
+                                } else if self.dark_mode {
+                                    egui::Color32::from_rgb(148, 163, 184)
+                                } else {
+                                    egui::Color32::from_rgb(100, 116, 139)
+                                }),
+                        )
+                        .fill(if self.show_terminal_panel {
+                            if self.dark_mode {
+                                egui::Color32::from_rgb(20, 40, 30)
+                            } else {
+                                egui::Color32::from_rgb(220, 252, 231)
+                            }
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .stroke(egui::Stroke::new(
+                            0.5,
+                            if self.show_terminal_panel {
+                                egui::Color32::from_rgb(52, 211, 153)
+                            } else if self.dark_mode {
+                                egui::Color32::from_rgb(55, 55, 70)
+                            } else {
+                                egui::Color32::from_rgb(200, 205, 218)
+                            },
+                        ))
+                        .rounding(8.0);
+                        if ui
+                            .add(term_btn)
+                            .on_hover_text("Toggle AI terminal panel")
+                            .clicked()
+                        {
+                            self.show_terminal_panel = !self.show_terminal_panel;
+                        }
+
+                        ui.add_space(4.0);
 
                         let right_sidebar_btn = if self.right_sidebar_open {
                             "Files ▶"
@@ -2172,6 +2258,7 @@ impl eframe::App for GuiApp {
                         }).collect();
                         self.session_written_files.clear();
                         self.file_diff_stats.clear();
+                        self.terminal_entries.clear();
                         let title = format!("Chat ({})", &id[..6.min(id.len())]);
                         self.status_text = format!("Loaded conversation: {}", title);
                     }
@@ -2188,6 +2275,7 @@ impl eframe::App for GuiApp {
                             self.current_session_id = None;
                             self.session_written_files.clear();
                             self.file_diff_stats.clear();
+                            self.terminal_entries.clear();
                         }
                         self.history_sessions = crate::agent::session::Session::list(&self.settings.project_root);
                         self.status_text = "Session deleted.".to_string();
@@ -2846,9 +2934,11 @@ impl eframe::App for GuiApp {
                                                 egui::Button::new(
                                                     egui::RichText::new("Send  ↑")
                                                         .color(egui::Color32::WHITE)
-                                                        .strong(),
+                                                        .strong()
+                                                        .size(14.0),
                                                 )
-                                                .fill(egui::Color32::from_rgb(124, 58, 237))
+                                                .fill(egui::Color32::from_rgb(109, 40, 217))
+                                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(167, 139, 250)))
                                                 .rounding(10.0),
                                             )
                                             .clicked()
@@ -2881,9 +2971,11 @@ impl eframe::App for GuiApp {
                                         egui::Button::new(
                                             egui::RichText::new("Send  ↑")
                                                 .color(egui::Color32::WHITE)
-                                                .strong(),
+                                                .strong()
+                                                .size(14.0),
                                         )
-                                        .fill(egui::Color32::from_rgb(124, 58, 237))
+                                        .fill(egui::Color32::from_rgb(109, 40, 217))
+                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(167, 139, 250)))
                                         .rounding(10.0),
                                     )
                                     .clicked()
@@ -2897,6 +2989,135 @@ impl eframe::App for GuiApp {
                     ui.add_space(horizontal_margin);
                 });
             });
+
+        // Terminal Panel (togglable, sits above input panel)
+        if self.show_terminal_panel {
+            egui::TopBottomPanel::bottom("terminal_panel")
+                .frame(
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                        .fill(if self.dark_mode {
+                            egui::Color32::from_rgb(8, 10, 14)
+                        } else {
+                            egui::Color32::from_rgb(24, 24, 32)
+                        })
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            if self.dark_mode {
+                                egui::Color32::from_rgb(30, 40, 35)
+                            } else {
+                                egui::Color32::from_rgb(50, 55, 65)
+                            },
+                        )),
+                )
+                .resizable(true)
+                .default_height(180.0)
+                .max_height(400.0)
+                .min_height(80.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("⬛ TERMINAL")
+                                .size(10.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(52, 211, 153)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("({} commands)", self.terminal_entries.len()))
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(100, 116, 139)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Clear")
+                                            .size(10.0)
+                                            .color(egui::Color32::from_rgb(148, 163, 184)),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE),
+                                )
+                                .clicked()
+                            {
+                                self.terminal_entries.clear();
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false; 2])
+                        .id_salt("terminal_scroll")
+                        .show(ui, |ui| {
+                            if self.terminal_entries.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("No commands executed yet. Agent terminal output will appear here.")
+                                        .size(11.0)
+                                        .italics()
+                                        .color(egui::Color32::from_rgb(75, 85, 99)),
+                                );
+                            } else {
+                                let entries = self.terminal_entries.clone();
+                                for (i, entry) in entries.iter().enumerate() {
+                                    // Command prompt line
+                                    let cmd_color = if entry.success {
+                                        egui::Color32::from_rgb(52, 211, 153)
+                                    } else {
+                                        egui::Color32::from_rgb(248, 113, 113)
+                                    };
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("$")
+                                                .size(12.0)
+                                                .strong()
+                                                .color(cmd_color)
+                                                .monospace(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(&entry.command)
+                                                .size(12.0)
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(226, 232, 240))
+                                                .monospace(),
+                                        );
+                                    });
+
+                                    // Output (truncated to prevent huge renders)
+                                    if !entry.output.is_empty() {
+                                        let output_text = if entry.output.len() > 2000 {
+                                            format!("{}…\n(truncated)", &entry.output[..2000])
+                                        } else {
+                                            entry.output.clone()
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(&output_text)
+                                                .size(11.0)
+                                                .color(egui::Color32::from_rgb(148, 163, 184))
+                                                .monospace(),
+                                        );
+                                    }
+
+                                    if i + 1 < entries.len() {
+                                        ui.add_space(6.0);
+                                        let separator_color = egui::Color32::from_rgb(30, 35, 45);
+                                        let rect = ui.available_rect_before_wrap();
+                                        let y = rect.top();
+                                        ui.painter().line_segment(
+                                            [
+                                                egui::pos2(rect.left(), y),
+                                                egui::pos2(rect.right(), y),
+                                            ],
+                                            egui::Stroke::new(0.5, separator_color),
+                                        );
+                                        ui.add_space(6.0);
+                                    }
+                                }
+                            }
+                        });
+                });
+        }
 
         // Center Panel (Chat Conversation Area)
         egui::CentralPanel::default()
@@ -2956,6 +3177,7 @@ impl eframe::App for GuiApp {
                             self.messages.clear();
                             self.session_written_files.clear();
                             self.file_diff_stats.clear();
+                            self.terminal_entries.clear();
                             self.current_session_id = None;
                             self.active_messages_backup = None;
                             self.selected_file = None;
@@ -3167,11 +3389,24 @@ impl eframe::App for GuiApp {
                                                              },
                                                          );
                                                     } else {
-                                                        // Agent response: NO bubble! Laid out directly on chat background
-                                                        ui.set_width(
-                                                            (available_chat_width - 36.0)
-                                                                .clamp(260.0, 960.0),
-                                                        );
+                                                        // Agent response: subtle left accent bar + clean background
+                                                        let agent_width = (available_chat_width - 36.0)
+                                                                .clamp(260.0, 960.0);
+                                                        let accent_color = if self.dark_mode {
+                                                            egui::Color32::from_rgb(124, 58, 237)
+                                                        } else {
+                                                            egui::Color32::from_rgb(139, 92, 246)
+                                                        };
+
+                                                        // Paint a left accent bar
+                                                        let before_rect = ui.cursor();
+                                                        let accent_id = egui::Id::new(format!("agent_accent_{msg_idx}"));
+                                                        let _ = accent_id; // used below after content
+
+                                                        ui.set_width(agent_width);
+                                                        ui.add_space(4.0);
+
+                                                        let content_start_y = ui.cursor().top();
 
                                                         // Render thinking and tools chronologically interleaved
                                                         let is_latest_agent =
@@ -3219,6 +3454,19 @@ impl eframe::App for GuiApp {
                                                                 ui,
                                                                 &msg.content,
                                                                 self.dark_mode,
+                                                            );
+                                                        }
+
+                                                        // Paint the left accent bar
+                                                        let content_end_y = ui.cursor().top();
+                                                        if content_end_y > content_start_y + 2.0 {
+                                                            let bar_x = before_rect.left() - 6.0;
+                                                            ui.painter().line_segment(
+                                                                [
+                                                                    egui::pos2(bar_x, content_start_y),
+                                                                    egui::pos2(bar_x, content_end_y - 4.0),
+                                                                ],
+                                                                egui::Stroke::new(2.5, accent_color.linear_multiply(0.6)),
                                                             );
                                                         }
                                                     }
@@ -4549,18 +4797,35 @@ fn render_chronological_activity(
             .id_salt(ui.next_auto_id())
             .default_open(is_processing)
             .show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(thinking.trim())
-                            .font(egui::FontId::monospace(11.0))
-                            .color(if dark_mode {
-                                egui::Color32::from_rgb(190, 198, 218)
-                            } else {
-                                egui::Color32::from_rgb(71, 85, 105)
-                            }),
-                    )
-                    .wrap(),
-                );
+                let thinking_bg = if dark_mode {
+                    egui::Color32::from_rgb(16, 17, 26)
+                } else {
+                    egui::Color32::from_rgb(245, 243, 255)
+                };
+                let thinking_border = if dark_mode {
+                    egui::Color32::from_rgb(55, 45, 80)
+                } else {
+                    egui::Color32::from_rgb(196, 181, 253)
+                };
+                egui::Frame::default()
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .fill(thinking_bg)
+                    .stroke(egui::Stroke::new(0.5, thinking_border))
+                    .rounding(6.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(thinking.trim())
+                                    .font(egui::FontId::monospace(11.0))
+                                    .color(if dark_mode {
+                                        egui::Color32::from_rgb(190, 198, 218)
+                                    } else {
+                                        egui::Color32::from_rgb(71, 85, 105)
+                                    }),
+                            )
+                            .wrap(),
+                        );
+                    });
             });
         }
         ui.add_space(4.0);
