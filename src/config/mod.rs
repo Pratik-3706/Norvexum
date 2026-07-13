@@ -63,6 +63,11 @@ pub struct Settings {
     pub custom_system_prompt: Option<String>,
     #[serde(default)]
     pub custom_models: Vec<String>,
+    
+    // ── Reasoning / Thinking settings ────────────────────────────────────
+    pub thinking_budget: Option<u32>,
+    #[serde(skip)]
+    pub model_reasoning_type: Option<crate::ai::types::ReasoningType>,
 }
 
 impl Default for Settings {
@@ -89,6 +94,8 @@ impl Default for Settings {
             ask_perms: true,
             custom_system_prompt: None,
             custom_models: Vec::new(),
+            thinking_budget: Some(2048),
+            model_reasoning_type: None,
         }
     }
 }
@@ -167,6 +174,9 @@ impl Settings {
             if let Some(custom) = file_settings.custom_models {
                 settings.custom_models = custom;
             }
+            if let Some(budget) = file_settings.thinking_budget {
+                settings.thinking_budget = Some(budget);
+            }
         }
 
         // Auto-select provider based on available keys if using defaults
@@ -219,6 +229,9 @@ impl Settings {
                                             if let Some(url) = file_settings.ollama_base_url {
                                                 settings.ollama_base_url = Some(url);
                                             }
+                                            if let Some(budget) = file_settings.thinking_budget {
+                                                settings.thinking_budget = Some(budget);
+                                            }
                                         }
                                     }
                                 }
@@ -260,6 +273,7 @@ impl Settings {
             } else {
                 Some(self.custom_models.clone())
             },
+            thinking_budget: self.thinking_budget,
         };
 
         let content = toml::to_string_pretty(&file_settings)?;
@@ -332,4 +346,5 @@ struct FileSettings {
     require_approval: Option<Vec<String>>,
     ollama_base_url: Option<String>,
     custom_models: Option<Vec<String>>,
+    thinking_budget: Option<u32>,
 }

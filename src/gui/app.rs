@@ -141,6 +141,19 @@ pub struct GuiApp {
     show_terminal_panel: bool,
     terminal_entries: Vec<TerminalEntry>,
     pending_terminal_command: Option<String>,
+
+    // Dynamic model capability probing
+    model_reasoning_type: Option<crate::ai::types::ReasoningType>,
+    probed_capabilities: std::collections::HashMap<String, Option<crate::ai::types::ReasoningType>>,
+    probing_in_progress: bool,
+    capabilities_rx: Option<std_mpsc::Receiver<CapabilitiesUpdate>>,
+    capabilities_tx: Option<std_mpsc::Sender<CapabilitiesUpdate>>,
+}
+
+struct CapabilitiesUpdate {
+    provider: String,
+    model: String,
+    reasoning_type: Option<crate::ai::types::ReasoningType>,
 }
 
 #[derive(Default)]
@@ -430,6 +443,7 @@ impl GuiApp {
         let skills_list = crate::skills::load_all_skills(&config.settings.project_root);
 
         let history_sessions = crate::agent::session::Session::list(&config.settings.project_root);
+        let (capabilities_tx, capabilities_rx) = std_mpsc::channel();
         let initial_provider = config.settings.active_provider.clone();
         let initial_model = config.settings.active_model.clone();
 
@@ -506,7 +520,15 @@ impl GuiApp {
             show_terminal_panel: false,
             terminal_entries: Vec::new(),
             pending_terminal_command: None,
+            model_reasoning_type: None,
+            probed_capabilities: std::collections::HashMap::new(),
+            probing_in_progress: false,
+            capabilities_rx: Some(capabilities_rx),
+            capabilities_tx: Some(capabilities_tx),
         };
+
+        app.load_capabilities_cache();
+        app.trigger_capabilities_probe();
 
         if let Some(msg) = config.initial_message {
             app.thinking_start_time = Some(std::time::Instant::now());
@@ -745,6 +767,93 @@ impl GuiApp {
                     });
                 }
             });
+        }
+        self.trigger_capabilities_probe();
+    }
+
+    fn save_capabilities_cache(&self) {
+        let cache_dir = self.settings.project_root.join(crate::config::NORVEXUM_DIR);
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let cache_path = cache_dir.join("capabilities_cache.json");
+        if let Ok(content) = serde_json::to_string_pretty(&self.probed_capabilities) {
+            let _ = std::fs::write(cache_path, content);
+        }
+    }
+
+    fn load_capabilities_cache(&mut self) {
+        let cache_path = self.settings.project_root.join(crate::config::NORVEXUM_DIR).join("capabilities_cache.json");
+        if cache_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(cache_path) {
+                if let Ok(map) = serde_json::from_str(&content) {
+                    self.probed_capabilities = map;
+                }
+            }
+        }
+    }
+
+    fn trigger_capabilities_probe(&mut self) {
+        let provider = self.settings.active_provider.clone();
+        let model = self.settings.active_model.clone();
+        let key = format!("{provider}:{model}");
+
+        // 1. Check cache first
+        if let Some(&reasoning_type) = self.probed_capabilities.get(&key) {
+            self.model_reasoning_type = reasoning_type;
+            self.settings.model_reasoning_type = reasoning_type;
+            self.probing_in_progress = false;
+            return;
+        }
+
+        // 2. Set immediate heuristic guess to keep UI responsive
+        let heuristic = crate::ai::guess_reasoning_support_by_name(&provider, &model);
+        self.model_reasoning_type = heuristic;
+        self.settings.model_reasoning_type = heuristic;
+
+        if provider == "ollama" {
+            self.probing_in_progress = false;
+            return;
+        }
+
+        // 3. Spawn dynamic verification probe in background
+        self.probing_in_progress = true;
+        let tx = self.capabilities_tx.clone();
+        let settings = self.settings.clone();
+        let ctx_opt = self.ctx.clone();
+
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+
+            rt.block_on(async {
+                let reasoning_type = crate::ai::probe_model_reasoning(&settings, &provider, &model).await;
+                if let Some(ref tx) = tx {
+                    let _ = tx.send(CapabilitiesUpdate {
+                        provider,
+                        model,
+                        reasoning_type,
+                    });
+                }
+                if let Some(ref ctx) = ctx_opt {
+                    ctx.request_repaint();
+                }
+            });
+        });
+    }
+
+    fn poll_capabilities(&mut self) {
+        if let Some(ref rx) = self.capabilities_rx {
+            while let Ok(update) = rx.try_recv() {
+                let key = format!("{}:{}", update.provider, update.model);
+                self.probed_capabilities.insert(key, update.reasoning_type);
+                if self.settings.active_provider == update.provider && self.settings.active_model == update.model {
+                    self.model_reasoning_type = update.reasoning_type;
+                    self.settings.model_reasoning_type = update.reasoning_type;
+                    self.probing_in_progress = false;
+                }
+                self.save_capabilities_cache();
+            }
         }
     }
 
@@ -1721,6 +1830,7 @@ impl eframe::App for GuiApp {
 
         self.poll_agent_events(ctx);
         self.poll_file_events(ctx);
+        self.poll_capabilities();
 
         // Capture dropped files
         ctx.input(|i| {
@@ -1905,6 +2015,44 @@ impl eframe::App for GuiApp {
                                 }
                             }
                         });
+
+                    if let Some(_reasoning_type) = self.model_reasoning_type {
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Thinking:").strong());
+                        let budget = self.settings.thinking_budget.unwrap_or(2048);
+                        let label = match budget {
+                            0 => "Off",
+                            1024 => "Minimal (1K)",
+                            2048 => "Low (2K)",
+                            4096 => "Medium (4K)",
+                            8192 => "High (8K)",
+                            16384 => "Max (16K)",
+                            32768 => "UltraCode (32K)",
+                            _ => "Custom",
+                        };
+                        egui::ComboBox::from_id_salt("thinking_select")
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                let options = [
+                                    (0, "Off"),
+                                    (1024, "Minimal (1K)"),
+                                    (2048, "Low (2K)"),
+                                    (4096, "Medium (4K)"),
+                                    (8192, "High (8K)"),
+                                    (16384, "Max (16K)"),
+                                    (32768, "UltraCode (32K)"),
+                                ];
+                                for (val, text) in options {
+                                    if ui.selectable_value(&mut self.settings.thinking_budget, Some(val), text).clicked() {
+                                        self.sync_settings();
+                                    }
+                                }
+                            });
+                    } else if self.probing_in_progress {
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Thinking:").strong());
+                        ui.label(egui::RichText::new("Checking support...").italics().color(egui::Color32::from_rgb(120, 120, 140)));
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -3046,12 +3194,16 @@ impl eframe::App for GuiApp {
                     });
                     ui.add_space(4.0);
 
+                    let is_running_cmd = self.is_processing && self.current_tool_name.as_ref().map_or(false, |name| {
+                        name == "run_command" || name == "shell" || name == "shell_command" || name == "execute"
+                    });
+
                     egui::ScrollArea::vertical()
                         .stick_to_bottom(true)
                         .auto_shrink([false; 2])
                         .id_salt("terminal_scroll")
                         .show(ui, |ui| {
-                            if self.terminal_entries.is_empty() {
+                            if self.terminal_entries.is_empty() && !is_running_cmd {
                                 ui.label(
                                     egui::RichText::new("No commands executed yet. Agent terminal output will appear here.")
                                         .size(11.0)
@@ -3099,7 +3251,7 @@ impl eframe::App for GuiApp {
                                         );
                                     }
 
-                                    if i + 1 < entries.len() {
+                                    if i + 1 < entries.len() || is_running_cmd {
                                         ui.add_space(6.0);
                                         let separator_color = egui::Color32::from_rgb(30, 35, 45);
                                         let rect = ui.available_rect_before_wrap();
@@ -3113,6 +3265,44 @@ impl eframe::App for GuiApp {
                                         );
                                         ui.add_space(6.0);
                                     }
+                                }
+
+                                // If currently executing a shell command, show it live!
+                                if is_running_cmd {
+                                    let cmd = extract_streaming_content(&self.current_tool_args, "command");
+                                    let mut cmd_line = if cmd.is_empty() {
+                                        extract_streaming_content(&self.current_tool_args, "CommandLine")
+                                    } else {
+                                        cmd
+                                    };
+                                    if cmd_line.is_empty() {
+                                        cmd_line = extract_streaming_content(&self.current_tool_args, "cmd");
+                                    }
+
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("$")
+                                                .size(12.0)
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(167, 139, 250)) // Purple prompt for active
+                                                .monospace(),
+                                        );
+                                        
+                                        // Make block character blink slightly (using sinus animation)
+                                        let time = ui.input(|i| i.time);
+                                        let cursor = if (time * 2.0) as i64 % 2 == 0 { "█" } else { " " };
+                                        
+                                        ui.label(
+                                            egui::RichText::new(format!("{} {}", cmd_line, cursor))
+                                                .size(12.0)
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(226, 232, 240))
+                                                .monospace(),
+                                        );
+                                    });
+                                    
+                                    // Request repaint for blinking cursor
+                                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
                                 }
                             }
                         });

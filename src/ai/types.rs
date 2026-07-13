@@ -160,6 +160,13 @@ pub struct ToolCall {
     pub thought_signature: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReasoningType {
+    OpenAiEffort,
+    AnthropicThinking,
+    GeminiThinking,
+}
+
 // ── AI Request ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -168,6 +175,8 @@ pub struct AiRequest {
     pub tools: Vec<ToolDef>,
     pub temperature: f32,
     pub max_tokens: Option<u32>,
+    pub reasoning_type: Option<ReasoningType>,
+    pub thinking_budget: Option<u32>,
 }
 
 impl AiRequest {
@@ -177,6 +186,8 @@ impl AiRequest {
             tools: vec![],
             temperature: 0.7,
             max_tokens: None,
+            reasoning_type: None,
+            thinking_budget: None,
         }
     }
 
@@ -187,6 +198,21 @@ impl AiRequest {
 
     pub fn with_temperature(mut self, temp: f32) -> Self {
         self.temperature = temp;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max: u32) -> Self {
+        self.max_tokens = Some(max);
+        self
+    }
+
+    pub fn with_reasoning_type(mut self, reasoning_type: Option<ReasoningType>) -> Self {
+        self.reasoning_type = reasoning_type;
+        self
+    }
+
+    pub fn with_thinking_budget(mut self, budget: Option<u32>) -> Self {
+        self.thinking_budget = budget;
         self
     }
 }

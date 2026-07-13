@@ -236,14 +236,21 @@ impl AiClient for GeminiClient {
 
         let (system_instruction, contents) = self.format_contents(&request.messages);
 
+        let mut gen_config = json!({
+            "temperature": request.temperature,
+        });
+
+        if let Some(budget) = request.thinking_budget {
+            if budget > 0 {
+                gen_config["thinkingConfig"] = json!({
+                    "thinkingBudget": budget
+                });
+            }
+        }
+
         let mut body = json!({
             "contents": contents,
-            "generationConfig": {
-                "temperature": request.temperature,
-                "thinkingConfig": {
-                    "thinkingBudget": 2048
-                }
-            },
+            "generationConfig": gen_config,
             "safetySettings": [
                 {
                     "category": "HARM_CATEGORY_HARASSMENT",
@@ -517,6 +524,7 @@ mod tests {
             id: "call-1".into(),
             name: "read_file".into(),
             arguments: json!({ "path": "README.md" }),
+            thought_signature: None,
         };
         let (_, contents) = client.format_contents(&[
             Message::assistant_with_tool_calls("", vec![call]),

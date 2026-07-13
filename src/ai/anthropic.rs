@@ -181,13 +181,32 @@ impl AiClient for AnthropicClient {
 
         let (system_prompt, messages) = self.format_messages(&request.messages);
 
+        let mut max_tokens = request.max_tokens.unwrap_or(8192);
+        let mut temperature = request.temperature;
+
         let mut body = json!({
             "model": self.model,
             "messages": messages,
-            "max_tokens": request.max_tokens.unwrap_or(8192),
             "stream": true,
-            "temperature": request.temperature,
         });
+
+        if let Some(budget) = request.thinking_budget {
+            if budget > 0 {
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget
+                });
+                // Anthropic thinking requires temperature to be 1.0 (or not set, but 1.0 is standard when enabled)
+                temperature = 1.0;
+                // Anthropic requires max_tokens to be strictly greater than budget_tokens
+                if max_tokens <= budget {
+                    max_tokens = budget + 1024;
+                }
+            }
+        }
+
+        body["max_tokens"] = json!(max_tokens);
+        body["temperature"] = json!(temperature);
 
         if let Some(sys) = system_prompt {
             body["system"] = json!(sys);
@@ -389,6 +408,7 @@ mod tests {
             id: "call-1".into(),
             name: "read_file".into(),
             arguments: json!({ "path": "README.md" }),
+            thought_signature: None,
         };
         let (_, messages) = client.format_messages(&[
             Message::assistant_with_tool_calls("", vec![call]),

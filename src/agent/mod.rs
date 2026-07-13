@@ -763,9 +763,20 @@ impl Agent {
             }
 
             // Create AI request with current conversation + tools
-            let request = AiRequest::new(active_messages)
-                .with_tools(self.tools.tool_defs())
-                .with_temperature(0.7);
+            let mut request = AiRequest::new(active_messages)
+                .with_tools(self.tools.tool_defs());
+
+            let mut temp = 0.7;
+            if let Some(budget) = self.settings.thinking_budget {
+                if budget > 0 {
+                    request = request.with_thinking_budget(Some(budget));
+                    request = request.with_reasoning_type(self.settings.model_reasoning_type);
+                    if self.settings.model_reasoning_type == Some(crate::ai::types::ReasoningType::AnthropicThinking) {
+                        temp = 1.0;
+                    }
+                }
+            }
+            let request = request.with_temperature(temp);
 
             // Stream response from AI
             let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<AiStreamEvent>();
@@ -817,7 +828,12 @@ impl Agent {
                             }
                             AiStreamEvent::ToolCallComplete(tc) => {
                                 has_tool_calls = true;
-                                pending_tool_calls.push(tc);
+                                pending_tool_calls.push(tc.clone());
+                                // Send full args delta to populate GUI current_tool_args for non-streaming providers
+                                let _ = event_tx.send(AgentEvent::ToolArgsDelta {
+                                    id: tc.id.clone(),
+                                    delta: tc.arguments.to_string(),
+                                });
                             }
                             AiStreamEvent::Done { finish_reason: _, usage } => {
                                 if let Some(ref u) = usage {
@@ -865,7 +881,12 @@ impl Agent {
                     }
                     AiStreamEvent::ToolCallComplete(tc) => {
                         has_tool_calls = true;
-                        pending_tool_calls.push(tc);
+                        pending_tool_calls.push(tc.clone());
+                        // Send full args delta to populate GUI current_tool_args for non-streaming providers
+                        let _ = event_tx.send(AgentEvent::ToolArgsDelta {
+                            id: tc.id.clone(),
+                            delta: tc.arguments.to_string(),
+                        });
                     }
                     AiStreamEvent::Done {
                         finish_reason: _,
@@ -979,8 +1000,16 @@ impl Agent {
                     }
 
                     // Snapshot files before write/edit operations
-                    if name == "write_file" || name == "edit_file" {
-                        if let Some(path_str) = args["path"].as_str() {
+                    let is_file_write = name == "write_file"
+                        || name == "write_to_file"
+                        || name == "edit_file"
+                        || name == "replace_file_content"
+                        || name == "multi_replace_file_content";
+
+                    let path_opt = args["path"].as_str().or_else(|| args["TargetFile"].as_str());
+
+                    if is_file_write {
+                        if let Some(path_str) = path_opt {
                             let full_path = ctx.cwd.join(path_str);
                             let _ = checkpoint::snapshot_file(&project_root, &full_path);
                         }
@@ -990,8 +1019,8 @@ impl Agent {
                     let result = tools.execute(&name, args.clone(), &ctx).await;
 
                     // Detect file writes for live streaming
-                    if result.success && (name == "write_file" || name == "edit_file") {
-                        if let Some(path_str) = args["path"].as_str() {
+                    if result.success && is_file_write {
+                        if let Some(path_str) = path_opt {
                             let full_path = ctx.cwd.join(path_str);
                             let preview = result.output.chars().take(200).collect::<String>();
                             let _ = ev_tx.send(AgentEvent::FileWrite {
@@ -1207,7 +1236,7 @@ fn tool_needs_approval(settings: &Settings, tool_name: &str, args: &serde_json::
         return false;
     }
     let mut needs_app = settings.needs_approval(tool_name);
-    if tool_name == "run_command" {
+    if tool_name == "run_command" && needs_app {
         let command_str = args["command"].as_str().unwrap_or("");
         if crate::tools::shell::is_unparseable_or_fallback(command_str) {
             needs_app = true;
@@ -1252,23 +1281,23 @@ mod tests {
             &json!({"command": "echo hello"})
         ));
 
-        // Fallback/metacharacter/wildcard commands always require approval
-        assert!(tool_needs_approval(
+        // Fallback/metacharacter/wildcard commands do not require approval when opted-out
+        assert!(!tool_needs_approval(
             &settings,
             "run_command",
             &json!({"command": "echo hello | grep foo"})
         ));
-        assert!(tool_needs_approval(
+        assert!(!tool_needs_approval(
             &settings,
             "run_command",
             &json!({"command": "echo 'hello"})
         ));
-        assert!(tool_needs_approval(
+        assert!(!tool_needs_approval(
             &settings,
             "run_command",
             &json!({"command": "echo hello; ls"})
         ));
-        assert!(tool_needs_approval(
+        assert!(!tool_needs_approval(
             &settings,
             "run_command",
             &json!({"command": "echo *.txt"})

@@ -227,21 +227,55 @@ impl AiClient for OpenAiCompatClient {
     ) -> Result<()> {
         let url = format!("{}/chat/completions", self.base_url);
 
+        let is_openai_reasoning = request.reasoning_type == Some(ReasoningType::OpenAiEffort);
+
         let mut body = json!({
             "model": self.model,
             "messages": self.format_messages(&request.messages),
             "stream": true,
-            "temperature": request.temperature,
             "stream_options": { "include_usage": true },
             "include_reasoning": true,
         });
+
+        // Only include temperature if not using OpenAI reasoning effort (OpenAI o-series requirement)
+        if !is_openai_reasoning {
+            body["temperature"] = json!(request.temperature);
+        }
+
+        if let Some(budget) = request.thinking_budget {
+            if budget > 0 {
+                match request.reasoning_type {
+                    Some(ReasoningType::OpenAiEffort) => {
+                        let effort = if budget <= 2048 {
+                            "low"
+                        } else if budget <= 4096 {
+                            "medium"
+                        } else {
+                            "high"
+                        };
+                        body["reasoning_effort"] = json!(effort);
+                    }
+                    Some(ReasoningType::AnthropicThinking) => {
+                        body["thinking"] = json!({
+                            "type": "enabled",
+                            "budget_tokens": budget
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         if self.base_url.contains("ollama") || self.base_url.contains(":11434") {
             body["keep_alive"] = json!(-1);
         }
 
         if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
+            if is_openai_reasoning {
+                body["max_completion_tokens"] = json!(max_tokens);
+            } else {
+                body["max_tokens"] = json!(max_tokens);
+            }
         }
 
         if !request.tools.is_empty() {
@@ -549,6 +583,7 @@ mod tests {
             id: "call-1".into(),
             name: "read_file".into(),
             arguments: json!({ "path": "README.md" }),
+            thought_signature: None,
         };
         let messages = vec![
             Message::assistant_with_tool_calls("", vec![call]),
