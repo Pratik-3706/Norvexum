@@ -216,6 +216,12 @@ struct SseUsage {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
     total_tokens: Option<u32>,
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionTokensDetails {
+    reasoning_tokens: Option<u32>,
 }
 
 #[async_trait]
@@ -242,24 +248,23 @@ impl AiClient for OpenAiCompatClient {
             body["temperature"] = json!(request.temperature);
         }
 
-        if let Some(budget) = request.thinking_budget {
-            if budget > 0 {
+        if let Some(effort) = request.thinking_effort {
+            if effort != "none" {
                 match request.reasoning_type {
                     Some(ReasoningType::OpenAiEffort) => {
-                        let effort = if budget <= 2048 {
-                            "low"
-                        } else if budget <= 4096 {
-                            "medium"
-                        } else {
-                            "high"
-                        };
                         body["reasoning_effort"] = json!(effort);
                     }
                     Some(ReasoningType::AnthropicThinking) => {
-                        body["thinking"] = json!({
-                            "type": "enabled",
-                            "budget_tokens": budget
-                        });
+                        if effort == "adaptive" {
+                            body["thinking"] = json!({
+                                "type": "adaptive"
+                            });
+                        } else {
+                            body["thinking"] = json!({
+                                "type": "enabled",
+                                "effort": effort
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -368,12 +373,14 @@ impl AiClient for OpenAiCompatClient {
 
                     // Emit usage if present
                     if let Some(usage) = &sse.usage {
+                        let reasoning_tokens = usage.completion_tokens_details.as_ref().and_then(|d| d.reasoning_tokens);
                         let _ = tx.send(AiStreamEvent::Done {
                             finish_reason: "stop".into(),
                             usage: Some(UsageStats {
                                 prompt_tokens: usage.prompt_tokens.unwrap_or(0),
                                 completion_tokens: usage.completion_tokens.unwrap_or(0),
                                 total_tokens: usage.total_tokens.unwrap_or(0),
+                                reasoning_tokens,
                             }),
                         });
                     }
@@ -551,7 +558,7 @@ impl AiClient for OpenAiCompatClient {
     }
 
     fn supports_vision(&self) -> bool {
-        self.model_info.as_ref().is_some_and(|m| m.multimodal)
+        self.model_info.as_ref().is_some_and(|m| matches!(m.vision, crate::config::providers::Vision::Yes))
     }
 
     fn supports_image_gen(&self) -> bool {

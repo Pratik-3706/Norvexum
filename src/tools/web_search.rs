@@ -254,7 +254,8 @@ impl Tool for WebSearchTool {
     fn description(&self) -> &str {
         "Search the web. Uses Tavily (if API key set) or DuckDuckGo (free fallback). \
          Returns page titles, URLs, and snippets ranked by relevance. \
-         Follow up with web_fetch to read full page content."
+         IMPORTANT: This only returns short snippets! You MUST follow up by using \
+         the `web_fetch` tool on specific URLs to read the actual full page content."
     }
 
     fn parameters(&self) -> serde_json::Value {

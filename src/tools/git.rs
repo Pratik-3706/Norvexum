@@ -135,7 +135,8 @@ impl Tool for GitLogTool {
     }
 
     fn description(&self) -> &str {
-        "Show recent git commit history. Returns a compact log of recent commits."
+        "Show recent git commit history. Returns a compact log of recent commits. \
+         IMPORTANT: Use the 'count' parameter to limit the output to avoid filling your context window."
     }
 
     fn parameters(&self) -> serde_json::Value {

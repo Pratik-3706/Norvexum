@@ -142,6 +142,7 @@ fn main() -> Result<()> {
             rt.block_on(async {
                 if let Err(e) = run_async(cli_clone).await {
                     eprintln!("Async background error: {}", e);
+                    tracing::error!("Async background error: {:?}", e);
                 }
             });
         });
@@ -169,7 +170,7 @@ fn main() -> Result<()> {
 
 async fn run_async(cli: Cli) -> Result<()> {
     // Build settings from env + config file + CLI overrides
-    let mut settings = config::Settings::load_remembered()?;
+    let mut settings = config::Settings::load_remembered().unwrap_or_default();
     if let Some(model) = &cli.model {
         settings.active_model = model.clone();
     }
@@ -177,6 +178,9 @@ async fn run_async(cli: Cli) -> Result<()> {
         settings.active_provider = provider.clone();
     }
     settings.headless = cli.headless;
+
+    // Spawn background model fetcher (loads dynamic models from APIs)
+    crate::config::model_fetch::spawn_background_fetch(&settings);
 
     let result = match cli.command {
         Some(Commands::Init) => commands::init::run(&settings).await,
@@ -201,7 +205,7 @@ async fn run_async(cli: Cli) -> Result<()> {
                 let _ = dotenvy::dotenv();
             }
             // Reload settings so newly created config/env is loaded
-            let mut settings = config::Settings::load_remembered()?;
+            let mut settings = config::Settings::load_remembered().unwrap_or_default();
             if let Some(model) = &cli.model {
                 settings.active_model = model.clone();
             }

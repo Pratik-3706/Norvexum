@@ -3,6 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub mod providers;
+pub mod model_fetch;
 
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
@@ -63,9 +64,10 @@ pub struct Settings {
     pub custom_system_prompt: Option<String>,
     #[serde(default)]
     pub custom_models: Vec<String>,
-    
+    #[serde(default)]
+    pub starred_models: Vec<String>,
     // ── Reasoning / Thinking settings ────────────────────────────────────
-    pub thinking_budget: Option<u32>,
+    pub thinking_effort: Option<String>,
     #[serde(skip)]
     pub model_reasoning_type: Option<crate::ai::types::ReasoningType>,
 }
@@ -94,7 +96,8 @@ impl Default for Settings {
             ask_perms: true,
             custom_system_prompt: None,
             custom_models: Vec::new(),
-            thinking_budget: Some(2048),
+            starred_models: vec![],
+            thinking_effort: None,
             model_reasoning_type: None,
         }
     }
@@ -174,8 +177,11 @@ impl Settings {
             if let Some(custom) = file_settings.custom_models {
                 settings.custom_models = custom;
             }
-            if let Some(budget) = file_settings.thinking_budget {
-                settings.thinking_budget = Some(budget);
+            if let Some(starred) = file_settings.starred_models {
+                settings.starred_models = starred;
+            }
+            if let Some(effort) = file_settings.thinking_effort {
+                settings.thinking_effort = Some(effort);
             }
         }
 
@@ -229,8 +235,11 @@ impl Settings {
                                             if let Some(url) = file_settings.ollama_base_url {
                                                 settings.ollama_base_url = Some(url);
                                             }
-                                            if let Some(budget) = file_settings.thinking_budget {
-                                                settings.thinking_budget = Some(budget);
+                                            if let Some(starred) = file_settings.starred_models {
+                                                settings.starred_models = starred;
+                                            }
+                                            if let Some(effort) = file_settings.thinking_effort {
+                                                settings.thinking_effort = Some(effort);
                                             }
                                         }
                                     }
@@ -273,7 +282,12 @@ impl Settings {
             } else {
                 Some(self.custom_models.clone())
             },
-            thinking_budget: self.thinking_budget,
+            starred_models: if self.starred_models.is_empty() {
+                None
+            } else {
+                Some(self.starred_models.clone())
+            },
+            thinking_effort: self.thinking_effort.clone(),
         };
 
         let content = toml::to_string_pretty(&file_settings)?;
@@ -346,5 +360,6 @@ struct FileSettings {
     require_approval: Option<Vec<String>>,
     ollama_base_url: Option<String>,
     custom_models: Option<Vec<String>>,
-    thinking_budget: Option<u32>,
+    starred_models: Option<Vec<String>>,
+    thinking_effort: Option<String>,
 }

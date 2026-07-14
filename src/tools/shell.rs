@@ -202,7 +202,10 @@ impl Tool for ShellCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command inside the project directory. Use this to run builds, tests, compilers, or git commands. \
+        "Execute a shell command inside the project directory. \
+         IMPORTANT RULES: 1) NEVER run interactive commands (like `nano`, `vim`, or blocking scripts) that wait for user input. \
+         2) Always use non-interactive flags (e.g. `apt-get -y`, `npm install --no-fund`). \
+         3) DO NOT use this tool for text replacement (like `sed` or `awk`); use the `edit_file` tool instead. \
          Commands are sandboxed — attempts to escape the project directory will be blocked."
     }
 
@@ -210,7 +213,7 @@ impl Tool for ShellCommandTool {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "The command line string to run" }
+                "command": { "type": "string", "description": "The command line string to run (must be non-interactive)" }
             },
             "required": ["command"]
         })

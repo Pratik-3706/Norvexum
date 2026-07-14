@@ -92,7 +92,9 @@ pub async fn discover_models(base_url: &str) -> Option<Vec<ModelInfo>> {
         model_infos.push(ModelInfo {
             id: model.name.clone(),
             family,
-            multimodal: is_vision,
+            vision: if is_vision { crate::config::providers::Vision::Yes } else { crate::config::providers::Vision::No },
+                adaptive_thinking: false,
+                effort_levels: vec![],
             image_gen: false,
             tool_calling: true,
             streaming: true,

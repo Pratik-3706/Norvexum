@@ -53,6 +53,7 @@ pub struct GuiApp {
 
     // UI state variables
     input_text: String,
+    model_search_query: String,
     messages: Vec<GuiMessage>,
     status_text: String,
     is_processing: bool,
@@ -265,56 +266,40 @@ fn draw_layered_logo_loader(
 }
 
 fn attachment_button(ui: &mut egui::Ui, dark_mode: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(44.0, 40.0), egui::Sense::click());
-    let fill = if response.hovered() {
-        egui::Color32::from_rgb(54, 42, 82)
-    } else if dark_mode {
-        egui::Color32::from_rgb(38, 31, 58)
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+    let icon_alpha = if response.hovered() { 1.0 } else { 0.55 };
+    let icon_color = if dark_mode {
+        egui::Color32::from_rgb(167, 139, 250).linear_multiply(icon_alpha)
     } else {
-        egui::Color32::from_rgb(237, 233, 254)
+        egui::Color32::from_rgb(91, 33, 182).linear_multiply(icon_alpha)
     };
-    let stroke = if response.hovered() {
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(167, 139, 250))
-    } else {
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(91, 70, 145))
-    };
-    ui.painter().rect(rect, 10.0, fill, stroke);
+
+    // Subtle hover glow circle
+    if response.hovered() {
+        ui.painter().circle_filled(
+            rect.center(),
+            14.0,
+            egui::Color32::from_rgba_premultiplied(109, 40, 217, 25),
+        );
+    }
 
     let center = rect.center();
     let angle = -0.65_f32;
     let (sin, cos) = angle.sin_cos();
-    let transform = |x: f32, y: f32| center + egui::vec2(x * cos - y * sin, x * sin + y * cos);
+    let scale = 0.8;
+    let transform = |x: f32, y: f32| center + egui::vec2((x * cos - y * sin) * scale, (x * sin + y * cos) * scale);
     let points = [
-        (-2.0, -8.0),
-        (3.0, -8.0),
-        (6.0, -5.0),
-        (6.0, 4.0),
-        (3.0, 8.0),
-        (-1.0, 8.0),
-        (-5.0, 4.0),
-        (-5.0, -3.0),
-        (-2.0, -6.0),
-        (2.0, -6.0),
-        (4.0, -3.0),
-        (4.0, 3.0),
-        (2.0, 5.0),
-        (0.0, 5.0),
-        (-2.0, 3.0),
-        (-2.0, -2.0),
+        (-2.0, -8.0), (3.0, -8.0), (6.0, -5.0), (6.0, 4.0),
+        (3.0, 8.0), (-1.0, 8.0), (-5.0, 4.0), (-5.0, -3.0),
+        (-2.0, -6.0), (2.0, -6.0), (4.0, -3.0), (4.0, 3.0),
+        (2.0, 5.0), (0.0, 5.0), (-2.0, 3.0), (-2.0, -2.0),
     ]
     .into_iter()
     .map(|(x, y)| transform(x, y))
     .collect();
     ui.painter().add(egui::Shape::line(
         points,
-        egui::Stroke::new(
-            2.0,
-            if dark_mode {
-                egui::Color32::from_rgb(216, 206, 255)
-            } else {
-                egui::Color32::from_rgb(91, 33, 182)
-            },
-        ),
+        egui::Stroke::new(1.8, icon_color),
     ));
 
     response.on_hover_text("Attach a file")
@@ -456,6 +441,7 @@ impl GuiApp {
             approval_tx: config.approval_tx,
             cancel_token,
             input_text: String::new(),
+            model_search_query: String::new(),
             messages: Vec::new(),
             status_text: "Idle".to_string(),
             is_processing: false,
@@ -975,15 +961,8 @@ impl GuiApp {
         };
 
         if is_writing {
-            let mut streaming_content =
+            let streaming_content =
                 extract_streaming_content(&self.current_tool_args, "CodeContent");
-            if streaming_content.is_empty() {
-                streaming_content =
-                    extract_streaming_content(&self.current_tool_args, "ReplacementContent");
-            }
-            if streaming_content.is_empty() {
-                streaming_content = extract_streaming_content(&self.current_tool_args, "content");
-            }
             if !streaming_content.is_empty() {
                 self.inspected_file_content = streaming_content;
                 return;
@@ -1109,19 +1088,25 @@ impl GuiApp {
                     match event {
                         AgentEvent::Status(s) => {
                             self.status_text = s.clone();
-                            let msg = self.get_or_create_assistant_message();
-                            msg.tool_logs.push(format!("ℹ️ {s}"));
+                            // Only attach status logs to an assistant message if there's an active conversation
+                            if self.messages.iter().any(|m| m.role == "user") {
+                                let msg = self.get_or_create_assistant_message();
+                                msg.tool_logs.push(format!("ℹ️ {s}"));
+                            }
                         }
                         AgentEvent::Thinking(t) => {
                             self.is_processing = true;
-                            self.check_and_split_assistant_message();
-                            let msg = self.get_or_create_assistant_message();
-                            if let Some(ref mut thinking) = msg.thinking {
-                                thinking.push_str(&t);
-                            } else {
-                                msg.thinking = Some(t.clone());
+                            // Only create assistant messages if there's an active conversation
+                            if self.messages.iter().any(|m| m.role == "user") {
+                                self.check_and_split_assistant_message();
+                                let msg = self.get_or_create_assistant_message();
+                                if let Some(ref mut thinking) = msg.thinking {
+                                    thinking.push_str(&t);
+                                } else {
+                                    msg.thinking = Some(t.clone());
+                                }
+                                msg.tool_logs.push(format!("THINKING_DELTA|{}", t));
                             }
-                            msg.tool_logs.push(format!("THINKING_DELTA|{}", t));
                         }
                         AgentEvent::ThinkingDone => {
                             let msg = self.get_or_create_assistant_message();
@@ -1189,9 +1174,8 @@ impl GuiApp {
                                             Some((relative_path.clone(), added, deleted));
                                         self.current_writing_status = Some("writing".to_string());
 
-                                        if self.selected_file.as_deref() == Some(&relative_path) {
-                                            self.inspect_file(&relative_path);
-                                        }
+                                        self.selected_file = Some(relative_path.clone());
+                                        self.inspect_file(&relative_path);
                                     }
                                 }
                             }
@@ -2750,7 +2734,7 @@ impl eframe::App for GuiApp {
         egui::TopBottomPanel::bottom("bottom_input_panel")
             .frame(
                 egui::Frame::default()
-                    .inner_margin(egui::Margin::symmetric(18.0, 14.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 6.0))
                     .fill(if self.dark_mode {
                         egui::Color32::from_rgb(12, 13, 19)
                     } else {
@@ -2937,29 +2921,164 @@ impl eframe::App for GuiApp {
                     ui.add_space(4.0);
                 }
 
+                // Model selectors floating above the input frame
+                ui.horizontal(|ui| {
+                    ui.add_space(horizontal_margin + 18.0); // indent slightly past the input frame's left edge
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.style_mut().spacing.interact_size.y = 20.0;
+                        ui.style_mut().spacing.item_spacing.x = 6.0;
+                        ui.label(egui::RichText::new("✨").size(11.0).color(egui::Color32::from_rgb(130, 110, 200)));
+                        
+                        let registry = build_registry();
+                        let mut current_provider_idx = registry
+                            .iter()
+                            .position(|p| p.name == self.settings.active_provider)
+                            .unwrap_or(0);
+                            
+                        egui::ComboBox::from_id_salt("provider_select_bottom")
+                            .selected_text(&registry[current_provider_idx].display_name)
+                            .show_ui(ui, |ui| {
+                                for (idx, provider) in registry.iter().enumerate() {
+                                    if ui.selectable_value(&mut current_provider_idx, idx, &provider.display_name).clicked() {
+                                        self.settings.active_provider = provider.name.clone();
+                                        if let Some(first_model) = provider.models.first() {
+                                            self.settings.active_model = first_model.id.clone();
+                                        }
+                                        self.sync_settings();
+                                    }
+                                }
+                            });
+
+                        ui.add_space(4.0);
+                        let active_provider = &registry[current_provider_idx];
+
+                        let active_model_info = active_provider.models.iter().find(|m| m.id == self.settings.active_model);
+                        let vision_icon = if let Some(m) = active_model_info {
+                            if matches!(m.vision, crate::config::providers::Vision::Yes) { " 👁" } else { "" }
+                        } else { "" };
+                        let mut model_display = format!("{}{}", self.settings.active_model, vision_icon);
+                        if model_display.len() > 30 {
+                            model_display = format!("{}…", &model_display[..27]);
+                        }
+
+                        let popup_id = ui.make_persistent_id("model_search_popup");
+                        let button_res = ui.add(egui::Button::new(model_display).frame(false));
+                        if button_res.clicked() {
+                            ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                        }
+                        egui::popup::popup_above_or_below_widget(ui, popup_id, &button_res, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                            ui.set_min_width(280.0);
+                            ui.set_min_height(250.0); // Prevent the Above popup bug where it gets stuck at a small height
+                            ui.add_space(4.0);
+                            ui.add(egui::TextEdit::singleline(&mut self.model_search_query).hint_text("Search models..."));
+                            ui.separator();
+                            egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                                
+                                let mut starred = Vec::new();
+                                let mut unstarred = Vec::new();
+                                let query = self.model_search_query.to_lowercase();
+                                for model in &active_provider.models {
+                                    if !query.is_empty() && !model.id.to_lowercase().contains(&query) {
+                                        continue;
+                                    }
+                                    if self.settings.starred_models.contains(&model.id) {
+                                        starred.push(model);
+                                    } else {
+                                        unstarred.push(model);
+                                    }
+                                }
+                                
+                                let mut render_model = |ui: &mut egui::Ui, model: &crate::config::providers::ModelInfo| {
+                                    ui.horizontal(|ui| {
+                                        let is_starred = self.settings.starred_models.contains(&model.id);
+                                        let star_icon = if is_starred { "⭐" } else { "☆" };
+                                        let star_color = if is_starred { egui::Color32::from_rgb(250, 204, 21) } else { egui::Color32::from_rgb(100, 116, 139) };
+                                        if ui.add(egui::Button::new(egui::RichText::new(star_icon).color(star_color)).frame(false)).clicked() {
+                                            if is_starred {
+                                                self.settings.starred_models.retain(|id| id != &model.id);
+                                            } else {
+                                                self.settings.starred_models.push(model.id.clone());
+                                            }
+                                            self.sync_settings();
+                                        }
+                                        let v_icon = if matches!(model.vision, crate::config::providers::Vision::Yes) { " 👁" } else { "" };
+                                        let display_text = format!("{}{}", model.id, v_icon);
+                                        if ui.selectable_value(&mut self.settings.active_model, model.id.clone(), display_text).clicked() {
+                                            self.sync_settings();
+                                            ui.memory_mut(|mem| mem.close_popup());
+                                        }
+                                    });
+                                };
+
+                                if !starred.is_empty() {
+                                    for model in starred { render_model(ui, model); }
+                                    ui.separator();
+                                }
+                                for model in unstarred { render_model(ui, model); }
+                            });
+                        });
+
+                        if self.settings.active_provider.to_lowercase().contains("anthropic") {
+                            if let Some(model) = active_provider.models.iter().find(|m| m.id == self.settings.active_model) {
+                                if !model.effort_levels.is_empty() || model.adaptive_thinking {
+                                    ui.add_space(4.0);
+                                    let current_effort = self.settings.thinking_effort.clone().unwrap_or_else(|| "none".to_string());
+                                    let label = if current_effort == "none" {
+                                        "Thinking: Off".to_string()
+                                    } else {
+                                        format!("Thinking: {}", current_effort)
+                                    };
+                                    egui::ComboBox::from_id_salt("thinking_select_bottom")
+                                        .selected_text(label)
+                                        .show_ui(ui, |ui| {
+                                            if ui.selectable_value(&mut self.settings.thinking_effort, Some("none".to_string()), "Off").clicked() {
+                                                self.sync_settings();
+                                            }
+                                            for lvl in &model.effort_levels {
+                                                if ui.selectable_value(&mut self.settings.thinking_effort, Some(lvl.clone()), lvl).clicked() {
+                                                    self.sync_settings();
+                                                }
+                                            }
+                                            if model.adaptive_thinking {
+                                                if ui.selectable_value(&mut self.settings.thinking_effort, Some("adaptive".to_string()), "Adaptive").clicked() {
+                                                    self.sync_settings();
+                                                }
+                                            }
+                                        });
+                                }
+                            }
+                        } else if self.probing_in_progress {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Checking...").italics().color(egui::Color32::from_rgb(120, 120, 140)));
+                        }
+                    });
+                });
+
+                ui.add_space(4.0); // Space between the selectors and the text input
+
                 ui.horizontal(|ui| {
                     ui.add_space(horizontal_margin);
 
-                    // Bottom Input bar enclosed in a premium card frame
+                    // Premium slim input frame
                     egui::Frame::default()
                         .fill(if self.dark_mode {
-                            egui::Color32::from_rgb(19, 20, 30)
+                            egui::Color32::from_rgb(22, 23, 35)
                         } else {
-                            egui::Color32::WHITE
+                            egui::Color32::from_rgb(250, 250, 255)
                         })
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(91, 70, 145)))
-                        .inner_margin(9.0)
-                        .rounding(14.0)
-                        .shadow(egui::epaint::Shadow {
-                            offset: egui::vec2(0.0, 4.0),
-                            blur: 14.0,
-                            spread: 0.0,
-                            color: egui::Color32::from_black_alpha(60),
-                        })
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            if self.dark_mode {
+                                egui::Color32::from_rgb(55, 45, 85)
+                            } else {
+                                egui::Color32::from_rgb(196, 181, 253)
+                            },
+                        ))
+                        .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                        .rounding(24.0)
                         .show(ui, |ui| {
                             ui.set_width(chat_width - 24.0);
-                            ui.vertical(|ui| {
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 if attachment_button(ui, self.dark_mode).clicked() {
                                     if let Some(path) = rfd::FileDialog::new().pick_file() {
                                         self.attached_image = Some(path);
@@ -2967,29 +3086,36 @@ impl eframe::App for GuiApp {
                                     }
                                 }
 
-                                // Text prompt input area with dynamic remaining width calculation
-                                let buttons_w = if self.is_processing { 170.0 } else { 85.0 };
+                                ui.add_space(4.0);
+
+                                let buttons_w = if self.is_processing { 80.0 } else { 36.0 };
                                 let remaining_w = (ui.available_width() - buttons_w).max(80.0);
                                 let mut edit_response_opt = None;
 
                                 egui::ScrollArea::vertical()
-                                    .max_height(120.0)
+                                    .max_height(100.0)
                                     .id_salt("prompt_input_scroll")
                                     .show(ui, |ui| {
                                         let resp = ui.add(
                                             egui::TextEdit::multiline(&mut self.input_text)
                                                 .hint_text(
                                                     egui::RichText::new("Ask Norvexum anything…")
-                                                        .color(egui::Color32::from_rgb(148, 163, 184))
+                                                        .size(13.0)
+                                                        .color(if self.dark_mode {
+                                                            egui::Color32::from_rgb(100, 100, 130)
+                                                        } else {
+                                                            egui::Color32::from_rgb(160, 160, 185)
+                                                        })
                                                 )
                                                 .text_color(if self.dark_mode {
-                                                    egui::Color32::from_rgb(235, 237, 245)
+                                                    egui::Color32::from_rgb(220, 222, 235)
                                                 } else {
                                                     egui::Color32::from_rgb(30, 41, 59)
                                                 })
                                                 .desired_rows(1)
-                                                .margin(egui::vec2(10.0, 8.0))
+                                                .margin(egui::vec2(4.0, 4.0))
                                                 .interactive(true)
+                                                .frame(false)
                                                 .desired_width(remaining_w),
                                         );
                                         edit_response_opt = Some(resp);
@@ -3006,36 +3132,40 @@ impl eframe::App for GuiApp {
                                     edit_response.request_focus();
                                 }
 
+                                // Send / Stop buttons — circular arrow for send, pill for stop
                                 if self.is_processing {
                                     ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                !self.input_text.trim().is_empty(),
-                                                egui::Button::new(
-                                                    egui::RichText::new("Send  ↑")
-                                                        .color(egui::Color32::WHITE)
-                                                        .strong()
-                                                        .size(14.0),
-                                                )
-                                                .fill(egui::Color32::from_rgb(109, 40, 217))
-                                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(167, 139, 250)))
-                                                .rounding(10.0),
-                                            )
-                                            .clicked()
-                                        {
+                                        // Circular send arrow
+                                        let has_text = !self.input_text.trim().is_empty();
+                                        let send_color = if has_text {
+                                            egui::Color32::from_rgb(109, 40, 217)
+                                        } else {
+                                            egui::Color32::from_rgb(50, 40, 70)
+                                        };
+                                        let (send_rect, send_resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
+                                        ui.painter().circle_filled(send_rect.center(), 15.0, send_color);
+                                        ui.painter().text(
+                                            send_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "↑",
+                                            egui::FontId::proportional(16.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                        if send_resp.clicked() && has_text {
                                             self.send_message();
                                             edit_response.request_focus();
                                         }
 
+                                        // Stop pill
                                         if ui
                                             .add(
                                                 egui::Button::new(
-                                                    egui::RichText::new("■  Stop")
+                                                    egui::RichText::new("■")
                                                         .color(egui::Color32::WHITE)
-                                                        .strong(),
+                                                        .size(12.0),
                                                 )
                                                 .fill(egui::Color32::from_rgb(190, 52, 74))
-                                                .rounding(10.0),
+                                                .rounding(14.0),
                                             )
                                             .on_hover_text("Stop the current response")
                                             .clicked()
@@ -3045,109 +3175,30 @@ impl eframe::App for GuiApp {
                                             self.status_text = "Stopped".to_string();
                                         }
                                     });
-                                } else if ui
-                                    .add_enabled(
-                                        !self.input_text.trim().is_empty(),
-                                        egui::Button::new(
-                                            egui::RichText::new("Send  ↑")
-                                                .color(egui::Color32::WHITE)
-                                                .strong()
-                                                .size(14.0),
-                                        )
-                                        .fill(egui::Color32::from_rgb(109, 40, 217))
-                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(167, 139, 250)))
-                                        .rounding(10.0),
-                                    )
-                                    .clicked()
-                                {
-                                    self.send_message();
-                                    edit_response.request_focus();
-                                }
-                            });
-
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                ui.add_space(8.0);
-                                ui.label(egui::RichText::new("✨").color(egui::Color32::from_rgb(167, 139, 250)));
-                                
-                                let registry = build_registry();
-                                let mut current_provider_idx = registry
-                                    .iter()
-                                    .position(|p| p.name == self.settings.active_provider)
-                                    .unwrap_or(0);
-                                    
-                                egui::ComboBox::from_id_salt("provider_select_bottom")
-                                    .selected_text(&registry[current_provider_idx].display_name)
-                                    .show_ui(ui, |ui| {
-                                        for (idx, provider) in registry.iter().enumerate() {
-                                            if ui.selectable_value(&mut current_provider_idx, idx, &provider.display_name).clicked() {
-                                                self.settings.active_provider = provider.name.clone();
-                                                if let Some(first_model) = provider.models.first() {
-                                                    self.settings.active_model = first_model.id.clone();
-                                                }
-                                                self.sync_settings();
-                                            }
-                                        }
-                                    });
-
-                                ui.add_space(4.0);
-                                let active_provider = &registry[current_provider_idx];
-
-                                let mut model_display = self.settings.active_model.clone();
-                                if model_display.len() > 30 {
-                                    model_display = format!("{}…", &model_display[..27]);
-                                }
-
-                                egui::ComboBox::from_id_salt("model_select_bottom")
-                                    .selected_text(&model_display)
-                                    .show_ui(ui, |ui| {
-                                        for model in &active_provider.models {
-                                            if ui.selectable_value(&mut self.settings.active_model, model.id.clone(), &model.id).clicked() {
-                                                self.sync_settings();
-                                            }
-                                        }
-                                    });
-
-                                if let Some(_reasoning_type) = self.model_reasoning_type {
-                                    ui.add_space(4.0);
-                                    let budget = self.settings.thinking_budget.unwrap_or(2048);
-                                    let label = match budget {
-                                        0 => "Thinking: Off",
-                                        1024 => "Thinking: 1K",
-                                        2048 => "Thinking: 2K",
-                                        4096 => "Thinking: 4K",
-                                        8192 => "Thinking: 8K",
-                                        16384 => "Thinking: 16K",
-                                        32768 => "Thinking: 32K",
-                                        _ => "Thinking: Custom",
+                                } else {
+                                    // Circular send arrow
+                                    let has_text = !self.input_text.trim().is_empty();
+                                    let send_color = if has_text {
+                                        egui::Color32::from_rgb(109, 40, 217)
+                                    } else {
+                                        egui::Color32::from_rgb(50, 40, 70)
                                     };
-                                    egui::ComboBox::from_id_salt("thinking_select_bottom")
-                                        .selected_text(label)
-                                        .show_ui(ui, |ui| {
-                                            let options = [
-                                                (0, "Off"),
-                                                (1024, "1K"),
-                                                (2048, "2K"),
-                                                (4096, "4K"),
-                                                (8192, "8K"),
-                                                (16384, "16K"),
-                                                (32768, "32K"),
-                                            ];
-                                            for (val, text) in options {
-                                                if ui.selectable_value(&mut self.settings.thinking_budget, Some(val), text).clicked() {
-                                                    self.sync_settings();
-                                                }
-                                            }
-                                        });
-                                } else if self.probing_in_progress {
-                                    ui.add_space(4.0);
-                                    ui.label(egui::RichText::new("Checking...").italics().color(egui::Color32::from_rgb(120, 120, 140)));
+                                    let (send_rect, send_resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
+                                    ui.painter().circle_filled(send_rect.center(), 15.0, send_color);
+                                    ui.painter().text(
+                                        send_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "↑",
+                                        egui::FontId::proportional(16.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                    if send_resp.clicked() && has_text {
+                                        self.send_message();
+                                        edit_response.request_focus();
+                                    }
                                 }
-                            });
-                            ui.add_space(4.0);
                             });
                         });
-
                     ui.add_space(horizontal_margin);
                 });
             });
@@ -3449,6 +3500,13 @@ impl eframe::App for GuiApp {
                                 if msg.role == "system" {
                                     continue;
                                 }
+                                // Skip ghost assistant messages: empty content + no thinking
+                                if msg.role == "assistant"
+                                    && msg.content.trim().is_empty()
+                                    && msg.thinking.as_ref().map_or(true, |t| t.trim().is_empty())
+                                {
+                                    continue;
+                                }
                                 let is_user = msg.role == "user";
                                 let is_status = msg.role == "status";
                                 let is_err = msg.role == "error";
@@ -3534,8 +3592,7 @@ impl eframe::App for GuiApp {
                                                          });
                                                          let text_w = galley.size().x.ceil();
                                                          let bubble_w = (text_w + inner_pad_total)
-                                                             .min(max_bubble_width)
-                                                             .max(120.0);
+                                                             .min(max_bubble_width);
 
                                                          ui.label(
                                                              egui::RichText::new("YOU")
@@ -4578,11 +4635,11 @@ fn get_tool_icon(tool_name: &str) -> &'static str {
         "search_web" | "web_search" | "tavily" => "🔍",
         "browser_subagent" | "read_url_content" | "read_browser_page" | "open_browser_url" => "🌐",
         "write_to_file" | "write_file" => "📝",
-        "replace_file_content" | "multi_replace_file_content" | "edit_file" => "✏️",
+        "replace_file_content" | "multi_replace_file_content" | "edit_file" => "✏",
         "view_file" | "read_file" => "📖",
         "list_dir" | "list_permissions" => "📁",
-        "remove" | "delete_file" => "🗑️",
-        _ => "🛠️",
+        "remove" | "delete_file" => "🗑",
+        _ => "🛠",
     }
 }
 

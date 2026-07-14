@@ -92,6 +92,8 @@ pub struct Agent {
     pub max_loops: usize,
     /// Unbounded receiver for dynamic instructions sent mid-run
     pub instruction_rx: Option<mpsc::UnboundedReceiver<String>>,
+    /// Temporary volatile RAM storage shared across the agent's lifetime
+    pub temp_memory: Arc<tokio::sync::RwLock<crate::tools::memory::TempMemory>>,
 }
 
 impl Agent {
@@ -119,6 +121,7 @@ impl Agent {
             approval_disabled: false,
             max_loops,
             instruction_rx: None,
+            temp_memory: Arc::new(tokio::sync::RwLock::new(crate::tools::memory::TempMemory::new())),
         })
     }
 
@@ -253,9 +256,6 @@ impl Agent {
                             self.messages.truncate(1); // Retain only system prompt
                         }
                         let _ = self.event_tx.send(AgentEvent::ClearChat);
-                        let msg = "🧹 Chat cleared".to_string();
-                        let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
-                        let _ = self.event_tx.send(AgentEvent::Content(msg));
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
                         return Ok(());
                     }
@@ -469,7 +469,7 @@ impl Agent {
                                     for model in &models {
                                         let capabilities = format!(
                                             "{}{}{}",
-                                            if model.multimodal { " 👁️" } else { "" },
+                                            if matches!(model.vision, crate::config::providers::Vision::Yes) { " 👁️" } else { "" },
                                             if model.tool_calling { " 🔧" } else { "" },
                                             if model.image_gen { " 🎨" } else { "" }
                                         );
@@ -492,7 +492,7 @@ impl Agent {
                                     for model in &provider.models {
                                         let capabilities = format!(
                                             "{}{}{}",
-                                            if model.multimodal { " 👁️" } else { "" },
+                                            if matches!(model.vision, crate::config::providers::Vision::Yes) { " 👁️" } else { "" },
                                             if model.tool_calling { " 🔧" } else { "" },
                                             if model.image_gen { " 🎨" } else { "" }
                                         );
@@ -640,53 +640,150 @@ impl Agent {
 
         let mut user_msg = None;
 
-        if let Some(img_path) = detect_image(user_input, &self.settings.project_root) {
-            if self.settings.is_in_sandbox(&img_path) {
+        let detected_images = detect_images(user_input, &self.settings.project_root);
+        if !detected_images.is_empty() {
+            let mut valid_images = Vec::new();
+            for img_path in detected_images {
+                if self.settings.is_in_sandbox(&img_path) {
+                    valid_images.push(img_path);
+                } else {
+                    let _ = self.event_tx.send(AgentEvent::Error(format!(
+                        "Access denied: image file '{}' is outside the sandbox",
+                        img_path.display()
+                    )));
+                }
+            }
+
+            if !valid_images.is_empty() {
                 if self.client.supports_vision() {
                     let _ = self.event_tx.send(AgentEvent::Status(format!(
-                        "📸 Loading image: {}...",
-                        img_path.file_name().unwrap_or_default().to_string_lossy()
+                        "📸 Loading {} image(s)...",
+                        valid_images.len()
                     )));
-                    match vision::encode_image_file(&img_path) {
-                        Ok((b64, mime)) => {
-                            user_msg = Some(Message::user_with_image(user_input, b64, mime));
+                    
+                    let mut encoded_images = Vec::new();
+                    for img_path in &valid_images {
+                        match vision::encode_image_file(img_path) {
+                            Ok((b64, mime)) => {
+                                encoded_images.push((b64, mime));
+                            }
+                            Err(e) => {
+                                let _ = self.event_tx.send(AgentEvent::Error(format!(
+                                    "Failed to load image '{}': {}",
+                                    img_path.display(),
+                                    e
+                                )));
+                            }
                         }
-                        Err(e) => {
-                            let _ = self
-                                .event_tx
-                                .send(AgentEvent::Error(format!("Failed to load image: {}", e)));
+                    }
+                    
+                    if !encoded_images.is_empty() {
+                        user_msg = Some(Message::user_with_images(user_input, encoded_images));
+                    }
+                } else if let Some(gemini_key) = &self.settings.google_ai_api_key {
+                    let _ = self.event_tx.send(AgentEvent::Status(format!(
+                        "📸 Analyzing {} image(s) via Gemini Fallback...",
+                        valid_images.len()
+                    )));
+                    
+                    let mut content_parts = vec![crate::ai::types::ContentPart::Text {
+                        text: format!("Please describe these {} images in detail so I can understand them:", valid_images.len()),
+                    }];
+                    
+                    let mut has_errors = false;
+                    for img_path in &valid_images {
+                        match vision::encode_image_file(img_path) {
+                            Ok((b64, mime)) => {
+                                content_parts.push(crate::ai::types::ContentPart::Text {
+                                    text: format!("\n--- Image: {} ---", img_path.file_name().unwrap_or_default().to_string_lossy()),
+                                });
+                                content_parts.push(crate::ai::types::ContentPart::Image {
+                                    data: b64,
+                                    mime_type: mime,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = self.event_tx.send(AgentEvent::Error(format!(
+                                    "Failed to load image '{}': {}", img_path.display(), e
+                                )));
+                                has_errors = true;
+                            }
+                        }
+                    }
+                    
+                    if !has_errors {
+                        let fallback_client = crate::ai::gemini::GeminiClient::new(
+                            gemini_key.clone(),
+                            "gemini-2.5-flash".to_string(),
+                            None,
+                        );
+                        let msg = crate::ai::types::Message {
+                            role: crate::ai::types::Role::User,
+                            content: content_parts,
+                            tool_calls: vec![],
+                            tool_call_id: None,
+                            tool_name: None,
+                            thought_signature: None,
+                        };
+                        
+                        let request = crate::ai::types::AiRequest::new(vec![msg]).with_temperature(0.5);
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                        
+                        use crate::ai::AiClient;
+                        if let Err(e) = fallback_client.chat_stream(request, tx).await {
+                            let _ = self.event_tx.send(AgentEvent::Error(format!("Gemini fallback failed: {}", e)));
+                        } else {
+                            let mut description = String::new();
+                            while let Some(event) = rx.recv().await {
+                                if let crate::ai::types::AiStreamEvent::ContentDelta(text) = event {
+                                    description.push_str(&text);
+                                }
+                            }
+                            
+                            if !description.trim().is_empty() {
+                                let enriched_prompt = format!(
+                                    "[Image content described by Gemini Fallback]:\n{}\n\n{}",
+                                    description, user_input
+                                );
+                                user_msg = Some(crate::ai::types::Message::user(enriched_prompt));
+                            }
                         }
                     }
                 } else if let Some(ocr_key) = &self.settings.ocr_space_api_key {
                     let _ = self.event_tx.send(AgentEvent::Status(format!(
-                        "📸 Performing OCR on {}...",
-                        img_path.file_name().unwrap_or_default().to_string_lossy()
+                        "📸 Performing OCR on {} image(s)...",
+                        valid_images.len()
                     )));
-                    match vision::ocr_image(ocr_key, &img_path).await {
-                        Ok(text) => {
-                            let enriched_prompt = format!(
-                                "[Image content detected via OCR]:\n{}\n\n{}",
-                                text, user_input
-                            );
-                            user_msg = Some(Message::user(enriched_prompt));
+                    
+                    let mut all_ocr_texts = Vec::new();
+                    for img_path in &valid_images {
+                        match vision::ocr_image(ocr_key, img_path).await {
+                            Ok(text) => {
+                                all_ocr_texts.push(format!("--- {} ---\n{}", img_path.file_name().unwrap_or_default().to_string_lossy(), text));
+                            }
+                            Err(e) => {
+                                let _ = self.event_tx.send(AgentEvent::Error(format!(
+                                    "OCR failed for '{}': {}",
+                                    img_path.display(),
+                                    e
+                                )));
+                            }
                         }
-                        Err(e) => {
-                            let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                "OCR failed: {}. Sending message as plain text.",
-                                e
-                            )));
-                        }
+                    }
+                    
+                    if !all_ocr_texts.is_empty() {
+                        let enriched_prompt = format!(
+                            "[Image content detected via OCR]:\n{}\n\n{}",
+                            all_ocr_texts.join("\n\n"),
+                            user_input
+                        );
+                        user_msg = Some(Message::user(enriched_prompt));
                     }
                 } else {
                     let _ = self.event_tx.send(AgentEvent::Status(
                         "⚠️ Model does not support vision, and no OCR_SPACE_API_KEY is configured. Sending as plain text.".into()
                     ));
                 }
-            } else {
-                let _ = self.event_tx.send(AgentEvent::Error(format!(
-                    "Access denied: image file '{}' is outside the sandbox",
-                    img_path.display()
-                )));
             }
         }
 
@@ -719,8 +816,16 @@ impl Agent {
             }
         }
 
-        self.messages.push(final_msg);
-
+        // Prevent consecutive User messages (which crash APIs like Anthropic) by merging them
+        if let Some(last) = self.messages.last_mut() {
+            if last.role == Role::User {
+                last.content.extend(final_msg.content);
+            } else {
+                self.messages.push(final_msg);
+            }
+        } else {
+            self.messages.push(final_msg);
+        }
         // ── Context compaction check ─────────────────────────────────────
         let context_window = self.get_context_window();
         if compaction::should_compact(&self.messages, context_window, 80) {
@@ -736,6 +841,7 @@ impl Agent {
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
+            reasoning_tokens: None,
         };
 
         for loop_num in 0..max_loops {
@@ -743,6 +849,12 @@ impl Agent {
             if let Some(ref mut rx) = self.instruction_rx {
                 while let Ok(new_prompt) = rx.try_recv() {
                     let _ = self.event_tx.send(AgentEvent::Status(format!("📥 Received instruction: {}", new_prompt)));
+                    if let Some(last) = self.messages.last_mut() {
+                        if last.role == Role::User {
+                            last.content.push(ContentPart::Text { text: format!("\n\n{}", new_prompt) });
+                            continue;
+                        }
+                    }
                     self.messages.push(Message::user(new_prompt));
                 }
             }
@@ -767,9 +879,9 @@ impl Agent {
                 .with_tools(self.tools.tool_defs());
 
             let mut temp = 0.7;
-            if let Some(budget) = self.settings.thinking_budget {
-                if budget > 0 {
-                    request = request.with_thinking_budget(Some(budget));
+            if let Some(effort) = &self.settings.thinking_effort {
+                if effort != "none" {
+                    request = request.with_thinking_effort(Some(effort.clone()));
                     request = request.with_reasoning_type(self.settings.model_reasoning_type);
                     if self.settings.model_reasoning_type == Some(crate::ai::types::ReasoningType::AnthropicThinking) {
                         temp = 1.0;
@@ -970,6 +1082,7 @@ impl Agent {
                 settings: self.settings.clone(),
                 cwd: self.settings.project_root.clone(),
                 client: Some(self.client.clone()),
+                temp_memory: self.temp_memory.clone(),
             };
 
             let mut handles = Vec::new();
@@ -1203,7 +1316,8 @@ fn load_readme_summary(root: &std::path::Path) -> String {
     String::new()
 }
 
-fn detect_image(user_input: &str, project_root: &std::path::Path) -> Option<std::path::PathBuf> {
+fn detect_images(user_input: &str, project_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut images = Vec::new();
     let cleaned: String = user_input.replace(['(', ')', '[', ']', '`', '"', '\''], " ");
     for word in cleaned.split_whitespace() {
         let lower = word.to_lowercase();
@@ -1222,11 +1336,11 @@ fn detect_image(user_input: &str, project_root: &std::path::Path) -> Option<std:
                 project_root.join(path)
             };
             if resolved.exists() && resolved.is_file() {
-                return Some(resolved);
+                images.push(resolved);
             }
         }
     }
-    None
+    images
 }
 
 use serde_json::json;

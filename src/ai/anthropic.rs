@@ -190,18 +190,20 @@ impl AiClient for AnthropicClient {
             "stream": true,
         });
 
-        if let Some(budget) = request.thinking_budget {
-            if budget > 0 {
-                body["thinking"] = json!({
-                    "type": "enabled",
-                    "budget_tokens": budget
-                });
-                // Anthropic thinking requires temperature to be 1.0 (or not set, but 1.0 is standard when enabled)
-                temperature = 1.0;
-                // Anthropic requires max_tokens to be strictly greater than budget_tokens
-                if max_tokens <= budget {
-                    max_tokens = budget + 1024;
+        if let Some(effort) = request.thinking_effort {
+            if effort != "none" {
+                if effort == "adaptive" {
+                    body["thinking"] = json!({
+                        "type": "adaptive"
+                    });
+                } else {
+                    body["thinking"] = json!({
+                        "type": "enabled",
+                        "effort": effort,
+                        "budget_tokens": 1024 // Fallback budget in case Anthropic API strictly requires it when effort is passed
+                    });
                 }
+                temperature = 1.0;
             }
         }
 
@@ -366,6 +368,7 @@ impl AiClient for AnthropicClient {
                                             completion_tokens: usage.output_tokens.unwrap_or(0),
                                             total_tokens: usage.input_tokens.unwrap_or(0)
                                                 + usage.output_tokens.unwrap_or(0),
+                                            reasoning_tokens: None,
                                         }),
                                     });
                                 }
@@ -381,7 +384,7 @@ impl AiClient for AnthropicClient {
     }
 
     fn supports_vision(&self) -> bool {
-        self.model_info.as_ref().is_some_and(|m| m.multimodal)
+        self.model_info.as_ref().is_some_and(|m| matches!(m.vision, crate::config::providers::Vision::Yes))
     }
 
     fn supports_image_gen(&self) -> bool {

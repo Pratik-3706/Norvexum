@@ -74,13 +74,7 @@ pub fn build_client(settings: &Settings) -> Result<Box<dyn AiClient>> {
 
     let api_key = settings
         .active_api_key()
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "No API key found for provider '{}'. Set {} in your .env file.",
-                provider.name,
-                provider.env_key
-            )
-        })?
+        .unwrap_or_default()
         .to_string();
 
     let model_info = provider
@@ -196,7 +190,7 @@ async fn test_openai_effort(client: &dyn AiClient) -> bool {
     let request = types::AiRequest::new(vec![types::Message::user("h")])
         .with_temperature(1.0)
         .with_max_tokens(1)
-        .with_thinking_budget(Some(1024))
+        .with_thinking_effort(Some("low".to_string()))
         .with_reasoning_type(Some(types::ReasoningType::OpenAiEffort));
     run_test_request(client, request).await
 }
@@ -206,7 +200,7 @@ async fn test_anthropic_thinking(client: &dyn AiClient) -> bool {
         .with_temperature(1.0)
         // Anthropic requires max_tokens to be strictly greater than budget_tokens
         .with_max_tokens(2048)
-        .with_thinking_budget(Some(1024))
+        .with_thinking_effort(Some("low".to_string()))
         .with_reasoning_type(Some(types::ReasoningType::AnthropicThinking));
     run_test_request(client, request).await
 }
@@ -215,7 +209,7 @@ async fn test_gemini_thinking(client: &dyn AiClient) -> bool {
     let request = types::AiRequest::new(vec![types::Message::user("h")])
         .with_temperature(1.0)
         .with_max_tokens(1)
-        .with_thinking_budget(Some(1024))
+        .with_thinking_effort(Some("low".to_string()))
         .with_reasoning_type(Some(types::ReasoningType::GeminiThinking));
     run_test_request(client, request).await
 }
@@ -224,28 +218,61 @@ async fn run_test_request(client: &dyn AiClient, request: types::AiRequest) -> b
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = client.chat_stream(request, tx);
 
-    tokio::select! {
-        res = handle => {
-            res.is_ok()
-        }
-        event = rx.recv() => {
+    let mut has_reasoning = false;
+    let mut is_unsupported_param_error = false;
+    let mut has_any_error = false;
+    let mut stream_succeeded = false;
+
+    let receive_future = async {
+        while let Some(event) = rx.recv().await {
             match event {
-                Some(types::AiStreamEvent::Error(err)) => {
-                    // Check if it failed due to unsupported parameters (400 validation error)
+                types::AiStreamEvent::Error(err) => {
+                    has_any_error = true;
                     let err_lower = err.to_lowercase();
                     if err_lower.contains("parameter") || err_lower.contains("unknown") || err_lower.contains("support") || err_lower.contains("invalid") || err_lower.contains("400") {
-                        false
-                    } else {
-                        // Rate limits or Auth errors keep the capability check optimistic
-                        true
+                        is_unsupported_param_error = true;
                     }
                 }
-                Some(_) => {
-                    // Any other stream events mean the request was successfully accepted
-                    true
+                types::AiStreamEvent::ThinkingDelta(_) | types::AiStreamEvent::ThinkingDone => {
+                    has_reasoning = true;
+                    stream_succeeded = true;
                 }
-                None => false,
+                types::AiStreamEvent::ContentDelta(_) => {
+                    stream_succeeded = true;
+                }
+                types::AiStreamEvent::Done { usage, .. } => {
+                    stream_succeeded = true;
+                    if let Some(u) = usage {
+                        if let Some(r_tokens) = u.reasoning_tokens {
+                            if r_tokens > 0 {
+                                has_reasoning = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
+    };
+
+    let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(5), receive_future).await;
+    if timeout_result.is_err() {
+        has_any_error = true; // Mark as error if it timed out
     }
+    
+    // Drop rx so the background stream task will naturally terminate if it tries to send more
+    drop(rx);
+
+    if is_unsupported_param_error {
+        return false;
+    }
+
+    if has_any_error && !stream_succeeded {
+        // Rate limits, auth errors, etc. keep the check optimistic
+        return true;
+    }
+
+    // If stream succeeded without error, it must have actually used reasoning.
+    // This prevents false positives on aggregators that silently strip the parameter.
+    has_reasoning
 }

@@ -95,7 +95,9 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file. Returns the file content with line numbers."
+        "Read the contents of a file. Returns the file content with line numbers (1-indexed). \
+         CRITICAL: For files with hundreds of lines, you MUST use `start_line` and `end_line` \
+         to read in chunks and avoid filling up your context window."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -138,11 +140,11 @@ impl Tool for ReadFileTool {
                     .collect();
 
                 let output = format!(
-                    "File: {} ({} lines total, showing {}-{})\n{}",
-                    path.display(),
-                    total,
+                    "📖 Reading lines {}-{} from {} ({} lines total)\n\n{}",
                     start,
                     end,
+                    path.display(),
+                    total,
                     numbered.join("\n")
                 );
 
@@ -232,8 +234,11 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing specific text or lines. Can be targeted to a specific line range (selection lock). \
-         If start_line and end_line are specified, you can omit or specify the target text. Shows a diff preview."
+        "Edit a file by replacing specific text or lines. \
+         IMPORTANT RULES: 1) `target` must EXACTLY match the existing text, including all leading/trailing whitespace and indentation! \
+         2) Do not make overlapping edits. \
+         3) Use `start_line` and `end_line` (1-indexed) to lock the search to a specific region to prevent accidental replacements elsewhere. \
+         4) Use this instead of shell commands like `sed`. Shows a diff preview."
     }
 
     fn parameters(&self) -> serde_json::Value {

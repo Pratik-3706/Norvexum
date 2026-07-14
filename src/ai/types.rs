@@ -87,6 +87,24 @@ impl Message {
         }
     }
 
+    pub fn user_with_images(text: impl Into<String>, images: Vec<(String, String)>) -> Self {
+        let mut content = vec![ContentPart::Text { text: text.into() }];
+        for (b64, mime) in images {
+            content.push(ContentPart::Image {
+                data: b64,
+                mime_type: mime,
+            });
+        }
+        Self {
+            role: Role::User,
+            content,
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_name: None,
+            thought_signature: None,
+        }
+    }
+
     pub fn assistant(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
@@ -176,7 +194,7 @@ pub struct AiRequest {
     pub temperature: f32,
     pub max_tokens: Option<u32>,
     pub reasoning_type: Option<ReasoningType>,
-    pub thinking_budget: Option<u32>,
+    pub thinking_effort: Option<String>,
 }
 
 impl AiRequest {
@@ -187,7 +205,7 @@ impl AiRequest {
             temperature: 0.7,
             max_tokens: None,
             reasoning_type: None,
-            thinking_budget: None,
+            thinking_effort: None,
         }
     }
 
@@ -211,8 +229,8 @@ impl AiRequest {
         self
     }
 
-    pub fn with_thinking_budget(mut self, budget: Option<u32>) -> Self {
-        self.thinking_budget = budget;
+    pub fn with_thinking_effort(mut self, effort: Option<String>) -> Self {
+        self.thinking_effort = effort;
         self
     }
 }
@@ -251,6 +269,7 @@ pub struct UsageStats {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    pub reasoning_tokens: Option<u32>,
 }
 
 // ── Image Generation ──────────────────────────────────────────────────────

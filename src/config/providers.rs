@@ -4,18 +4,34 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Vision {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl Default for Vision {
+    fn default() -> Self {
+        Vision::Unknown
+    }
+}
+
 /// Describes a single AI model's capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub family: String,
-    pub multimodal: bool,        // Can accept image input (vision)
-    pub image_gen: bool,         // Can generate images
-    pub tool_calling: bool,      // Supports function/tool calling
-    pub streaming: bool,         // Supports streaming responses
-    pub context_window: usize,   // Max tokens in context
-    pub cost_per_1k_input: f64,  // Cost per 1K input tokens (USD)
-    pub cost_per_1k_output: f64, // Cost per 1K output tokens (USD)
+    pub vision: Vision,
+    pub image_gen: bool,
+    pub tool_calling: bool,
+    pub streaming: bool,
+    pub context_window: usize,
+    pub cost_per_1k_input: f64,
+    pub cost_per_1k_output: f64,
+    #[serde(default)] pub adaptive_thinking: bool,
+    #[serde(default)] pub effort_levels: Vec<String>,
 }
 
 /// Describes an AI provider endpoint.
@@ -40,8 +56,26 @@ pub enum ApiStyle {
     Anthropic,
 }
 
-/// Build the complete provider registry with all known models.
+static DYNAMIC_REGISTRY: std::sync::RwLock<Option<Vec<ProviderInfo>>> = std::sync::RwLock::new(None);
+
+pub fn update_dynamic_registry(registry: Vec<ProviderInfo>) {
+    if let Ok(mut guard) = DYNAMIC_REGISTRY.write() {
+        *guard = Some(registry);
+    }
+}
+
+/// Build the complete provider registry. Uses the dynamic registry if available, else static.
 pub fn build_registry() -> Vec<ProviderInfo> {
+    if let Ok(guard) = DYNAMIC_REGISTRY.read() {
+        if let Some(registry) = &*guard {
+            return registry.clone();
+        }
+    }
+    build_static_registry()
+}
+
+/// Build the static provider registry with known fallback models.
+pub fn build_static_registry() -> Vec<ProviderInfo> {
     vec![
         // ── aicredits.in (OpenAI-compatible gateway) ─────────────────────
         ProviderInfo {
@@ -54,7 +88,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "anthropic/claude-3-5-sonnet".into(),
                     family: "claude".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -65,7 +101,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "anthropic/claude-3-5-haiku".into(),
                     family: "claude".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -76,7 +114,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "anthropic/claude-3-haiku".into(),
                     family: "claude".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -87,7 +127,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "moonshotai/kimi-k2.6".into(),
                     family: "kimi".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -98,7 +140,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "deepseek/deepseek-v4-pro".into(),
                     family: "deepseek".into(),
-                    multimodal: false,
+                    vision: Vision::No,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -109,7 +153,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "deepseek/deepseek-r1".into(),
                     family: "deepseek".into(),
-                    multimodal: false,
+                    vision: Vision::No,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: false,
                     streaming: true,
@@ -120,7 +166,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "minimax/minimax-m3".into(),
                     family: "minimax".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -131,7 +179,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "google/gemini-2.5-flash".into(),
                     family: "gemini".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -142,7 +192,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "z-ai/glm-5.1".into(),
                     family: "glm".into(),
-                    multimodal: false,
+                    vision: Vision::No,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -153,7 +205,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "z-ai/glm-4.5".into(),
                     family: "glm".into(),
-                    multimodal: false,
+                    vision: Vision::No,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -174,7 +228,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "gemini-3-flash".into(),
                     family: "gemini".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -185,7 +241,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "gemini-3.1-flash-lite".into(),
                     family: "gemini".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -196,7 +254,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "gemini-2.5-flash".into(),
                     family: "gemini".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -207,7 +267,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "gemini-3.1-flash-image".into(),
                     family: "gemini".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: true,
                     tool_calling: true,
                     streaming: true,
@@ -228,7 +290,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "gpt-4o".into(),
                     family: "gpt".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -239,7 +303,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "gpt-4o-mini".into(),
                     family: "gpt".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -260,7 +326,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "claude-sonnet-4-20250514".into(),
                     family: "claude".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -271,7 +339,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                 ModelInfo {
                     id: "claude-3-5-haiku-latest".into(),
                     family: "claude".into(),
-                    multimodal: true,
+                    vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
@@ -293,7 +363,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     ModelInfo {
                         id: "llama3".into(),
                         family: "llama".into(),
-                        multimodal: false,
+                        vision: Vision::No,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                         image_gen: false,
                         tool_calling: true,
                         streaming: true,
@@ -304,7 +376,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     ModelInfo {
                         id: "mistral".into(),
                         family: "mistral".into(),
-                        multimodal: false,
+                        vision: Vision::No,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                         image_gen: false,
                         tool_calling: true,
                         streaming: true,
@@ -318,7 +392,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     ModelInfo {
                         id: "llama3".into(),
                         family: "llama".into(),
-                        multimodal: false,
+                        vision: Vision::No,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                         image_gen: false,
                         tool_calling: true,
                         streaming: true,
@@ -329,7 +405,9 @@ pub fn build_registry() -> Vec<ProviderInfo> {
                     ModelInfo {
                         id: "mistral".into(),
                         family: "mistral".into(),
-                        multimodal: false,
+                        vision: Vision::No,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                         image_gen: false,
                         tool_calling: true,
                         streaming: true,
@@ -365,7 +443,9 @@ pub fn build_registry_with_settings(settings: &crate::config::Settings) -> Vec<P
                     prov.models.push(ModelInfo {
                         id: model_id.to_string(),
                         family: family.to_string(),
-                        multimodal: true,
+                        vision: Vision::Yes,
+                    adaptive_thinking: false,
+                    effort_levels: vec![],
                         image_gen: false,
                         tool_calling: true,
                         streaming: true,

@@ -15,6 +15,8 @@ pub mod image_download;
 pub mod image_gen;
 pub mod image_inspect;
 pub mod image_search;
+pub mod manage_tasks;
+pub mod memory;
 pub mod package_safety;
 pub mod shell;
 pub mod skills;
@@ -98,6 +100,8 @@ pub struct ToolContext {
     /// Current working directory (within sandbox)
     pub cwd: std::path::PathBuf,
     pub client: Option<Arc<dyn crate::ai::AiClient>>,
+    /// Temporary volatile RAM storage shared across the agent's lifetime
+    pub temp_memory: Arc<tokio::sync::RwLock<crate::tools::memory::TempMemory>>,
 }
 
 /// The trait all tools must implement.
@@ -167,6 +171,13 @@ impl ToolRegistry {
         // ── Batch image analysis ─────────────────────────────────────────
         registry.register(Arc::new(batch_image_inspect::BatchViewImageTool));
 
+        // ── Memory tools ─────────────────────────────────────────────────
+        registry.register(Arc::new(memory::StoreInMemoryTool));
+        registry.register(Arc::new(memory::ReadFromMemoryTool));
+
+        // ── Task Management tools ────────────────────────────────────────
+        registry.register(Arc::new(manage_tasks::ManageTasksTool));
+
         // ── Package safety ───────────────────────────────────────────────
         registry.register(Arc::new(package_safety::PackageSafetyTool));
 
@@ -234,6 +245,7 @@ mod tests {
             settings: Arc::new(settings),
             cwd: root.clone(),
             client: None,
+            temp_memory: Arc::new(tokio::sync::RwLock::new(crate::tools::memory::TempMemory::new())),
         };
         (root, context)
     }

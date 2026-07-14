@@ -16,7 +16,9 @@ impl Tool for InspectImageTool {
 
     fn description(&self) -> &str {
         "View and analyze the contents of an image file within the project sandbox. \
-         Use this to inspect screenshots, generated UI mockups, or downloaded assets."
+         Use this to inspect screenshots, generated UI mockups, or downloaded assets. \
+         IMPORTANT: You can pass custom questions via the 'prompt' parameter to ask \
+         specific things like 'what character is this?' or 'what is odd about this image?'"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -24,7 +26,7 @@ impl Tool for InspectImageTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path to the image file (relative to CWD or absolute within project)" },
-                "prompt": { "type": "string", "description": "Specific question or instruction for analyzing the image (default: 'Describe this image in detail')" }
+                "prompt": { "type": "string", "description": "Specific question or instruction for analyzing the image (e.g., 'what character is this?'). Highly recommended to customize this instead of using the default." }
             },
             "required": ["path"]
         })
@@ -91,6 +93,57 @@ impl Tool for InspectImageTool {
             } else {
                 ToolResult::err("No active AI client found in tool context.")
             }
+        } else if let Some(gemini_key) = &ctx.settings.google_ai_api_key {
+            // Fallback: Gemini SDK for SFW images
+            let (b64, mime) = match vision::encode_image_file(&path) {
+                Ok(data) => data,
+                Err(e) => return ToolResult::err(format!("Failed to read/encode image: {}", e)),
+            };
+
+            let client = crate::ai::gemini::GeminiClient::new(
+                gemini_key.clone(),
+                "gemini-2.5-flash".to_string(),
+                None,
+            );
+            use crate::ai::AiClient;
+            
+            let msg = Message::user_with_image(prompt_str, b64, mime);
+            let request = AiRequest::new(vec![msg]).with_temperature(0.5);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            
+            if let Err(e) = client.chat_stream(request, tx).await {
+                // If it fails immediately
+                return ToolResult::err(format!("Gemini fallback request failed: {}", e));
+            }
+
+            let mut description = String::new();
+            let mut safety_blocked = false;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    AiStreamEvent::ContentDelta(text) => description.push_str(&text),
+                    AiStreamEvent::Error(err) => {
+                        if err.to_lowercase().contains("safety") || err.to_lowercase().contains("blocked") {
+                            safety_blocked = true;
+                        } else {
+                            return ToolResult::err(format!("Gemini stream error: {}", err));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if safety_blocked {
+                return ToolResult::err("The image may contain NSFW/unsafe content. You must rely on your own native vision capabilities to view it directly.");
+            }
+
+            if description.trim().is_empty() {
+                return ToolResult::err("Gemini returned an empty description for the image.");
+            }
+
+            ToolResult::ok_with_data(
+                format!("🖼️ Image Analysis for {} (via Gemini Fallback):\n\n{}", path_str, description),
+                json!({ "path": path.to_string_lossy(), "analysis": description, "method": "gemini_fallback" }),
+            )
         } else if let Some(ocr_key) = &ctx.settings.ocr_space_api_key {
             // Fallback: OCR space
             match vision::ocr_image(ocr_key, &path).await {
@@ -101,10 +154,7 @@ impl Tool for InspectImageTool {
                 Err(e) => ToolResult::err(format!("OCR failed: {}", e)),
             }
         } else {
-            ToolResult::err(
-                "The current AI model does not support vision (image inputs), \
-                 and no OCR_SPACE_API_KEY is configured in .env. Cannot inspect image.",
-            )
+            ToolResult::err("The current AI model does not support vision (image inputs), no GOOGLE_AI_API_KEY is available for SDK fallback, and no OCR API key is set.")
         }
     }
 }

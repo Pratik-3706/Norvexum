@@ -240,13 +240,7 @@ impl AiClient for GeminiClient {
             "temperature": request.temperature,
         });
 
-        if let Some(budget) = request.thinking_budget {
-            if budget > 0 {
-                gen_config["thinkingConfig"] = json!({
-                    "thinkingBudget": budget
-                });
-            }
-        }
+        // Thinking is exclusively for Anthropic API per user request
 
         let mut body = json!({
             "contents": contents,
@@ -417,6 +411,7 @@ impl AiClient for GeminiClient {
                                 prompt_tokens: usage.prompt_token_count.unwrap_or(0),
                                 completion_tokens: usage.candidates_token_count.unwrap_or(0),
                                 total_tokens: usage.total_token_count.unwrap_or(0),
+                                reasoning_tokens: None,
                             }),
                         });
                     }
@@ -428,7 +423,7 @@ impl AiClient for GeminiClient {
     }
 
     fn supports_vision(&self) -> bool {
-        self.model_info.as_ref().is_some_and(|m| m.multimodal)
+        self.model_info.as_ref().is_some_and(|m| matches!(m.vision, crate::config::providers::Vision::Yes))
     }
 
     fn supports_image_gen(&self) -> bool {
