@@ -28,14 +28,10 @@ pub async fn run(settings: &Settings) -> Result<()> {
     fs::create_dir_all(norvexum_path.join(VENVS_DIR))
         .wrap_err("Failed to create venvs directory")?;
 
-    // Save initial configuration
-    settings
-        .save()
-        .wrap_err("Failed to save initial configuration")?;
-    println!(
-        "Created configuration: {}",
-        norvexum_path.join(CONFIG_FILE).display()
-    );
+    // We no longer save settings.json here because it is global.
+    // Instead we just ensure the global config directory exists.
+    let global_config_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| project_dir.join(NORVEXUM_DIR));
+    let _ = fs::create_dir_all(&global_config_dir);
 
     // Generate initial project context
     let context = ProjectContext::scan(project_dir);
@@ -44,19 +40,7 @@ pub async fn run(settings: &Settings) -> Result<()> {
         .wrap_err("Failed to save initial project context")?;
     println!("Created project context index.");
 
-    // Create .env configuration template dynamically
-    let env_path = project_dir.join(".env");
-    if !env_path.exists() {
-        let env_example_path = project_dir.join(".env.example");
-        if env_example_path.exists() {
-            let _ = fs::copy(&env_example_path, &env_path);
-            println!("Created default .env file from .env.example (please add your API keys).");
-        } else {
-            let template = "# Norvexum API Keys\nGOOGLE_AI_API_KEY=\nAICREDITS_API_KEY=\nOPENAI_API_KEY=\nANTHROPIC_API_KEY=\nTAVILY_API_KEY=\nOCR_SPACE_API_KEY=\nPOLLINATIONS_API_KEY=\n";
-            let _ = fs::write(&env_path, template);
-            println!("Created default .env template file.");
-        }
-    }
+    // We no longer create a local .env file because API keys are stored globally.
 
     // Add to gitignore if git repo is present
     let gitignore_path = project_dir.join(".gitignore");
@@ -65,8 +49,8 @@ pub async fn run(settings: &Settings) -> Result<()> {
         if !content.contains(".norvexum") {
             let mut file = fs::OpenOptions::new().append(true).open(&gitignore_path)?;
             use std::io::Write;
-            writeln!(file, "\n# Norvexum local data\n.norvexum/\n.env")?;
-            println!("Added .norvexum/ and .env to .gitignore.");
+            writeln!(file, "\n# Norvexum local data\n.norvexum/")?;
+            println!("Added .norvexum/ to .gitignore.");
         }
     }
 

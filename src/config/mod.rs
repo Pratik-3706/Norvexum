@@ -146,7 +146,8 @@ impl Settings {
 
         settings.project_root = target_dir.clone();
 
-        let config_path = target_dir.join(NORVEXUM_DIR).join(CONFIG_FILE);
+        let config_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| target_dir.join(NORVEXUM_DIR));
+        let config_path = config_dir.join(CONFIG_FILE);
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)
                 .wrap_err_with(|| format!("Failed to read config: {}", config_path.display()))?;
@@ -221,8 +222,9 @@ impl Settings {
                                 let _ = std::env::set_current_dir(&saved_path);
                                 settings.project_root = saved_path.clone();
 
-                                // Also load directory-specific config.toml from the remembered dir
-                                let config_path = saved_path.join(NORVEXUM_DIR).join(CONFIG_FILE);
+                                // Also load global config.toml
+                                let global_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| saved_path.join(NORVEXUM_DIR));
+                                let config_path = global_dir.join(CONFIG_FILE);
                                 if config_path.exists() {
                                     if let Ok(cfg_content) = std::fs::read_to_string(&config_path) {
                                         if let Ok(file_settings) = toml::from_str::<FileSettings>(&cfg_content) {
@@ -245,8 +247,8 @@ impl Settings {
                                     }
                                 }
 
-                                // Load .env from remembered dir
-                                let env_path = saved_path.join(".env");
+                                // Load .env from global dir
+                                let env_path = global_dir.join(".env");
                                 if env_path.exists() {
                                     let _ = dotenvy::from_path(&env_path);
                                 }
@@ -260,9 +262,9 @@ impl Settings {
         Ok(settings)
     }
 
-    /// Save current config to .norvexum/config.toml
+    /// Save current config to global ~/.norvexum/config.toml
     pub fn save(&self) -> Result<()> {
-        let config_dir = self.project_root.join(NORVEXUM_DIR);
+        let config_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| self.project_root.join(NORVEXUM_DIR));
         std::fs::create_dir_all(&config_dir)?;
 
         let file_settings = FileSettings {

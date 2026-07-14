@@ -758,7 +758,7 @@ impl GuiApp {
     }
 
     fn save_capabilities_cache(&self) {
-        let cache_dir = self.settings.project_root.join(crate::config::NORVEXUM_DIR);
+        let cache_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| self.settings.project_root.join(crate::config::NORVEXUM_DIR));
         let _ = std::fs::create_dir_all(&cache_dir);
         let cache_path = cache_dir.join("capabilities_cache.json");
         if let Ok(content) = serde_json::to_string_pretty(&self.probed_capabilities) {
@@ -767,7 +767,8 @@ impl GuiApp {
     }
 
     fn load_capabilities_cache(&mut self) {
-        let cache_path = self.settings.project_root.join(crate::config::NORVEXUM_DIR).join("capabilities_cache.json");
+        let cache_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| self.settings.project_root.join(crate::config::NORVEXUM_DIR));
+        let cache_path = cache_dir.join("capabilities_cache.json");
         if cache_path.exists() {
             if let Ok(content) = std::fs::read_to_string(cache_path) {
                 if let Ok(map) = serde_json::from_str(&content) {
@@ -2419,6 +2420,47 @@ impl eframe::App for GuiApp {
                 right_panel = right_panel.default_width(self.right_sidebar_width);
             }
             let panel_response = right_panel.show(ctx, |ui| {
+                    let bg_procs = crate::tools::shell::get_background_processes();
+                    if !bg_procs.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Background Processes")
+                                    .font(egui::FontId::proportional(16.0))
+                                    .strong(),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{}", bg_procs.len()))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(167, 139, 250)),
+                                );
+                            });
+                        });
+                        ui.add_space(8.0);
+                        for proc in bg_procs {
+                            ui.horizontal(|ui| {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Kill").on_hover_text("Kill this background process").clicked() {
+                                        crate::tools::shell::kill_background_process(proc.pid);
+                                    }
+                                    
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new(format!("[{}]", proc.pid)).small().color(egui::Color32::from_rgb(148, 163, 184)));
+                                        let mut cmd_str = proc.command.clone();
+                                        if cmd_str.len() > 25 {
+                                            cmd_str.truncate(22);
+                                            cmd_str.push_str("...");
+                                        }
+                                        ui.label(egui::RichText::new(cmd_str).monospace());
+                                    });
+                                });
+                            });
+                        }
+                        ui.add_space(16.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("Workspace files")
@@ -3254,6 +3296,26 @@ impl eframe::App for GuiApp {
                                 .clicked()
                             {
                                 self.terminal_entries.clear();
+                            }
+                            
+                            let bg_procs = crate::tools::shell::get_background_processes();
+                            if !bg_procs.is_empty() {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(format!("Kill {} Background Processes", bg_procs.len()))
+                                                .size(10.0)
+                                                .color(egui::Color32::from_rgb(239, 68, 68)),
+                                        )
+                                        .fill(egui::Color32::TRANSPARENT)
+                                        .stroke(egui::Stroke::NONE),
+                                    )
+                                    .clicked()
+                                {
+                                    for proc in bg_procs {
+                                        crate::tools::shell::kill_background_process(proc.pid);
+                                    }
+                                }
                             }
                         });
                     });

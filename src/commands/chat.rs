@@ -69,16 +69,9 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
         // Send initial message if provided
         if let Some(msg) = initial_msg {
             is_processing_task.store(true, std::sync::atomic::Ordering::SeqCst);
-            tokio::select! {
-                res = agent.process_message(&msg) => {
-                    if let Err(e) = res {
-                        let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
-                    }
-                }
-                _ = cancel_rx.recv() => {
-                    let _ = agent_tx_err.send(AgentEvent::Status("⏹️ Run stopped".into()));
-                    let _ = agent_tx_err.send(AgentEvent::Done { usage: None });
-                }
+            let res = agent.process_message(&msg, &mut cancel_rx).await;
+            if let Err(e) = res {
+                let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
             }
             is_processing_task.store(false, std::sync::atomic::Ordering::SeqCst);
         }
@@ -88,16 +81,9 @@ pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> 
             active_user_rx.recv().await
         } {
             is_processing_task.store(true, std::sync::atomic::Ordering::SeqCst);
-            tokio::select! {
-                res = agent.process_message(&msg) => {
-                    if let Err(e) = res {
-                        let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
-                    }
-                }
-                _ = cancel_rx.recv() => {
-                    let _ = agent_tx_err.send(AgentEvent::Status("⏹️ Run stopped".into()));
-                    let _ = agent_tx_err.send(AgentEvent::Done { usage: None });
-                }
+            let res = agent.process_message(&msg, &mut cancel_rx).await;
+            if let Err(e) = res {
+                let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
             }
             is_processing_task.store(false, std::sync::atomic::Ordering::SeqCst);
         }

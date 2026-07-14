@@ -7,9 +7,33 @@ use serde_json::json;
 use std::path::Path;
 
 use super::{Tool, ToolContext, ToolResult};
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+#[derive(Clone, Debug)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub command: String,
+    pub kill_tx: tokio::sync::mpsc::Sender<()>,
+}
+
+pub static BACKGROUND_PROCESSES: Lazy<Mutex<HashMap<u32, ProcessInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+pub fn get_background_processes() -> Vec<ProcessInfo> {
+    let map = BACKGROUND_PROCESSES.lock().unwrap();
+    map.values().cloned().collect()
+}
+
+pub fn kill_background_process(pid: u32) {
+    // Remove the process and send the kill signal to the background task
+    if let Some(info) = BACKGROUND_PROCESSES.lock().unwrap().remove(&pid) {
+        let _ = info.kill_tx.try_send(());
+    }
+}
 
 pub fn is_shell_builtin(cmd_name: &str) -> bool {
-    matches!(cmd_name, "exit" | "echo" | "set" | "export" | "dir" | "cls")
+    matches!(cmd_name, "exit" | "echo" | "set" | "export" | "dir" | "cls" | "start")
 }
 
 /// Check if a command is unparseable or contains shell metacharacters/wildcards
@@ -85,25 +109,30 @@ fn looks_like_path(s: &str) -> bool {
     }
 }
 
-fn clean_path_string(s: &str) -> &str {
-    if let Some(stripped) = s.strip_prefix("file://") {
-        stripped
-    } else {
-        s
-    }
-}
-
-fn extract_paths(token: &str) -> Vec<&str> {
-    let mut paths = Vec::new();
-    if let Some((left, right)) = token.split_once('=') {
-        paths.push(left);
-        paths.push(right);
-    } else if token.starts_with('-') {
-        if let Some(idx) = token.find(['/', '\\', '.', '~']) {
-            paths.push(&token[idx..]);
+fn clean_path_string(s: &str) -> String {
+    let stripped = if let Some(stripped) = s.strip_prefix("file://") {
+        if cfg!(windows) && stripped.starts_with('/') && stripped.len() > 2 && stripped.chars().nth(2) == Some(':') {
+            &stripped[1..]
+        } else {
+            stripped
         }
     } else {
-        paths.push(token);
+        s
+    };
+    stripped.replace("%20", " ")
+}
+
+fn extract_paths(token: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some((left, right)) = token.split_once('=') {
+        paths.push(left.to_string());
+        paths.push(right.to_string());
+    } else if token.starts_with('-') {
+        if let Some(idx) = token.find(['/', '\\', '.', '~']) {
+            paths.push(token[idx..].to_string());
+        }
+    } else {
+        paths.push(token.to_string());
     }
     paths
 }
@@ -184,8 +213,8 @@ fn check_raw_command_paths(command_str: &str, ctx: &ToolContext) -> Result<(), S
     let words = command_str.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '=');
     for word in words {
         let clean = clean_path_string(word.trim());
-        if !clean.is_empty() && looks_like_path(clean) {
-            if let Err(e) = super::filesystem::resolve_path(clean, ctx) {
+        if !clean.is_empty() && looks_like_path(&clean) {
+            if let Err(e) = super::filesystem::resolve_path(&clean, ctx) {
                 return Err(e);
             }
         }
@@ -206,6 +235,7 @@ impl Tool for ShellCommandTool {
          IMPORTANT RULES: 1) NEVER run interactive commands (like `nano`, `vim`, or blocking scripts) that wait for user input. \
          2) Always use non-interactive flags (e.g. `apt-get -y`, `npm install --no-fund`). \
          3) DO NOT use this tool for text replacement (like `sed` or `awk`); use the `edit_file` tool instead. \
+         4) Use background=true to run long-running servers without deadlocking. \
          Commands are sandboxed — attempts to escape the project directory will be blocked."
     }
 
@@ -213,7 +243,8 @@ impl Tool for ShellCommandTool {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "The command line string to run (must be non-interactive)" }
+                "command": { "type": "string", "description": "The command line string to run (must be non-interactive)" },
+                "background": { "type": "boolean", "description": "Set to true to run the command in the background (detached). Useful for long-running servers." }
             },
             "required": ["command"]
         })
@@ -221,6 +252,22 @@ impl Tool for ShellCommandTool {
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let command_str = args["command"].as_str().unwrap_or("");
+        let mut background = args["background"].as_bool().unwrap_or(false);
+        
+        // Auto-detect common long-running servers and force background if the agent forgot
+        if !background {
+            let cmd_lower = command_str.to_lowercase();
+            if cmd_lower.contains("http.server") 
+                || cmd_lower.contains("npm start") 
+                || cmd_lower.contains("npm run dev")
+                || cmd_lower.contains("serve ")
+                || cmd_lower.contains("fastapi dev")
+                || cmd_lower.contains("uvicorn ")
+                || cmd_lower.contains("flask run")
+            {
+                background = true;
+            }
+        }
         if command_str.is_empty() {
             return ToolResult::err("Command string cannot be empty");
         }
@@ -263,7 +310,7 @@ impl Tool for ShellCommandTool {
                 if cmd_name == "cd" {
                     if argv.len() > 1 {
                         let target_dir = clean_path_string(&argv[1]);
-                        match super::filesystem::resolve_path(target_dir, ctx) {
+                        match super::filesystem::resolve_path(&target_dir, ctx) {
                             Ok(resolved) => {
                                 return ToolResult::ok(format!(
                                     "Directory changed to {}\n(Note: Directory changes do not persist across separate command runs. Use relative paths or chain commands with && instead.)",
@@ -296,8 +343,8 @@ impl Tool for ShellCommandTool {
 
                 // 3. Path checking on argv[0]
                 let argv0_clean = clean_path_string(&argv[0]);
-                if looks_like_path(argv0_clean) {
-                    if let Err(e) = super::filesystem::resolve_path(argv0_clean, ctx) {
+                if looks_like_path(&argv0_clean) {
+                    if let Err(e) = super::filesystem::resolve_path(&argv0_clean, ctx) {
                         return ToolResult::err(format!(
                             "⚠️ Command blocked: directory escape attempt detected in command name.\n{}",
                             e
@@ -314,7 +361,7 @@ impl Tool for ShellCommandTool {
                         && !is_chmod_mode(token)
                     {
                         let clean_token = clean_path_string(token);
-                        if let Err(e) = super::filesystem::resolve_path(clean_token, ctx) {
+                        if let Err(e) = super::filesystem::resolve_path(&clean_token, ctx) {
                             return ToolResult::err(format!(
                                 "⚠️ Command blocked: directory escape attempt detected in chmod argument.\n{}",
                                 e
@@ -323,9 +370,9 @@ impl Tool for ShellCommandTool {
                     }
 
                     for path_str in extract_paths(token) {
-                        let path_clean = clean_path_string(path_str);
-                        if looks_like_path(path_clean) {
-                            if let Err(e) = super::filesystem::resolve_path(path_clean, ctx) {
+                        let path_clean = clean_path_string(&path_str);
+                        if looks_like_path(&path_clean) {
+                            if let Err(e) = super::filesystem::resolve_path(&path_clean, ctx) {
                                 return ToolResult::err(format!(
                                     "⚠️ Command blocked: directory escape attempt detected.\n{}",
                                     e
@@ -338,9 +385,9 @@ impl Tool for ShellCommandTool {
         }
 
         if fallback {
-            // Fallback path: Run command via powershell on Windows, or sh on Unix
+            // Fallback path: Run command via cmd.exe on Windows, or sh on Unix
             let (shell, command_args) = if cfg!(target_os = "windows") {
-                ("powershell", vec!["-NoProfile", "-Command", command_str])
+                ("cmd.exe", vec!["/C", command_str])
             } else {
                 ("sh", vec!["-c", command_str])
             };
@@ -348,11 +395,43 @@ impl Tool for ShellCommandTool {
             let mut cmd = tokio::process::Command::new(shell);
             cmd.args(&command_args)
                .current_dir(&ctx.cwd)
-               .kill_on_drop(true);
+               .kill_on_drop(!background);
 
             #[cfg(windows)]
             {
                 cmd.creation_flags(0x08000000);
+            }
+
+            if background {
+                cmd.stdin(std::process::Stdio::null());
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        if let Some(pid) = child.id() {
+                            let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
+                            BACKGROUND_PROCESSES.lock().unwrap().insert(pid, ProcessInfo {
+                                pid,
+                                command: command_str.to_string(),
+                                kill_tx,
+                            });
+                            
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    _ = child.wait() => {}
+                                    _ = kill_rx.recv() => {
+                                        let _ = child.kill().await;
+                                    }
+                                }
+                                BACKGROUND_PROCESSES.lock().unwrap().remove(&pid);
+                            });
+                            
+                            return ToolResult::ok(format!("Command started in background with PID: {}", pid));
+                        }
+                        return ToolResult::ok("Command started in background (no PID available)".to_string());
+                    }
+                    Err(e) => return ToolResult::err(format!("Failed to spawn background command: {}", e)),
+                }
             }
 
             let output_res = cmd.output().await;
@@ -368,11 +447,43 @@ impl Tool for ShellCommandTool {
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
            .current_dir(&ctx.cwd)
-           .kill_on_drop(true);
+           .kill_on_drop(!background);
 
         #[cfg(windows)]
         {
             cmd.creation_flags(0x08000000);
+        }
+
+        if background {
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    if let Some(pid) = child.id() {
+                        let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
+                        BACKGROUND_PROCESSES.lock().unwrap().insert(pid, ProcessInfo {
+                            pid,
+                            command: command_str.to_string(),
+                            kill_tx,
+                        });
+                        
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = child.wait() => {}
+                                _ = kill_rx.recv() => {
+                                    let _ = child.kill().await;
+                                }
+                            }
+                            BACKGROUND_PROCESSES.lock().unwrap().remove(&pid);
+                        });
+                        
+                        return ToolResult::ok(format!("Command started in background with PID: {}", pid));
+                    }
+                    return ToolResult::ok("Command started in background (no PID available)".to_string());
+                }
+                Err(e) => return ToolResult::err(format!("Failed to spawn background command: {}", e)),
+            }
         }
 
         let output_res = cmd.output().await;

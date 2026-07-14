@@ -56,7 +56,7 @@ impl OpenAiCompatClient {
     fn format_messages(&self, messages: &[Message]) -> Vec<serde_json::Value> {
         messages
             .iter()
-            .map(|msg| {
+            .flat_map(|msg| {
                 let role = match msg.role {
                     Role::System => "system",
                     Role::User => "user",
@@ -65,13 +65,67 @@ impl OpenAiCompatClient {
                 };
 
                 // Check if message has image content
-                let has_image = msg
+                let has_image = self.supports_vision() && msg
                     .content
                     .iter()
                     .any(|p| matches!(p, ContentPart::Image { .. }));
 
                 if has_image {
-                    // Multi-modal content array
+                    if role == "tool" {
+                        // CRITICAL FIX: APIs often strictly reject `image_url` inside `tool` messages.
+                        // We must split the `tool` message into a text-only tool message, 
+                        // and append a new `user` message containing the image.
+                        let mut text_parts = Vec::new();
+                        let mut img_parts = Vec::new();
+                        
+                        for part in &msg.content {
+                            match part {
+                                ContentPart::Text { text } => {
+                                    text_parts.push(json!({ "type": "text", "text": text }));
+                                }
+                                ContentPart::Image { data, mime_type } => {
+                                    img_parts.push(json!({
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": format!("data:{};base64,{}", mime_type, data)
+                                        }
+                                    }));
+                                }
+                            }
+                        }
+                        
+                        let mut tool_obj = json!({
+                            "role": role,
+                            "content": text_parts
+                        });
+                        if let Some(id) = &msg.tool_call_id {
+                            tool_obj["tool_call_id"] = json!(id);
+                        }
+                        if !msg.tool_calls.is_empty() {
+                            tool_obj["tool_calls"] = json!(
+                                msg.tool_calls
+                                    .iter()
+                                    .map(|call| json!({
+                                        "id": call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call.name,
+                                            "arguments": Self::tool_arguments(call)
+                                        }
+                                    }))
+                                    .collect::<Vec<_>>()
+                            );
+                        }
+                        
+                        let user_obj = json!({
+                            "role": "user",
+                            "content": img_parts
+                        });
+                        
+                        return vec![tool_obj, user_obj];
+                    }
+
+                    // Multi-modal content array (for non-tool roles, usually "user")
                     let content_parts: Vec<serde_json::Value> = msg
                         .content
                         .iter()
@@ -112,7 +166,7 @@ impl OpenAiCompatClient {
                                 .collect::<Vec<_>>()
                         );
                     }
-                    obj
+                    vec![obj]
                 } else {
                     // Simple text content
                     let text = msg.text();
@@ -139,7 +193,7 @@ impl OpenAiCompatClient {
                                 .collect::<Vec<_>>()
                         );
                     }
-                    obj
+                    vec![obj]
                 }
             })
             .collect()

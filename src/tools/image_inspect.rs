@@ -26,7 +26,8 @@ impl Tool for InspectImageTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path to the image file (relative to CWD or absolute within project)" },
-                "prompt": { "type": "string", "description": "Specific question or instruction for analyzing the image (e.g., 'what character is this?'). Highly recommended to customize this instead of using the default." }
+                "prompt": { "type": "string", "description": "Specific question or instruction for analyzing the image (e.g., 'what character is this?'). Highly recommended to customize this instead of using the default." },
+                "attach_natively": { "type": "boolean", "description": "If true, attaches the image natively to the chat history so the model can see it in context. If false, makes a separate sub-request to save payload size and only returns text. Defaults to false." }
             },
             "required": ["path"]
         })
@@ -37,6 +38,7 @@ impl Tool for InspectImageTool {
         let prompt_str = args["prompt"]
             .as_str()
             .unwrap_or("Describe this image in detail");
+        let attach_natively = args["attach_natively"].as_bool().unwrap_or(false);
 
         let path = match super::filesystem::resolve_path(path_str, ctx) {
             Ok(p) => p,
@@ -61,7 +63,13 @@ impl Tool for InspectImageTool {
                 Err(e) => return ToolResult::err(format!("Failed to read/encode image: {}", e)),
             };
 
-            // Call model directly with vision request
+            if attach_natively {
+                // Call model directly with vision request attached natively
+                let msg = format!("🖼️ Image {} attached natively for analysis.\n\nPrompt: {}", path_str, prompt_str);
+                return ToolResult::ok_with_image(msg, b64, mime);
+            }
+            
+            // Otherwise, make a separate sub-request to save payload size
             if let Some(client) = &ctx.client {
                 let msg = Message::user_with_image(prompt_str, b64, mime);
                 let request = AiRequest::new(vec![msg]).with_temperature(0.5);

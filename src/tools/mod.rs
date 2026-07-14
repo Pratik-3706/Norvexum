@@ -22,6 +22,8 @@ pub mod shell;
 pub mod skills;
 pub mod web_fetch;
 pub mod web_search;
+pub mod syntax_check;
+pub mod browser;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,9 @@ pub struct ToolResult {
     /// Structured data for the agent to use (e.g. file paths, image URLs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// Optional image data as (base64_string, mime_type)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base64_image: Option<(String, String)>,
 }
 
 impl ToolResult {
@@ -50,6 +55,7 @@ impl ToolResult {
             output: output.into(),
             error: None,
             data: None,
+            base64_image: None,
         }
     }
 
@@ -59,6 +65,17 @@ impl ToolResult {
             output: output.into(),
             error: None,
             data: Some(data),
+            base64_image: None,
+        }
+    }
+
+    pub fn ok_with_image(output: impl Into<String>, base64: String, mime: String) -> Self {
+        Self {
+            success: true,
+            output: output.into(),
+            error: None,
+            data: None,
+            base64_image: Some((base64, mime)),
         }
     }
 
@@ -69,6 +86,7 @@ impl ToolResult {
             output: String::new(),
             error: Some(error_str),
             data: None,
+            base64_image: None,
         }
     }
 
@@ -165,6 +183,7 @@ impl ToolRegistry {
         registry.register(Arc::new(image_download::BatchDownloadImageTool));
         registry.register(Arc::new(image_inspect::InspectImageTool));
         registry.register(Arc::new(image_gen::GenerateImageTool));
+        registry.register(Arc::new(browser::BrowserInteractTool));
         registry.register(Arc::new(skills::ListSkillsTool));
         registry.register(Arc::new(skills::ReadSkillTool));
 
@@ -183,6 +202,9 @@ impl ToolRegistry {
 
         // ── Shell command execution ──────────────────────────────────────
         registry.register(Arc::new(shell::ShellCommandTool));
+        
+        // ── Syntax checking ──────────────────────────────────────────────
+        registry.register(Arc::new(syntax_check::SyntaxCheckTool));
 
         // ── Git tools ────────────────────────────────────────────────────
         registry.register(Arc::new(git::GitStatusTool));

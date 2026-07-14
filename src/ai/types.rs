@@ -144,6 +144,11 @@ impl Message {
         }
     }
 
+    pub fn with_image(mut self, data: String, mime_type: String) -> Self {
+        self.content.push(ContentPart::Image { data, mime_type });
+        self
+    }
+
     /// Extract all text content, concatenated.
     pub fn text(&self) -> String {
         self.content
@@ -154,6 +159,11 @@ impl Message {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// Strips all image content from this message to save payload size on subsequent requests.
+    pub fn strip_images(&mut self) {
+        self.content.retain(|p| !matches!(p, ContentPart::Image { .. }));
     }
 }
 
