@@ -19,10 +19,10 @@ pub fn encode_image_file(path: &std::path::Path) -> Result<(String, String)> {
         _ => "image/jpeg",
     };
 
-    // If the image is large (> 300 KB) and not a gif (which loses animation on resize), resize/compress it
-    if bytes.len() > 300_000 && mime != "image/gif" {
+    // If the image is extremely large (> 4 MB) and not a gif (which loses animation on resize), resize/compress it
+    if bytes.len() > 4_000_000 && mime != "image/gif" {
         if let Ok(img) = image::load_from_memory(&bytes) {
-            let max_dim = 1024;
+            let max_dim = 2048;
             let w = img.width();
             let h = img.height();
 

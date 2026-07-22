@@ -22,7 +22,7 @@ pub mod shell;
 pub mod skills;
 pub mod web_fetch;
 pub mod web_search;
-pub mod syntax_check;
+
 pub mod browser;
 
 use async_trait::async_trait;
@@ -203,8 +203,7 @@ impl ToolRegistry {
         // ── Shell command execution ──────────────────────────────────────
         registry.register(Arc::new(shell::ShellCommandTool));
         
-        // ── Syntax checking ──────────────────────────────────────────────
-        registry.register(Arc::new(syntax_check::SyntaxCheckTool));
+
 
         // ── Git tools ────────────────────────────────────────────────────
         registry.register(Arc::new(git::GitStatusTool));

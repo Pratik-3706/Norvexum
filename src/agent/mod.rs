@@ -184,8 +184,25 @@ impl Agent {
         user_input: &str,
         cancel_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
     ) -> Result<()> {
-        if user_input.starts_with('/') {
-            let parts: Vec<&str> = user_input.split_whitespace().collect();
+        let mut actual_user_input = user_input;
+        let mut explicit_images = Vec::new();
+
+        if actual_user_input.starts_with("/image_prompt |") {
+            let mut parts = actual_user_input.splitn(3, '|');
+            parts.next(); // skip "/image_prompt "
+            if let Some(img_path) = parts.next() {
+                if let Some(prompt) = parts.next() {
+                    let path = std::path::PathBuf::from(img_path);
+                    if path.exists() {
+                        explicit_images.push(path);
+                    }
+                    actual_user_input = prompt.trim();
+                }
+            }
+        }
+
+        if actual_user_input.starts_with('/') {
+            let parts: Vec<&str> = actual_user_input.split_whitespace().collect();
             if !parts.is_empty() {
                 match parts[0] {
                     "/help" => {
@@ -666,7 +683,12 @@ impl Agent {
 
         let mut user_msg = None;
 
-        let detected_images = detect_images(user_input, &self.settings.project_root);
+        let mut detected_images = detect_images(actual_user_input, &self.settings.project_root);
+        for img in explicit_images {
+            if !detected_images.contains(&img) {
+                detected_images.push(img);
+            }
+        }
         if !detected_images.is_empty() {
             let mut valid_images = Vec::new();
             for img_path in detected_images {
@@ -704,7 +726,7 @@ impl Agent {
                     }
                     
                     if !encoded_images.is_empty() {
-                        user_msg = Some(Message::user_with_images(user_input, encoded_images));
+                        user_msg = Some(Message::user_with_images(actual_user_input, encoded_images));
                     }
                 } else if let Some(gemini_key) = &self.settings.google_ai_api_key {
                     let _ = self.event_tx.send(AgentEvent::Status(format!(
@@ -769,7 +791,7 @@ impl Agent {
                             if !description.trim().is_empty() {
                                 let enriched_prompt = format!(
                                     "[Image content described by Gemini Fallback]:\n{}\n\n{}",
-                                    description, user_input
+                                    description, actual_user_input
                                 );
                                 user_msg = Some(crate::ai::types::Message::user(enriched_prompt));
                             }
@@ -799,11 +821,10 @@ impl Agent {
                     
                     if !all_ocr_texts.is_empty() {
                         let enriched_prompt = format!(
-                            "[Image content detected via OCR]:\n{}\n\n{}",
-                            all_ocr_texts.join("\n\n"),
-                            user_input
+                            "[Images analyzed via OCR]:\n{}\n\n{}",
+                            all_ocr_texts.join("\n\n"), actual_user_input
                         );
-                        user_msg = Some(Message::user(enriched_prompt));
+                        user_msg = Some(crate::ai::types::Message::user(enriched_prompt));
                     }
                 } else {
                     let _ = self.event_tx.send(AgentEvent::Status(
@@ -813,14 +834,14 @@ impl Agent {
             }
         }
 
-        let final_msg = user_msg.unwrap_or_else(|| Message::user(user_input));
+        let final_msg = user_msg.unwrap_or_else(|| Message::user(actual_user_input.to_string()));
 
         let root_str = self.settings.project_root.to_string_lossy().to_string();
         let _ = self.event_tx.send(AgentEvent::Status(format!("📂 Agent root: {root_str}")));
 
         // Check if user input triggers a skill template
         if let Some(skill) =
-            crate::skills::find_matching_skill(user_input, &self.settings.project_root)
+            crate::skills::find_matching_skill(actual_user_input, &self.settings.project_root)
         {
             let _ = self
                 .event_tx

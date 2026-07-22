@@ -32,6 +32,7 @@ pub struct GuiMessage {
     pub thinking: Option<String>,
     pub is_thinking_done: bool,
     pub tool_logs: Vec<String>,
+    pub attached_image: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -524,6 +525,7 @@ impl GuiApp {
                 thinking: None,
                 is_thinking_done: false,
                 tool_logs: Vec::new(),
+                attached_image: None,
             });
             app.is_processing = true;
         }
@@ -1058,6 +1060,7 @@ impl GuiApp {
                 thinking: None,
                 is_thinking_done: false,
                 tool_logs: Vec::new(),
+                attached_image: None,
             });
         }
         self.messages.last_mut().unwrap()
@@ -1072,6 +1075,7 @@ impl GuiApp {
                     thinking: None,
                     is_thinking_done: false,
                     tool_logs: Vec::new(),
+                    attached_image: None,
                 });
             }
         }
@@ -1447,6 +1451,7 @@ impl GuiApp {
         let mut raw_prompt = self.input_text.trim().to_string();
         let display_prompt = raw_prompt.clone();
 
+        let mut final_attached_image = None;
         if let Some(ref file_path) = self.attached_image.take() {
             let filename = file_path
                 .file_name()
@@ -1455,11 +1460,11 @@ impl GuiApp {
             let dest_path = self.settings.project_root.join(filename);
             if std::fs::copy(file_path, &dest_path).is_ok() {
                 raw_prompt = format!(
-                    "{} (Uploaded/copied file {} to sandbox workspace path: {})",
-                    raw_prompt,
-                    filename,
-                    dest_path.to_string_lossy()
+                    "/image_prompt |{}| {}",
+                    dest_path.to_string_lossy(),
+                    raw_prompt
                 );
+                final_attached_image = Some(dest_path.clone());
                 self.trigger_load_files();
             } else {
                 raw_prompt = format!("{} ({})", raw_prompt, file_path.to_string_lossy());
@@ -1472,6 +1477,7 @@ impl GuiApp {
             thinking: None,
             is_thinking_done: false,
             tool_logs: Vec::new(),
+            attached_image: final_attached_image,
         });
 
         // If this is the start of a conversation, clear session files
@@ -2318,6 +2324,7 @@ impl eframe::App for GuiApp {
                                 thinking: None,
                                 is_thinking_done: true,
                                 tool_logs: Vec::new(),
+                                attached_image: None,
                             })
                         }).collect();
                         self.session_written_files.clear();
@@ -3606,6 +3613,14 @@ impl eframe::App for GuiApp {
                                              let msg_response = ui
                                                  .with_layout(egui::Layout::top_down(alignment), |ui| {
                                                      if is_user {
+                                                         if let Some(ref img_path) = msg.attached_image {
+                                                             let filename = img_path.file_name().and_then(|n| n.to_str()).unwrap_or("image.png");
+                                                             ui.label(
+                                                                 egui::RichText::new(format!("📎 {}", filename))
+                                                                     .color(egui::Color32::from_rgb(148, 163, 184))
+                                                                     .small(),
+                                                             );
+                                                         }
                                                          // User speech bubble: clean slate background
                                                          let max_bubble_width =
                                                              (available_chat_width * 0.72)
