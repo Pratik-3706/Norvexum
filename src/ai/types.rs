@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // AI Types — Shared data structures for messages, tool calls, streaming
 // ===========================================================================
 
@@ -163,7 +163,8 @@ impl Message {
 
     /// Strips all image content from this message to save payload size on subsequent requests.
     pub fn strip_images(&mut self) {
-        self.content.retain(|p| !matches!(p, ContentPart::Image { .. }));
+        self.content
+            .retain(|p| !matches!(p, ContentPart::Image { .. }));
     }
 }
 

@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Provider Registry — AI provider catalog with model capabilities
 // ===========================================================================
 
@@ -30,8 +30,10 @@ pub struct ModelInfo {
     pub context_window: usize,
     pub cost_per_1k_input: f64,
     pub cost_per_1k_output: f64,
-    #[serde(default)] pub adaptive_thinking: bool,
-    #[serde(default)] pub effort_levels: Vec<String>,
+    #[serde(default)]
+    pub adaptive_thinking: bool,
+    #[serde(default)]
+    pub effort_levels: Vec<String>,
 }
 
 /// Describes an AI provider endpoint.
@@ -56,7 +58,8 @@ pub enum ApiStyle {
     Anthropic,
 }
 
-static DYNAMIC_REGISTRY: std::sync::RwLock<Option<Vec<ProviderInfo>>> = std::sync::RwLock::new(None);
+static DYNAMIC_REGISTRY: std::sync::RwLock<Option<Vec<ProviderInfo>>> =
+    std::sync::RwLock::new(None);
 
 pub fn update_dynamic_registry(registry: Vec<ProviderInfo>) {
     if let Ok(mut guard) = DYNAMIC_REGISTRY.write() {
@@ -359,42 +362,44 @@ pub fn build_static_registry() -> Vec<ProviderInfo> {
             api_style: ApiStyle::OpenAiCompat,
             env_key: "OLLAMA_BASE_URL".into(),
             models: if let Ok(cache) = crate::ai::ollama::DISCOVERED_OLLAMA_MODELS.lock() {
-                cache.clone().unwrap_or_else(|| vec![
-                    ModelInfo {
-                        id: "llama3".into(),
-                        family: "llama".into(),
-                        vision: Vision::No,
-                    adaptive_thinking: false,
-                    effort_levels: vec![],
-                        image_gen: false,
-                        tool_calling: true,
-                        streaming: true,
-                        context_window: 8192,
-                        cost_per_1k_input: 0.0,
-                        cost_per_1k_output: 0.0,
-                    },
-                    ModelInfo {
-                        id: "mistral".into(),
-                        family: "mistral".into(),
-                        vision: Vision::No,
-                    adaptive_thinking: false,
-                    effort_levels: vec![],
-                        image_gen: false,
-                        tool_calling: true,
-                        streaming: true,
-                        context_window: 32768,
-                        cost_per_1k_input: 0.0,
-                        cost_per_1k_output: 0.0,
-                    },
-                ])
+                cache.clone().unwrap_or_else(|| {
+                    vec![
+                        ModelInfo {
+                            id: "llama3".into(),
+                            family: "llama".into(),
+                            vision: Vision::No,
+                            adaptive_thinking: false,
+                            effort_levels: vec![],
+                            image_gen: false,
+                            tool_calling: true,
+                            streaming: true,
+                            context_window: 8192,
+                            cost_per_1k_input: 0.0,
+                            cost_per_1k_output: 0.0,
+                        },
+                        ModelInfo {
+                            id: "mistral".into(),
+                            family: "mistral".into(),
+                            vision: Vision::No,
+                            adaptive_thinking: false,
+                            effort_levels: vec![],
+                            image_gen: false,
+                            tool_calling: true,
+                            streaming: true,
+                            context_window: 32768,
+                            cost_per_1k_input: 0.0,
+                            cost_per_1k_output: 0.0,
+                        },
+                    ]
+                })
             } else {
                 vec![
                     ModelInfo {
                         id: "llama3".into(),
                         family: "llama".into(),
                         vision: Vision::No,
-                    adaptive_thinking: false,
-                    effort_levels: vec![],
+                        adaptive_thinking: false,
+                        effort_levels: vec![],
                         image_gen: false,
                         tool_calling: true,
                         streaming: true,
@@ -406,8 +411,8 @@ pub fn build_static_registry() -> Vec<ProviderInfo> {
                         id: "mistral".into(),
                         family: "mistral".into(),
                         vision: Vision::No,
-                    adaptive_thinking: false,
-                    effort_levels: vec![],
+                        adaptive_thinking: false,
+                        effort_levels: vec![],
                         image_gen: false,
                         tool_calling: true,
                         streaming: true,
@@ -444,8 +449,8 @@ pub fn build_registry_with_settings(settings: &crate::config::Settings) -> Vec<P
                         id: model_id.to_string(),
                         family: family.to_string(),
                         vision: Vision::Yes,
-                    adaptive_thinking: false,
-                    effort_levels: vec![],
+                        adaptive_thinking: false,
+                        effort_levels: vec![],
                         image_gen: false,
                         tool_calling: true,
                         streaming: true,

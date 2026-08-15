@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Commands: init — Initializes Norvexum project directory and templates
 // ===========================================================================
 
@@ -30,7 +30,9 @@ pub async fn run(settings: &Settings) -> Result<()> {
 
     // I no longer save settings.json here because it is global.
     // Instead I just ensure the global config directory exists.
-    let global_config_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| project_dir.join(NORVEXUM_DIR));
+    let global_config_dir = dirs::home_dir()
+        .map(|h| h.join(".norvexum"))
+        .unwrap_or_else(|| project_dir.join(NORVEXUM_DIR));
     let _ = fs::create_dir_all(&global_config_dir);
 
     // Generate initial project context

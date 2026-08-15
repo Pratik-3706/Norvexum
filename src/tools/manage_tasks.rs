@@ -46,7 +46,10 @@ impl Tool for ManageTasksTool {
 
         // Find task.md in the workspace
         let mut task_path = None;
-        for entry in walkdir::WalkDir::new(&ctx.cwd).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(&ctx.cwd)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if entry.file_name() == "task.md" {
                 task_path = Some(entry.path().to_path_buf());
                 break;
@@ -60,12 +63,15 @@ impl Tool for ManageTasksTool {
                     // Create it in the root if it doesn't exist
                     ctx.cwd.join("task.md")
                 } else {
-                    return ToolResult::err("No task.md found in the workspace. Create one first or use 'add' to create it.");
+                    return ToolResult::err(
+                        "No task.md found in the workspace. Create one first or use 'add' to create it.",
+                    );
                 }
             }
         };
 
-        let mut content = std::fs::read_to_string(&path).unwrap_or_else(|_| "# Tasks\n\n".to_string());
+        let mut content =
+            std::fs::read_to_string(&path).unwrap_or_else(|_| "# Tasks\n\n".to_string());
 
         if action == "view" {
             return ToolResult::ok(content);
@@ -73,7 +79,9 @@ impl Tool for ManageTasksTool {
 
         let task_text = match args.get("task_text").and_then(|v| v.as_str()) {
             Some(t) => t,
-            None => return ToolResult::err("Missing 'task_text' argument required for this action."),
+            None => {
+                return ToolResult::err("Missing 'task_text' argument required for this action.");
+            }
         };
 
         match action {

@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Commands: chat — Starts interactive agent session in TUI, Headless, or GUI mode
 // ===========================================================================
 
@@ -86,14 +86,23 @@ pub async fn run(mut settings: Settings, initial_msg: Option<String>) -> Result<
                     Ok(new_settings) => {
                         settings_local = new_settings;
                         if let Err(e) = agent.update_settings(settings_local.clone()) {
-                            let _ = agent_tx.send(AgentEvent::Status(format!("⚠️ Config update failed: {e}").into()));
+                            let _ = agent_tx.send(AgentEvent::Status(
+                                format!("⚠️ Config update failed: {e}").into(),
+                            ));
                         } else {
-                            let _ =
-                                agent_tx.send(AgentEvent::Status(format!("⚙️ Workspace root set to: {}", settings_local.project_root.display()).into()));
+                            let _ = agent_tx.send(AgentEvent::Status(
+                                format!(
+                                    "⚙️ Workspace root set to: {}",
+                                    settings_local.project_root.display()
+                                )
+                                .into(),
+                            ));
                         }
                     }
                     Err(e) => {
-                        let _ = agent_tx.send(AgentEvent::Status(format!("⚠️ Config parse error: {e}").into()));
+                        let _ = agent_tx.send(AgentEvent::Status(
+                            format!("⚠️ Config parse error: {e}").into(),
+                        ));
                     }
                 }
                 continue;

@@ -21,7 +21,7 @@ impl TempMemory {
 
     pub fn store(&mut self, key: String, value: String) -> Result<(), String> {
         let value_size = value.len();
-        
+
         // Check if value itself is too large
         if value_size > MAX_MEMORY_SIZE {
             return Err(format!("Value too large to store. Max size is 20MB."));
@@ -83,7 +83,10 @@ impl Tool for StoreInMemoryTool {
 
         let mut mem = ctx.temp_memory.write().await;
         match mem.store(key.clone(), value) {
-            Ok(_) => ToolResult::ok(format!("Successfully stored {} bytes under key '{}'. Current memory usage: {}/20MB.", mem.current_size, key, mem.current_size)),
+            Ok(_) => ToolResult::ok(format!(
+                "Successfully stored {} bytes under key '{}'. Current memory usage: {}/20MB.",
+                mem.current_size, key, mem.current_size
+            )),
             Err(e) => ToolResult::err(e),
         }
     }

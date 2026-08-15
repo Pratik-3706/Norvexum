@@ -1,12 +1,13 @@
 use async_trait::async_trait;
+use once_cell::sync::Lazy;
 use serde_json::json;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use once_cell::sync::Lazy;
 
 use super::{Tool, ToolContext, ToolResult};
 
-static BROWSER_SESSION: Lazy<Mutex<Option<(headless_chrome::Browser, Arc<headless_chrome::Tab>)>>> = Lazy::new(|| Mutex::new(None));
+static BROWSER_SESSION: Lazy<Mutex<Option<(headless_chrome::Browser, Arc<headless_chrome::Tab>)>>> =
+    Lazy::new(|| Mutex::new(None));
 
 pub struct BrowserInteractTool;
 
@@ -44,7 +45,7 @@ impl Tool for BrowserInteractTool {
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
         let action = args["action"].as_str().unwrap_or("screenshot").to_string();
-        
+
         let url = args["url"].as_str().unwrap_or("").to_string();
         let x = args["x"].as_f64().unwrap_or(0.0);
         let y = args["y"].as_f64().unwrap_or(0.0);
@@ -81,40 +82,45 @@ impl Tool for BrowserInteractTool {
             if session.is_none() {
                 let mut w = 1920;
                 let mut h = 1080;
-                if let Ok(data) = std::fs::read_to_string(project_dir.join(".norvexum/browser_size.json")) {
+                if let Ok(data) =
+                    std::fs::read_to_string(project_dir.join(".norvexum/browser_size.json"))
+                {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
                         w = val["width"].as_u64().unwrap_or(1920) as u32;
                         h = val["height"].as_u64().unwrap_or(1080) as u32;
                     }
                 }
-                
+
                 let browser = Browser::new(LaunchOptions {
                     headless: false,
                     window_size: Some((w, h)),
                     idle_browser_timeout: std::time::Duration::from_secs(3600),
                     ..Default::default()
-                }).map_err(|e| format!("Failed to launch browser: {}", e))?;
-                
-                let tab = browser.new_tab().map_err(|e| format!("Failed to open tab: {}", e))?;
+                })
+                .map_err(|e| format!("Failed to launch browser: {}", e))?;
+
+                let tab = browser
+                    .new_tab()
+                    .map_err(|e| format!("Failed to open tab: {}", e))?;
                 *session = Some((browser, tab));
             }
 
             let tab = session.as_ref().unwrap().1.clone();
-
-
 
             match action_inner.as_str() {
                 "navigate" => {
                     if url.is_empty() {
                         return Err("URL is required for navigate action".to_string());
                     }
-                    tab.navigate_to(&url).map_err(|e| format!("Failed to navigate: {}", e))?;
-                    tab.wait_until_navigated().map_err(|e| format!("Failed to wait for navigation: {}", e))?;
+                    tab.navigate_to(&url)
+                        .map_err(|e| format!("Failed to navigate: {}", e))?;
+                    tab.wait_until_navigated()
+                        .map_err(|e| format!("Failed to wait for navigation: {}", e))?;
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
                 "click" => {
                     use headless_chrome::protocol::cdp::Input;
-                    
+
                     // First move the mouse to the location
                     tab.call_method(Input::DispatchMouseEvent {
                         Type: Input::DispatchMouseEventTypeOption::MouseMoved,
@@ -133,10 +139,11 @@ impl Tool for BrowserInteractTool {
                         delta_x: None,
                         delta_y: None,
                         pointer_Type: None,
-                    }).map_err(|e| format!("Failed to dispatch mouse moved: {}", e))?;
-                    
+                    })
+                    .map_err(|e| format!("Failed to dispatch mouse moved: {}", e))?;
+
                     std::thread::sleep(std::time::Duration::from_millis(50));
-                    
+
                     tab.call_method(Input::DispatchMouseEvent {
                         Type: Input::DispatchMouseEventTypeOption::MousePressed,
                         x,
@@ -154,10 +161,11 @@ impl Tool for BrowserInteractTool {
                         delta_x: None,
                         delta_y: None,
                         pointer_Type: None,
-                    }).map_err(|e| format!("Failed to dispatch mouse down: {}", e))?;
-                    
+                    })
+                    .map_err(|e| format!("Failed to dispatch mouse down: {}", e))?;
+
                     std::thread::sleep(std::time::Duration::from_millis(50));
-                    
+
                     tab.call_method(Input::DispatchMouseEvent {
                         Type: Input::DispatchMouseEventTypeOption::MouseReleased,
                         x,
@@ -175,24 +183,28 @@ impl Tool for BrowserInteractTool {
                         delta_x: None,
                         delta_y: None,
                         pointer_Type: None,
-                    }).map_err(|e| format!("Failed to dispatch mouse up: {}", e))?;
+                    })
+                    .map_err(|e| format!("Failed to dispatch mouse up: {}", e))?;
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
                 "type" => {
                     for c in text.chars() {
-                        tab.type_str(&c.to_string()).map_err(|e| format!("Failed to type: {}", e))?;
+                        tab.type_str(&c.to_string())
+                            .map_err(|e| format!("Failed to type: {}", e))?;
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
                 "key" => {
-                    tab.press_key(&text).map_err(|e| format!("Failed to press key {}: {}", text, e))?;
+                    tab.press_key(&text)
+                        .map_err(|e| format!("Failed to press key {}: {}", text, e))?;
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
                 "scroll" => {
                     let script = format!("window.scrollBy({}, {})", scroll_x, scroll_y);
-                    tab.evaluate(&script, false).map_err(|e| format!("Failed to scroll: {}", e))?;
+                    tab.evaluate(&script, false)
+                        .map_err(|e| format!("Failed to scroll: {}", e))?;
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
                 "screenshot" => {
@@ -232,33 +244,43 @@ impl Tool for BrowserInteractTool {
             let _ = tab.evaluate(&cursor_script, false);
             std::thread::sleep(std::time::Duration::from_millis(100)); // wait for cursor to render
 
-            if let Ok(ret) = tab.evaluate("JSON.stringify({width: window.outerWidth, height: window.outerHeight})", false) {
+            if let Ok(ret) = tab.evaluate(
+                "JSON.stringify({width: window.outerWidth, height: window.outerHeight})",
+                false,
+            ) {
                 if let Some(s) = ret.value.and_then(|v| v.as_str().map(|s| s.to_string())) {
                     let _ = std::fs::write(project_dir.join(".norvexum/browser_size.json"), s);
                 }
             }
 
-            let img_data = tab.capture_screenshot(
-                headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Jpeg,
-                None,
-                None, // Capture viewport only, not full height
-                true,
-            ).map_err(|e| format!("Failed to capture screenshot: {}", e))?;
-            
-            std::fs::write(&path, &img_data).map_err(|e| format!("Failed to save screenshot: {}", e))?;
-            
+            let img_data = tab
+                .capture_screenshot(
+                    headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Jpeg,
+                    None,
+                    None, // Capture viewport only, not full height
+                    true,
+                )
+                .map_err(|e| format!("Failed to capture screenshot: {}", e))?;
+
+            std::fs::write(&path, &img_data)
+                .map_err(|e| format!("Failed to save screenshot: {}", e))?;
+
             use base64::{Engine as _, engine::general_purpose::STANDARD};
             let base64_str = STANDARD.encode(&img_data);
-            
+
             Ok(base64_str)
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(base64_str)) => {
                 if action == "close" {
                     ToolResult::ok("✅ Browser session closed.")
                 } else {
-                    let msg = format!("✅ Action '{}' completed. The current browser viewport is attached.", action);
+                    let msg = format!(
+                        "✅ Action '{}' completed. The current browser viewport is attached.",
+                        action
+                    );
                     ToolResult::ok_with_image(msg, base64_str, "image/jpeg".to_string())
                 }
             }

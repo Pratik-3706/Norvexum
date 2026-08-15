@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Ollama — Local model support via Ollama's OpenAI-compatible API
 //
 // Auto-discovers locally available models by querying the Ollama API.
@@ -12,7 +12,8 @@ use crate::config::providers::{ApiStyle, ModelInfo, ProviderInfo};
 /// Default Ollama API base URL.
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
-pub static DISCOVERED_OLLAMA_MODELS: std::sync::Mutex<Option<Vec<ModelInfo>>> = std::sync::Mutex::new(None);
+pub static DISCOVERED_OLLAMA_MODELS: std::sync::Mutex<Option<Vec<ModelInfo>>> =
+    std::sync::Mutex::new(None);
 
 #[derive(Debug, Deserialize)]
 struct TagsResponse {
@@ -70,12 +71,19 @@ pub async fn discover_models(base_url: &str) -> Option<Vec<ModelInfo>> {
             .send()
             .await
         {
-            resp.json().await.unwrap_or(ShowResponse { capabilities: vec![] })
+            resp.json().await.unwrap_or(ShowResponse {
+                capabilities: vec![],
+            })
         } else {
-            ShowResponse { capabilities: vec![] }
+            ShowResponse {
+                capabilities: vec![],
+            }
         };
 
-        let is_vision = show.capabilities.iter().any(|c| c.to_lowercase() == "vision")
+        let is_vision = show
+            .capabilities
+            .iter()
+            .any(|c| c.to_lowercase() == "vision")
             || model.name.contains("llava")
             || model.name.contains("vision")
             || model.name.contains("bakllava")
@@ -92,9 +100,13 @@ pub async fn discover_models(base_url: &str) -> Option<Vec<ModelInfo>> {
         model_infos.push(ModelInfo {
             id: model.name.clone(),
             family,
-            vision: if is_vision { crate::config::providers::Vision::Yes } else { crate::config::providers::Vision::No },
-                adaptive_thinking: false,
-                effort_levels: vec![],
+            vision: if is_vision {
+                crate::config::providers::Vision::Yes
+            } else {
+                crate::config::providers::Vision::No
+            },
+            adaptive_thinking: false,
+            effort_levels: vec![],
             image_gen: false,
             tool_calling: true,
             streaming: true,

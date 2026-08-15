@@ -168,9 +168,7 @@ impl Tool for GitLogTool {
 
 async fn run_git_command(args: &[&str], ctx: &ToolContext) -> ToolResult {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args)
-       .current_dir(&ctx.cwd)
-       .kill_on_drop(true);
+    cmd.args(args).current_dir(&ctx.cwd).kill_on_drop(true);
 
     #[cfg(windows)]
     {

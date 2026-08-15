@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
 
     // Build settings from env + config file + CLI overrides
     let mut settings = config::Settings::load().unwrap_or_default();
-    
+
     // Spawn background model fetcher
     crate::config::model_fetch::spawn_background_fetch(&settings);
 

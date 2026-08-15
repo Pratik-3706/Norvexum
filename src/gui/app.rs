@@ -288,12 +288,26 @@ fn attachment_button(ui: &mut egui::Ui, dark_mode: bool) -> egui::Response {
     let angle = -0.65_f32;
     let (sin, cos) = angle.sin_cos();
     let scale = 0.8;
-    let transform = |x: f32, y: f32| center + egui::vec2((x * cos - y * sin) * scale, (x * sin + y * cos) * scale);
+    let transform = |x: f32, y: f32| {
+        center + egui::vec2((x * cos - y * sin) * scale, (x * sin + y * cos) * scale)
+    };
     let points = [
-        (-2.0, -8.0), (3.0, -8.0), (6.0, -5.0), (6.0, 4.0),
-        (3.0, 8.0), (-1.0, 8.0), (-5.0, 4.0), (-5.0, -3.0),
-        (-2.0, -6.0), (2.0, -6.0), (4.0, -3.0), (4.0, 3.0),
-        (2.0, 5.0), (0.0, 5.0), (-2.0, 3.0), (-2.0, -2.0),
+        (-2.0, -8.0),
+        (3.0, -8.0),
+        (6.0, -5.0),
+        (6.0, 4.0),
+        (3.0, 8.0),
+        (-1.0, 8.0),
+        (-5.0, 4.0),
+        (-5.0, -3.0),
+        (-2.0, -6.0),
+        (2.0, -6.0),
+        (4.0, -3.0),
+        (4.0, 3.0),
+        (2.0, 5.0),
+        (0.0, 5.0),
+        (-2.0, 3.0),
+        (-2.0, -2.0),
     ]
     .into_iter()
     .map(|(x, y)| transform(x, y))
@@ -320,13 +334,13 @@ fn set_secure_key(name: &str, val: &str) {
     if let Ok(entry) = keyring::Entry::new("norvexum", name) {
         let _ = entry.set_password(val);
     }
-    
+
     // Also explicitly save to ~/.norvexum/.env as a fallback because keyring can fail silently on some Windows setups
     if let Some(home) = dirs::home_dir() {
         let norv_dir = home.join(".norvexum");
         let _ = std::fs::create_dir_all(&norv_dir);
         let env_path = norv_dir.join(".env");
-        
+
         let env_key = name.to_uppercase();
         let mut lines = Vec::new();
         if env_path.exists() {
@@ -334,10 +348,10 @@ fn set_secure_key(name: &str, val: &str) {
                 lines = content.lines().map(|s| s.to_string()).collect();
             }
         }
-        
+
         lines.retain(|l| !l.starts_with(&format!("{}=", env_key)));
         lines.push(format!("{}={}", env_key, val));
-        
+
         let _ = std::fs::write(&env_path, lines.join("\n"));
     }
 }
@@ -346,13 +360,14 @@ fn delete_secure_key(name: &str) {
     if let Ok(entry) = keyring::Entry::new("norvexum", name) {
         let _ = entry.delete_password();
     }
-    
+
     if let Some(home) = dirs::home_dir() {
         let env_path = home.join(".norvexum").join(".env");
         if env_path.exists() {
             let env_key = name.to_uppercase();
             if let Ok(content) = std::fs::read_to_string(&env_path) {
-                let lines: Vec<String> = content.lines()
+                let lines: Vec<String> = content
+                    .lines()
                     .filter(|l| !l.starts_with(&format!("{}=", env_key)))
                     .map(|s| s.to_string())
                     .collect();
@@ -574,11 +589,17 @@ impl GuiApp {
 
         // Scan for local Ollama models in background on startup
         {
-            let ollama_url = app.settings.ollama_base_url.clone()
+            let ollama_url = app
+                .settings
+                .ollama_base_url
+                .clone()
                 .unwrap_or_else(|| crate::ai::ollama::DEFAULT_OLLAMA_URL.to_string());
             let ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     rt.block_on(async {
                         let _ = crate::ai::ollama::discover_models(&ollama_url).await;
                         ctx.request_repaint();
@@ -750,13 +771,21 @@ impl GuiApp {
         let current_provider = self.settings.active_provider.clone();
         let current_model = self.settings.active_model.clone();
 
-        if (last_provider == "ollama" && current_provider != "ollama") || (last_provider == "ollama" && last_model != current_model) {
-            let ollama_url = self.settings.ollama_base_url.clone()
+        if (last_provider == "ollama" && current_provider != "ollama")
+            || (last_provider == "ollama" && last_model != current_model)
+        {
+            let ollama_url = self
+                .settings
+                .ollama_base_url
+                .clone()
                 .unwrap_or_else(|| crate::ai::ollama::DEFAULT_OLLAMA_URL.to_string());
             let client = reqwest::Client::new();
             let unload_url = format!("{}/api/generate", ollama_url.trim_end_matches('/'));
             std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     let _ = rt.block_on(async {
                         let payload = serde_json::json!({
                             "model": last_model,
@@ -771,12 +800,18 @@ impl GuiApp {
         self.last_active_provider = current_provider;
         self.last_active_model = current_model;
         // Sync local Ollama models in background in case the endpoint URL changed
-        let ollama_url = self.settings.ollama_base_url.clone()
+        let ollama_url = self
+            .settings
+            .ollama_base_url
+            .clone()
             .unwrap_or_else(|| crate::ai::ollama::DEFAULT_OLLAMA_URL.to_string());
         if let Some(ref ctx) = self.ctx {
             let ctx_clone = ctx.clone();
             std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     rt.block_on(async {
                         let _ = crate::ai::ollama::discover_models(&ollama_url).await;
                         ctx_clone.request_repaint();
@@ -785,7 +820,10 @@ impl GuiApp {
             });
         } else {
             std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     rt.block_on(async {
                         let _ = crate::ai::ollama::discover_models(&ollama_url).await;
                     });
@@ -796,7 +834,9 @@ impl GuiApp {
     }
 
     fn save_capabilities_cache(&self) {
-        let cache_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| self.settings.project_root.join(crate::config::NORVEXUM_DIR));
+        let cache_dir = dirs::home_dir()
+            .map(|h| h.join(".norvexum"))
+            .unwrap_or_else(|| self.settings.project_root.join(crate::config::NORVEXUM_DIR));
         let _ = std::fs::create_dir_all(&cache_dir);
         let cache_path = cache_dir.join("capabilities_cache.json");
         if let Ok(content) = serde_json::to_string_pretty(&self.probed_capabilities) {
@@ -805,7 +845,9 @@ impl GuiApp {
     }
 
     fn load_capabilities_cache(&mut self) {
-        let cache_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| self.settings.project_root.join(crate::config::NORVEXUM_DIR));
+        let cache_dir = dirs::home_dir()
+            .map(|h| h.join(".norvexum"))
+            .unwrap_or_else(|| self.settings.project_root.join(crate::config::NORVEXUM_DIR));
         let cache_path = cache_dir.join("capabilities_cache.json");
         if cache_path.exists() {
             if let Ok(content) = std::fs::read_to_string(cache_path) {
@@ -846,13 +888,17 @@ impl GuiApp {
         let ctx_opt = self.ctx.clone();
 
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(r) => r,
                 Err(_) => return,
             };
 
             rt.block_on(async {
-                let reasoning_type = crate::ai::probe_model_reasoning(&settings, &provider, &model).await;
+                let reasoning_type =
+                    crate::ai::probe_model_reasoning(&settings, &provider, &model).await;
                 if let Some(ref tx) = tx {
                     let _ = tx.send(CapabilitiesUpdate {
                         provider,
@@ -872,7 +918,9 @@ impl GuiApp {
             while let Ok(update) = rx.try_recv() {
                 let key = format!("{}:{}", update.provider, update.model);
                 self.probed_capabilities.insert(key, update.reasoning_type);
-                if self.settings.active_provider == update.provider && self.settings.active_model == update.model {
+                if self.settings.active_provider == update.provider
+                    && self.settings.active_model == update.model
+                {
                     self.model_reasoning_type = update.reasoning_type;
                     self.settings.model_reasoning_type = update.reasoning_type;
                     self.probing_in_progress = false;
@@ -890,7 +938,10 @@ impl GuiApp {
         let norvexum_path = path_buf.join(".norvexum");
         if !norvexum_path.exists() {
             let path_clone = path_buf.clone();
-            if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 let mut temp_settings = Settings::default();
                 temp_settings.project_root = path_clone;
                 let _ = rt.block_on(crate::commands::init::run(&temp_settings));
@@ -953,7 +1004,10 @@ impl GuiApp {
     fn get_active_editing_range(&self) -> Option<(usize, usize)> {
         let name = self.current_tool_name.as_deref()?;
         let args = &self.current_tool_args;
-        if name == "replace_file_content" || name == "multi_replace_file_content" || name == "edit_file" {
+        if name == "replace_file_content"
+            || name == "multi_replace_file_content"
+            || name == "edit_file"
+        {
             let start_opt = extract_streaming_number(args, "StartLine");
             let end_opt = extract_streaming_number(args, "EndLine");
             if let (Some(start), Some(end)) = (start_opt, end_opt) {
@@ -1028,7 +1082,11 @@ impl GuiApp {
                     self.line_range_total_lines = lines.len();
                     if self.line_range_enabled {
                         let start = self.line_range_start.clamp(1, lines.len().max(1)) - 1;
-                        let end = self.line_range_end.clamp(1, lines.len().max(1)).max(self.line_range_start) - 1;
+                        let end = self
+                            .line_range_end
+                            .clamp(1, lines.len().max(1))
+                            .max(self.line_range_start)
+                            - 1;
                         let mut filtered_content = String::new();
                         for i in start..=end.min(lines.len() - 1) {
                             filtered_content.push_str(lines[i]);
@@ -1057,7 +1115,11 @@ impl GuiApp {
                 let original_content = std::fs::read_to_string(&path)?;
                 let original_lines: Vec<&str> = original_content.lines().collect();
                 let start = self.line_range_start.clamp(1, original_lines.len().max(1)) - 1;
-                let end = self.line_range_end.clamp(1, original_lines.len().max(1)).max(self.line_range_start) - 1;
+                let end = self
+                    .line_range_end
+                    .clamp(1, original_lines.len().max(1))
+                    .max(self.line_range_start)
+                    - 1;
 
                 let mut new_lines = Vec::new();
                 for i in 0..start {
@@ -1222,7 +1284,10 @@ impl GuiApp {
                             }
                         }
                         AgentEvent::ToolResult {
-                            id, name, result, success,
+                            id,
+                            name,
+                            result,
+                            success,
                         } => {
                             let args_summary = if Some(&id) == self.current_tool_id.as_ref() {
                                 format_tool_args_summary(&name, &self.current_tool_args)
@@ -1246,14 +1311,27 @@ impl GuiApp {
                             };
 
                             // Capture terminal entry for run_command/shell
-                            if name == "run_command" || name == "shell" || name == "shell_command" || name == "execute" {
+                            if name == "run_command"
+                                || name == "shell"
+                                || name == "shell_command"
+                                || name == "execute"
+                            {
                                 let cmd = if Some(&id) == self.current_tool_id.as_ref() {
-                                    let mut c = extract_streaming_content(&self.current_tool_args, "command");
+                                    let mut c = extract_streaming_content(
+                                        &self.current_tool_args,
+                                        "command",
+                                    );
                                     if c.is_empty() {
-                                        c = extract_streaming_content(&self.current_tool_args, "CommandLine");
+                                        c = extract_streaming_content(
+                                            &self.current_tool_args,
+                                            "CommandLine",
+                                        );
                                     }
                                     if c.is_empty() {
-                                        c = extract_streaming_content(&self.current_tool_args, "cmd");
+                                        c = extract_streaming_content(
+                                            &self.current_tool_args,
+                                            "cmd",
+                                        );
                                     }
                                     c
                                 } else {
@@ -1316,17 +1394,22 @@ impl GuiApp {
                             // streaming from TargetContent/ReplacementContent) because they are
                             // more accurate — git diff runs AFTER the write, so for untracked
                             // files it can never see deleted lines.
-                            let (added, deleted) = if let Some((ref live_file, live_add, live_del)) =
-                                self.current_writing_file
-                            {
-                                if live_file == &relative_path && (live_add > 0 || live_del > 0) {
-                                    (live_add as i32, live_del as i32)
+                            let (added, deleted) =
+                                if let Some((ref live_file, live_add, live_del)) =
+                                    self.current_writing_file
+                                {
+                                    if live_file == &relative_path && (live_add > 0 || live_del > 0)
+                                    {
+                                        (live_add as i32, live_del as i32)
+                                    } else {
+                                        get_file_diff_stats(
+                                            &self.settings.project_root,
+                                            &relative_path,
+                                        )
+                                    }
                                 } else {
                                     get_file_diff_stats(&self.settings.project_root, &relative_path)
-                                }
-                            } else {
-                                get_file_diff_stats(&self.settings.project_root, &relative_path)
-                            };
+                                };
                             let icon = get_file_icon(&relative_path);
 
                             let msg = self.get_or_create_assistant_message();
@@ -1365,33 +1448,33 @@ impl GuiApp {
                                 self.inspect_file(&selected);
                             }
                         }
-                         AgentEvent::Done { .. } => {
-                             self.is_processing = false;
-                             self.status_text = "Idle".to_string();
-                             self.current_writing_status = None;
-                             self.current_writing_file = None;
-                             self.thinking_start_time = None;
-                             self.last_scrolled_range = None;
-                             self.history_sessions =
-                                 crate::agent::session::Session::list(&self.settings.project_root);
-                         }
-                         AgentEvent::Error(err) => {
-                             self.is_processing = false;
-                             self.status_text = "Error".to_string();
-                             self.thinking_start_time = None;
-                             self.last_scrolled_range = None;
+                        AgentEvent::Done { .. } => {
+                            self.is_processing = false;
+                            self.status_text = "Idle".to_string();
+                            self.current_writing_status = None;
+                            self.current_writing_file = None;
+                            self.thinking_start_time = None;
+                            self.last_scrolled_range = None;
+                            self.history_sessions =
+                                crate::agent::session::Session::list(&self.settings.project_root);
+                        }
+                        AgentEvent::Error(err) => {
+                            self.is_processing = false;
+                            self.status_text = "Error".to_string();
+                            self.thinking_start_time = None;
+                            self.last_scrolled_range = None;
 
-                             let display_err = if err.contains("error decoding response body") {
-                                 "API Provider connection dropped (error decoding response body). Please check your internet connection or try again.".to_string()
-                             } else {
-                                 err
-                             };
+                            let display_err = if err.contains("error decoding response body") {
+                                "API Provider connection dropped (error decoding response body). Please check your internet connection or try again.".to_string()
+                            } else {
+                                err
+                            };
 
-                             let msg = self.get_or_create_assistant_message();
-                             msg.tool_logs.push(format!("⚠️ Error: {display_err}"));
-                             msg.content
-                                 .push_str(&format!("\n\n⚠️ **Execution Error:** {display_err}"));
-                         }
+                            let msg = self.get_or_create_assistant_message();
+                            msg.tool_logs.push(format!("⚠️ Error: {display_err}"));
+                            msg.content
+                                .push_str(&format!("\n\n⚠️ **Execution Error:** {display_err}"));
+                        }
                         AgentEvent::ApprovalRequest {
                             id,
                             tool_name,
@@ -1642,9 +1725,7 @@ impl GuiApp {
                                         }
                                         changed_tools = true;
                                     }
-                                    ui.label(
-                                        egui::RichText::new(tool_label).color(label_color),
-                                    );
+                                    ui.label(egui::RichText::new(tool_label).color(label_color));
                                 });
                             }
                         });
@@ -1671,7 +1752,13 @@ impl GuiApp {
                             egui::ComboBox::from_id_salt("custom_model_provider_select")
                                 .selected_text(&self.new_model_provider)
                                 .show_ui(ui, |ui| {
-                                    for prov in &["openai", "google_direct", "anthropic", "aicredits", "ollama"] {
+                                    for prov in &[
+                                        "openai",
+                                        "google_direct",
+                                        "anthropic",
+                                        "aicredits",
+                                        "ollama",
+                                    ] {
                                         ui.selectable_value(
                                             &mut self.new_model_provider,
                                             prov.to_string(),
@@ -1685,8 +1772,14 @@ impl GuiApp {
                         ui.horizontal(|ui| {
                             ui.label("Model ID:  ");
                             ui.text_edit_singleline(&mut self.new_model_id);
-                            if ui.button("➕ Add Model").clicked() && !self.new_model_id.trim().is_empty() {
-                                let full_model_entry = format!("{}:{}", self.new_model_provider, self.new_model_id.trim());
+                            if ui.button("➕ Add Model").clicked()
+                                && !self.new_model_id.trim().is_empty()
+                            {
+                                let full_model_entry = format!(
+                                    "{}:{}",
+                                    self.new_model_provider,
+                                    self.new_model_id.trim()
+                                );
                                 if !self.settings.custom_models.contains(&full_model_entry) {
                                     self.settings.custom_models.push(full_model_entry);
                                     self.new_model_id.clear();
@@ -1697,7 +1790,11 @@ impl GuiApp {
 
                         if !self.settings.custom_models.is_empty() {
                             ui.add_space(6.0);
-                            ui.label(egui::RichText::new("Registered Custom Models:").small().color(label_color));
+                            ui.label(
+                                egui::RichText::new("Registered Custom Models:")
+                                    .small()
+                                    .color(label_color),
+                            );
                             let mut to_remove = None;
                             for (idx, m) in self.settings.custom_models.iter().enumerate() {
                                 ui.horizontal(|ui| {
@@ -1728,8 +1825,7 @@ impl GuiApp {
                         ui.add_space(6.0);
 
                         ui.label(
-                            egui::RichText::new("Max thinking loops per cycle:")
-                                .color(label_color),
+                            egui::RichText::new("Max thinking loops per cycle:").color(label_color),
                         );
                         if ui
                             .add(egui::Slider::new(
@@ -1742,8 +1838,7 @@ impl GuiApp {
                         }
 
                         ui.label(
-                            egui::RichText::new("Browser timeout (seconds):")
-                                .color(label_color),
+                            egui::RichText::new("Browser timeout (seconds):").color(label_color),
                         );
                         if ui
                             .add(egui::Slider::new(
@@ -1756,8 +1851,7 @@ impl GuiApp {
                         }
 
                         ui.label(
-                            egui::RichText::new("Max content characters limit:")
-                                .color(label_color),
+                            egui::RichText::new("Max content characters limit:").color(label_color),
                         );
                         if ui
                             .add(egui::Slider::new(
@@ -2023,37 +2117,36 @@ impl eframe::App for GuiApp {
                         } else {
                             "▲ Terminal"
                         };
-                        let term_btn = egui::Button::new(
-                            egui::RichText::new(term_label)
-                                .size(12.0)
-                                .color(if self.show_terminal_panel {
+                        let term_btn =
+                            egui::Button::new(egui::RichText::new(term_label).size(12.0).color(
+                                if self.show_terminal_panel {
                                     egui::Color32::from_rgb(52, 211, 153)
                                 } else if self.dark_mode {
                                     egui::Color32::from_rgb(148, 163, 184)
                                 } else {
                                     egui::Color32::from_rgb(100, 116, 139)
-                                }),
-                        )
-                        .fill(if self.show_terminal_panel {
-                            if self.dark_mode {
-                                egui::Color32::from_rgb(20, 40, 30)
+                                },
+                            ))
+                            .fill(if self.show_terminal_panel {
+                                if self.dark_mode {
+                                    egui::Color32::from_rgb(20, 40, 30)
+                                } else {
+                                    egui::Color32::from_rgb(220, 252, 231)
+                                }
                             } else {
-                                egui::Color32::from_rgb(220, 252, 231)
-                            }
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        })
-                        .stroke(egui::Stroke::new(
-                            0.5,
-                            if self.show_terminal_panel {
-                                egui::Color32::from_rgb(52, 211, 153)
-                            } else if self.dark_mode {
-                                egui::Color32::from_rgb(55, 55, 70)
-                            } else {
-                                egui::Color32::from_rgb(200, 205, 218)
-                            },
-                        ))
-                        .rounding(8.0);
+                                egui::Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::new(
+                                0.5,
+                                if self.show_terminal_panel {
+                                    egui::Color32::from_rgb(52, 211, 153)
+                                } else if self.dark_mode {
+                                    egui::Color32::from_rgb(55, 55, 70)
+                                } else {
+                                    egui::Color32::from_rgb(200, 205, 218)
+                                },
+                            ))
+                            .rounding(8.0);
                         if ui
                             .add(term_btn)
                             .on_hover_text("Toggle AI terminal panel")
@@ -2463,327 +2556,355 @@ impl eframe::App for GuiApp {
                 right_panel = right_panel.default_width(self.right_sidebar_width);
             }
             let panel_response = right_panel.show(ctx, |ui| {
-                    let bg_procs = crate::tools::shell::get_background_processes();
-                    if !bg_procs.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Background Processes")
-                                    .font(egui::FontId::proportional(16.0))
-                                    .strong(),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{}", bg_procs.len()))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(167, 139, 250)),
-                                );
-                            });
-                        });
-                        ui.add_space(8.0);
-                        for proc in bg_procs {
-                            ui.horizontal(|ui| {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Kill").on_hover_text("Kill this background process").clicked() {
-                                        crate::tools::shell::kill_background_process(proc.pid);
-                                    }
-                                    
-                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                        ui.label(egui::RichText::new(format!("[{}]", proc.pid)).small().color(egui::Color32::from_rgb(148, 163, 184)));
-                                        let mut cmd_str = proc.command.clone();
-                                        if cmd_str.len() > 25 {
-                                            cmd_str.truncate(22);
-                                            cmd_str.push_str("...");
-                                        }
-                                        ui.label(egui::RichText::new(cmd_str).monospace());
-                                    });
-                                });
-                            });
-                        }
-                        ui.add_space(16.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                    }
-
+                let bg_procs = crate::tools::shell::get_background_processes();
+                if !bg_procs.is_empty() {
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("Workspace files")
+                            egui::RichText::new("Background Processes")
                                 .font(egui::FontId::proportional(16.0))
                                 .strong(),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "{}",
-                                    self.session_written_files.len()
-                                ))
-                                .small()
-                                .color(egui::Color32::from_rgb(167, 139, 250)),
+                                egui::RichText::new(format!("{}", bg_procs.len()))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(167, 139, 250)),
                             );
                         });
                     });
-                    ui.label(
-                        egui::RichText::new("Created or changed this session")
-                            .size(12.0)
-                            .color(egui::Color32::from_rgb(148, 163, 184)),
-                    );
                     ui.add_space(8.0);
-
-                    let mut file_to_inspect = None;
-                    egui::ScrollArea::vertical()
-                        .id_salt("workspace_file_list")
-                        .max_height((ui.available_height() * 0.46).max(120.0))
-                        .show(ui, |ui| {
-                            let mut display_files = self.session_written_files.clone();
-                            if let Some((ref active_file, _, _)) = self.current_writing_file {
-                                if self.current_writing_status.as_deref() == Some("writing")
-                                    && !active_file.is_empty()
-                                    && !display_files.contains(active_file)
-                                {
-                                    display_files.push(active_file.clone());
-                                }
-                            }
-
-                            if display_files.is_empty() {
-                                egui::Frame::default()
-                                    .fill(ctx.style().visuals.faint_bg_color)
-                                    .inner_margin(12.0)
-                                    .rounding(10.0)
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Your files will appear here.",
-                                            )
-                                            .size(13.0)
-                                            .color(egui::Color32::from_rgb(148, 163, 184)),
-                                        );
-                                    });
-                            } else {
-                                for filename in &display_files {
-                                    let icon = get_file_icon(filename);
-
-                                    let is_writing = if let Some((ref active_file, _, _)) =
-                                        self.current_writing_file
-                                    {
-                                        active_file == filename
-                                            && self.current_writing_status.as_deref()
-                                                == Some("writing")
-                                    } else {
-                                        false
-                                    };
-
-                                    let label_text = if is_writing {
-                                        let tool_name = self.current_tool_name.as_deref().unwrap_or("");
-                                        let action = if tool_name == "write_file" || tool_name == "write_to_file" {
-                                            "Writing"
-                                        } else {
-                                            "Editing"
-                                        };
-                                        format!("📝 {} [{}...]", filename, action)
-                                    } else {
-                                        format!("{} {}", icon, filename)
-                                    };
-
-                                    let label = if is_writing {
-                                        egui::RichText::new(label_text)
-                                            .color(egui::Color32::from_rgb(16, 185, 129))
-                                            .strong()
-                                    } else {
-                                        egui::RichText::new(label_text)
-                                    };
-
-                                    let is_selected =
-                                        self.selected_file.as_deref() == Some(filename);
+                    for proc in bg_procs {
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
                                     if ui
-                                        .selectable_label(is_selected, label)
-                                        .on_hover_text("Preview file")
+                                        .button("Kill")
+                                        .on_hover_text("Kill this background process")
                                         .clicked()
                                     {
-                                        file_to_inspect = Some(filename.clone());
+                                        crate::tools::shell::kill_background_process(proc.pid);
                                     }
 
-                                    // Show diff stats: prefer live current_writing_file, fall back to persisted file_diff_stats
-                                    let (show_added, show_deleted) = if let Some((active_file, added, deleted)) =
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("[{}]", proc.pid))
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(148, 163, 184)),
+                                            );
+                                            let mut cmd_str = proc.command.clone();
+                                            if cmd_str.len() > 25 {
+                                                cmd_str.truncate(22);
+                                                cmd_str.push_str("...");
+                                            }
+                                            ui.label(egui::RichText::new(cmd_str).monospace());
+                                        },
+                                    );
+                                },
+                            );
+                        });
+                    }
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Workspace files")
+                            .font(egui::FontId::proportional(16.0))
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{}", self.session_written_files.len()))
+                                .small()
+                                .color(egui::Color32::from_rgb(167, 139, 250)),
+                        );
+                    });
+                });
+                ui.label(
+                    egui::RichText::new("Created or changed this session")
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(148, 163, 184)),
+                );
+                ui.add_space(8.0);
+
+                let mut file_to_inspect = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("workspace_file_list")
+                    .max_height((ui.available_height() * 0.46).max(120.0))
+                    .show(ui, |ui| {
+                        let mut display_files = self.session_written_files.clone();
+                        if let Some((ref active_file, _, _)) = self.current_writing_file {
+                            if self.current_writing_status.as_deref() == Some("writing")
+                                && !active_file.is_empty()
+                                && !display_files.contains(active_file)
+                            {
+                                display_files.push(active_file.clone());
+                            }
+                        }
+
+                        if display_files.is_empty() {
+                            egui::Frame::default()
+                                .fill(ctx.style().visuals.faint_bg_color)
+                                .inner_margin(12.0)
+                                .rounding(10.0)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Your files will appear here.")
+                                            .size(13.0)
+                                            .color(egui::Color32::from_rgb(148, 163, 184)),
+                                    );
+                                });
+                        } else {
+                            for filename in &display_files {
+                                let icon = get_file_icon(filename);
+
+                                let is_writing = if let Some((ref active_file, _, _)) =
+                                    self.current_writing_file
+                                {
+                                    active_file == filename
+                                        && self.current_writing_status.as_deref() == Some("writing")
+                                } else {
+                                    false
+                                };
+
+                                let label_text = if is_writing {
+                                    let tool_name = self.current_tool_name.as_deref().unwrap_or("");
+                                    let action = if tool_name == "write_file"
+                                        || tool_name == "write_to_file"
+                                    {
+                                        "Writing"
+                                    } else {
+                                        "Editing"
+                                    };
+                                    format!("📝 {} [{}...]", filename, action)
+                                } else {
+                                    format!("{} {}", icon, filename)
+                                };
+
+                                let label = if is_writing {
+                                    egui::RichText::new(label_text)
+                                        .color(egui::Color32::from_rgb(16, 185, 129))
+                                        .strong()
+                                } else {
+                                    egui::RichText::new(label_text)
+                                };
+
+                                let is_selected = self.selected_file.as_deref() == Some(filename);
+                                if ui
+                                    .selectable_label(is_selected, label)
+                                    .on_hover_text("Preview file")
+                                    .clicked()
+                                {
+                                    file_to_inspect = Some(filename.clone());
+                                }
+
+                                // Show diff stats: prefer live current_writing_file, fall back to persisted file_diff_stats
+                                let (show_added, show_deleted) =
+                                    if let Some((active_file, added, deleted)) =
                                         &self.current_writing_file
                                     {
                                         if active_file == filename {
                                             (*added, *deleted)
-                                        } else if let Some(&(a, d)) = self.file_diff_stats.get(filename.as_str()) {
+                                        } else if let Some(&(a, d)) =
+                                            self.file_diff_stats.get(filename.as_str())
+                                        {
                                             (a, d)
                                         } else {
                                             (0, 0)
                                         }
-                                    } else if let Some(&(a, d)) = self.file_diff_stats.get(filename.as_str()) {
+                                    } else if let Some(&(a, d)) =
+                                        self.file_diff_stats.get(filename.as_str())
+                                    {
                                         (a, d)
                                     } else {
                                         (0, 0)
                                     };
 
-                                    if show_added > 0 || show_deleted > 0 {
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(22.0);
-                                            if show_added > 0 {
-                                                ui.label(
-                                                    egui::RichText::new(format!("+{show_added}"))
-                                                        .small()
-                                                        .color(egui::Color32::from_rgb(
-                                                            16, 185, 129,
-                                                        )),
-                                                );
-                                            }
-                                            if show_deleted > 0 {
-                                                ui.label(
-                                                    egui::RichText::new(format!("-{show_deleted}"))
-                                                        .small()
-                                                        .color(egui::Color32::from_rgb(
-                                                            239, 68, 68,
-                                                        )),
-                                                );
-                                            }
-                                        });
-                                    }
+                                if show_added > 0 || show_deleted > 0 {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(22.0);
+                                        if show_added > 0 {
+                                            ui.label(
+                                                egui::RichText::new(format!("+{show_added}"))
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(16, 185, 129)),
+                                            );
+                                        }
+                                        if show_deleted > 0 {
+                                            ui.label(
+                                                egui::RichText::new(format!("-{show_deleted}"))
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(239, 68, 68)),
+                                            );
+                                        }
+                                    });
                                 }
                             }
+                        }
+                    });
+
+                if let Some(filename) = file_to_inspect {
+                    self.inspect_file(&filename);
+                }
+
+                if let Some(filename) = self.selected_file.clone() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("File preview").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("Close preview")
+                                .clicked()
+                            {
+                                self.selected_file = None;
+                                self.inspected_file_content.clear();
+                                self.inspector_error = None;
+                            }
                         });
+                    });
+                    ui.label(
+                        egui::RichText::new(&filename)
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(167, 139, 250)),
+                    );
 
-                    if let Some(filename) = file_to_inspect {
-                        self.inspect_file(&filename);
-                    }
-
-                    if let Some(filename) = self.selected_file.clone() {
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("File preview").strong());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .small_button("×")
-                                        .on_hover_text("Close preview")
-                                        .clicked()
-                                    {
-                                        self.selected_file = None;
-                                        self.inspected_file_content.clear();
-                                        self.inspector_error = None;
-                                    }
-                                },
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new(&filename)
-                                .monospace()
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(167, 139, 250)),
-                        );
-
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            let mut filter = self.line_range_enabled;
-                            if ui.checkbox(&mut filter, "Filter lines").changed() {
-                                self.line_range_enabled = filter;
-                                if filter && self.line_range_end == 0 {
-                                    self.line_range_end = self.line_range_total_lines.min(100);
-                                }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let mut filter = self.line_range_enabled;
+                        if ui.checkbox(&mut filter, "Filter lines").changed() {
+                            self.line_range_enabled = filter;
+                            if filter && self.line_range_end == 0 {
+                                self.line_range_end = self.line_range_total_lines.min(100);
+                            }
+                            self.inspect_file(&filename);
+                        }
+                        if self.line_range_enabled {
+                            ui.label("From:");
+                            let mut start = self.line_range_start;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut start)
+                                        .range(1..=self.line_range_total_lines.max(1)),
+                                )
+                                .changed()
+                            {
+                                self.line_range_start = start;
                                 self.inspect_file(&filename);
                             }
-                            if self.line_range_enabled {
-                                ui.label("From:");
-                                let mut start = self.line_range_start;
-                                if ui.add(egui::DragValue::new(&mut start).range(1..=self.line_range_total_lines.max(1))).changed() {
-                                    self.line_range_start = start;
-                                    self.inspect_file(&filename);
-                                }
-                                ui.label("To:");
-                                let mut end = self.line_range_end;
-                                if ui.add(egui::DragValue::new(&mut end).range(1..=self.line_range_total_lines.max(1))).changed() {
-                                    self.line_range_end = end;
-                                    self.inspect_file(&filename);
+                            ui.label("To:");
+                            let mut end = self.line_range_end;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut end)
+                                        .range(1..=self.line_range_total_lines.max(1)),
+                                )
+                                .changed()
+                            {
+                                self.line_range_end = end;
+                                self.inspect_file(&filename);
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let mut edits = self.manual_edits_enabled;
+                        if ui.checkbox(&mut edits, "✏️ Edit").changed() {
+                            self.manual_edits_enabled = edits;
+                            if !edits {
+                                self.inspected_file_edited = false;
+                                self.inspect_file(&filename);
+                            }
+                        }
+                        if self.manual_edits_enabled {
+                            if ui.button("💾 Save").clicked() {
+                                if let Err(e) = self.save_inspected_file_changes() {
+                                    self.inspector_error = Some(format!("Failed to save: {e}"));
+                                } else {
+                                    self.status_text = "Saved!".to_string();
                                 }
                             }
-                        });
-                        ui.horizontal(|ui| {
-                            let mut edits = self.manual_edits_enabled;
-                            if ui.checkbox(&mut edits, "✏️ Edit").changed() {
-                                self.manual_edits_enabled = edits;
-                                if !edits {
-                                    self.inspected_file_edited = false;
-                                    self.inspect_file(&filename);
-                                }
-                            }
-                            if self.manual_edits_enabled {
-                                if ui.button("💾 Save").clicked() {
-                                    if let Err(e) = self.save_inspected_file_changes() {
-                                        self.inspector_error = Some(format!("Failed to save: {e}"));
-                                    } else {
-                                        self.status_text = "Saved!".to_string();
-                                    }
-                                }
-                            }
-                        });
+                        }
+                    });
+                    ui.add_space(6.0);
+
+                    if let Some(error) = &self.inspector_error {
                         ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(error)
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(248, 113, 113)),
+                        );
+                    } else {
+                        let is_active_writing = self
+                            .current_writing_file
+                            .as_ref()
+                            .map_or(false, |(name, _, _)| {
+                                Some(name) == self.selected_file.as_ref()
+                            });
 
-                        if let Some(error) = &self.inspector_error {
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new(error)
-                                    .size(12.0)
-                                    .color(egui::Color32::from_rgb(248, 113, 113)),
-                            );
-                        } else {
-                            let is_active_writing = self
-                                .current_writing_file
-                                .as_ref()
-                                .map_or(false, |(name, _, _)| {
-                                    Some(name) == self.selected_file.as_ref()
-                                });
+                        let active_range = self.get_active_editing_range();
+                        let is_active_file = self.selected_file.as_ref().is_some()
+                            && self.selected_file.as_ref()
+                                == self.current_writing_file.as_ref().map(|(n, _, _)| n);
 
-                            let active_range = self.get_active_editing_range();
-                            let is_active_file = self.selected_file.as_ref().is_some() 
-                                && self.selected_file.as_ref() == self.current_writing_file.as_ref().map(|(n, _, _)| n);
-
-                            egui::ScrollArea::both()
-                                .id_salt("inline_file_inspector")
-                                .auto_shrink([false, false])
-                                .stick_to_bottom(is_active_writing)
-                                .show(ui, |ui| {
-                                    if self.manual_edits_enabled {
-                                        let edit_resp = ui.add(
-                                            egui::TextEdit::multiline(&mut self.inspected_file_content)
-                                                .font(egui::TextStyle::Monospace)
-                                                .desired_width(f32::INFINITY)
-                                                .interactive(true),
-                                        );
-                                        if edit_resp.changed() {
-                                            self.inspected_file_edited = true;
-                                        }
-                                    } else {
-                                        let lines: Vec<&str> = self.inspected_file_content.lines().collect();
-                                        ui.vertical(|ui| {
-                                            let start_line_num = if self.line_range_enabled { self.line_range_start } else { 1 };
-                                            for (idx, line_content) in lines.iter().enumerate() {
-                                                let line_num = start_line_num + idx;
-                                                let is_highlighted = is_active_file && active_range.map_or(false, |(start, end)| {
+                        egui::ScrollArea::both()
+                            .id_salt("inline_file_inspector")
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(is_active_writing)
+                            .show(ui, |ui| {
+                                if self.manual_edits_enabled {
+                                    let edit_resp = ui.add(
+                                        egui::TextEdit::multiline(&mut self.inspected_file_content)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(f32::INFINITY)
+                                            .interactive(true),
+                                    );
+                                    if edit_resp.changed() {
+                                        self.inspected_file_edited = true;
+                                    }
+                                } else {
+                                    let lines: Vec<&str> =
+                                        self.inspected_file_content.lines().collect();
+                                    ui.vertical(|ui| {
+                                        let start_line_num = if self.line_range_enabled {
+                                            self.line_range_start
+                                        } else {
+                                            1
+                                        };
+                                        for (idx, line_content) in lines.iter().enumerate() {
+                                            let line_num = start_line_num + idx;
+                                            let is_highlighted = is_active_file
+                                                && active_range.map_or(false, |(start, end)| {
                                                     line_num >= start && line_num <= end
                                                 });
 
-                                                let line_text = format!("{:>4} | {}", line_num, line_content);
-                                                let mut rich_text = egui::RichText::new(line_text)
-                                                    .font(egui::FontId::monospace(11.0));
+                                            let line_text =
+                                                format!("{:>4} | {}", line_num, line_content);
+                                            let mut rich_text = egui::RichText::new(line_text)
+                                                .font(egui::FontId::monospace(11.0));
 
-                                                if is_highlighted {
-                                                    rich_text = rich_text
-                                                        .color(egui::Color32::from_rgb(16, 185, 129))
-                                                        .strong();
+                                            if is_highlighted {
+                                                rich_text = rich_text
+                                                    .color(egui::Color32::from_rgb(16, 185, 129))
+                                                    .strong();
+                                            } else {
+                                                rich_text = rich_text.color(if self.dark_mode {
+                                                    egui::Color32::from_rgb(209, 213, 219)
                                                 } else {
-                                                    rich_text = rich_text.color(if self.dark_mode {
-                                                        egui::Color32::from_rgb(209, 213, 219)
-                                                    } else {
-                                                        egui::Color32::from_rgb(55, 65, 81)
-                                                    });
-                                                }
+                                                    egui::Color32::from_rgb(55, 65, 81)
+                                                });
+                                            }
 
-                                                let response = ui.horizontal(|ui| {
+                                            let response = ui
+                                                .horizontal(|ui| {
                                                     if is_highlighted {
                                                         let bg = if self.dark_mode {
                                                             egui::Color32::from_rgb(20, 45, 30)
@@ -2794,22 +2915,27 @@ impl eframe::App for GuiApp {
                                                         ui.painter().rect_filled(rect, 0.0, bg);
                                                     }
                                                     ui.label(rich_text)
-                                                }).response;
+                                                })
+                                                .response;
 
-                                                if is_active_file {
-                                                    if let Some((start, _)) = active_range {
-                                                        if self.should_scroll_to_line == Some(start) && line_num == start {
-                                                            response.scroll_to_me(Some(egui::Align::Center));
-                                                        }
+                                            if is_active_file {
+                                                if let Some((start, _)) = active_range {
+                                                    if self.should_scroll_to_line == Some(start)
+                                                        && line_num == start
+                                                    {
+                                                        response.scroll_to_me(Some(
+                                                            egui::Align::Center,
+                                                        ));
                                                     }
                                                 }
                                             }
-                                        });
-                                    }
-                                });
-                        }
+                                        }
+                                    });
+                                }
+                            });
                     }
-                });
+                }
+            });
             if !right_animating && self.right_sidebar_open {
                 self.right_sidebar_width = panel_response.response.rect.width();
             }

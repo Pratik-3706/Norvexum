@@ -65,10 +65,13 @@ impl Tool for InspectImageTool {
 
             if attach_natively {
                 // Call model directly with vision request attached natively
-                let msg = format!("🖼️ Image {} attached natively for analysis.\n\nPrompt: {}", path_str, prompt_str);
+                let msg = format!(
+                    "🖼️ Image {} attached natively for analysis.\n\nPrompt: {}",
+                    path_str, prompt_str
+                );
                 return ToolResult::ok_with_image(msg, b64, mime);
             }
-            
+
             // Otherwise, make a separate sub-request to save payload size
             if let Some(client) = &ctx.client {
                 let msg = Message::user_with_image(prompt_str, b64, mime);
@@ -114,11 +117,11 @@ impl Tool for InspectImageTool {
                 None,
             );
             use crate::ai::AiClient;
-            
+
             let msg = Message::user_with_image(prompt_str, b64, mime);
             let request = AiRequest::new(vec![msg]).with_temperature(0.5);
             let (tx, mut rx) = mpsc::unbounded_channel();
-            
+
             if let Err(e) = client.chat_stream(request, tx).await {
                 // If it fails immediately
                 return ToolResult::err(format!("Gemini fallback request failed: {}", e));
@@ -130,7 +133,9 @@ impl Tool for InspectImageTool {
                 match event {
                     AiStreamEvent::ContentDelta(text) => description.push_str(&text),
                     AiStreamEvent::Error(err) => {
-                        if err.to_lowercase().contains("safety") || err.to_lowercase().contains("blocked") {
+                        if err.to_lowercase().contains("safety")
+                            || err.to_lowercase().contains("blocked")
+                        {
                             safety_blocked = true;
                         } else {
                             return ToolResult::err(format!("Gemini stream error: {}", err));
@@ -141,7 +146,9 @@ impl Tool for InspectImageTool {
             }
 
             if safety_blocked {
-                return ToolResult::err("The image may contain NSFW/unsafe content. You must rely on your own native vision capabilities to view it directly.");
+                return ToolResult::err(
+                    "The image may contain NSFW/unsafe content. You must rely on your own native vision capabilities to view it directly.",
+                );
             }
 
             if description.trim().is_empty() {
@@ -149,7 +156,10 @@ impl Tool for InspectImageTool {
             }
 
             ToolResult::ok_with_data(
-                format!("🖼️ Image Analysis for {} (via Gemini Fallback):\n\n{}", path_str, description),
+                format!(
+                    "🖼️ Image Analysis for {} (via Gemini Fallback):\n\n{}",
+                    path_str, description
+                ),
                 json!({ "path": path.to_string_lossy(), "analysis": description, "method": "gemini_fallback" }),
             )
         } else if let Some(ocr_key) = &ctx.settings.ocr_space_api_key {
@@ -162,7 +172,9 @@ impl Tool for InspectImageTool {
                 Err(e) => ToolResult::err(format!("OCR failed: {}", e)),
             }
         } else {
-            ToolResult::err("The current AI model does not support vision (image inputs), no GOOGLE_AI_API_KEY is available for SDK fallback, and no OCR API key is set.")
+            ToolResult::err(
+                "The current AI model does not support vision (image inputs), no GOOGLE_AI_API_KEY is available for SDK fallback, and no OCR API key is set.",
+            )
         }
     }
 }

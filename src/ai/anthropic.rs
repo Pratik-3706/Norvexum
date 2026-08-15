@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Anthropic Client — Anthropic Messages API with streaming
 //
 // Features:
@@ -384,7 +384,9 @@ impl AiClient for AnthropicClient {
     }
 
     fn supports_vision(&self) -> bool {
-        self.model_info.as_ref().is_some_and(|m| matches!(m.vision, crate::config::providers::Vision::Yes))
+        self.model_info
+            .as_ref()
+            .is_some_and(|m| matches!(m.vision, crate::config::providers::Vision::Yes))
     }
 
     fn supports_image_gen(&self) -> bool {

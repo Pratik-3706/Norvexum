@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // AI — Multi-provider AI client layer
 //
 // Unified trait for chat completions, tool calling, streaming, vision,
@@ -72,10 +72,7 @@ pub fn build_client(settings: &Settings) -> Result<Box<dyn AiClient>> {
     let provider = find_provider(&settings.active_provider)
         .ok_or_else(|| eyre::eyre!("Unknown provider: {}", settings.active_provider))?;
 
-    let api_key = settings
-        .active_api_key()
-        .unwrap_or_default()
-        .to_string();
+    let api_key = settings.active_api_key().unwrap_or_default().to_string();
 
     let model_info = provider
         .models
@@ -104,33 +101,58 @@ pub fn build_client(settings: &Settings) -> Result<Box<dyn AiClient>> {
 }
 
 /// Guess reasoning support based on model/provider name (heuristic fallback)
-pub fn guess_reasoning_support_by_name(provider: &str, model: &str) -> Option<types::ReasoningType> {
+pub fn guess_reasoning_support_by_name(
+    provider: &str,
+    model: &str,
+) -> Option<types::ReasoningType> {
     let model_lower = model.to_lowercase();
     let provider_lower = provider.to_lowercase();
 
     // Google Gemini (Gemini 2.0+ support thinking config)
     if provider_lower.contains("google") || model_lower.contains("gemini") {
-        if model_lower.contains("gemini-2.0") || model_lower.contains("gemini-2.5") || model_lower.contains("gemini-3") || model_lower.contains("gemini-pro") {
+        if model_lower.contains("gemini-2.0")
+            || model_lower.contains("gemini-2.5")
+            || model_lower.contains("gemini-3")
+            || model_lower.contains("gemini-pro")
+        {
             return Some(types::ReasoningType::GeminiThinking);
         }
     }
 
     // Anthropic Claude (Claude 3.7+ support extended thinking)
     if provider_lower.contains("anthropic") || model_lower.contains("claude") {
-        if model_lower.contains("claude-3-7") || model_lower.contains("claude-3.7") || model_lower.contains("claude-4") {
+        if model_lower.contains("claude-3-7")
+            || model_lower.contains("claude-3.7")
+            || model_lower.contains("claude-4")
+        {
             return Some(types::ReasoningType::AnthropicThinking);
         }
     }
 
     // OpenAI o1 / o3 / o4
-    if provider_lower.contains("openai") || model_lower.contains("o1") || model_lower.contains("o3") || model_lower.contains("o4") {
-        if model_lower.contains("o1-") || model_lower.contains("o3-") || model_lower.contains("o4-") || model_lower == "o1" || model_lower == "o3" || model_lower == "o4" {
+    if provider_lower.contains("openai")
+        || model_lower.contains("o1")
+        || model_lower.contains("o3")
+        || model_lower.contains("o4")
+    {
+        if model_lower.contains("o1-")
+            || model_lower.contains("o3-")
+            || model_lower.contains("o4-")
+            || model_lower == "o1"
+            || model_lower == "o3"
+            || model_lower == "o4"
+        {
             return Some(types::ReasoningType::OpenAiEffort);
         }
     }
 
     // DeepSeek R1 / Reasoner / Think models
-    if model_lower.contains("-r1") || model_lower.contains("r1-") || model_lower.contains("reasoner") || model_lower.contains("-think") || model_lower.contains("thinking") {
+    if model_lower.contains("-r1")
+        || model_lower.contains("r1-")
+        || model_lower.contains("reasoner")
+        || model_lower.contains("-think")
+        || model_lower.contains("thinking")
+    {
         return Some(types::ReasoningType::OpenAiEffort);
     }
 
@@ -229,7 +251,12 @@ async fn run_test_request(client: &dyn AiClient, request: types::AiRequest) -> b
                 types::AiStreamEvent::Error(err) => {
                     has_any_error = true;
                     let err_lower = err.to_lowercase();
-                    if err_lower.contains("parameter") || err_lower.contains("unknown") || err_lower.contains("support") || err_lower.contains("invalid") || err_lower.contains("400") {
+                    if err_lower.contains("parameter")
+                        || err_lower.contains("unknown")
+                        || err_lower.contains("support")
+                        || err_lower.contains("invalid")
+                        || err_lower.contains("400")
+                    {
                         is_unsupported_param_error = true;
                     }
                 }
@@ -255,11 +282,12 @@ async fn run_test_request(client: &dyn AiClient, request: types::AiRequest) -> b
         }
     };
 
-    let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(5), receive_future).await;
+    let timeout_result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), receive_future).await;
     if timeout_result.is_err() {
         has_any_error = true; // Mark as error if it timed out
     }
-    
+
     // Drop rx so the background stream task will naturally terminate if it tries to send more
     drop(rx);
 

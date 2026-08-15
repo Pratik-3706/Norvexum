@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // OpenAI-Compatible Client — Covers aicredits.in, OpenAI direct, and any
 // OpenAI-compatible endpoint.
 //
@@ -65,19 +65,20 @@ impl OpenAiCompatClient {
                 };
 
                 // Check if message has image content
-                let has_image = self.supports_vision() && msg
-                    .content
-                    .iter()
-                    .any(|p| matches!(p, ContentPart::Image { .. }));
+                let has_image = self.supports_vision()
+                    && msg
+                        .content
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::Image { .. }));
 
                 if has_image {
                     if role == "tool" {
                         // CRITICAL FIX: APIs often strictly reject `image_url` inside `tool` messages.
-                        // I must split the `tool` message into a text-only tool message, 
+                        // I must split the `tool` message into a text-only tool message,
                         // and append a new `user` message containing the image.
                         let mut text_parts = Vec::new();
                         let mut img_parts = Vec::new();
-                        
+
                         for part in &msg.content {
                             match part {
                                 ContentPart::Text { text } => {
@@ -93,7 +94,7 @@ impl OpenAiCompatClient {
                                 }
                             }
                         }
-                        
+
                         let mut tool_obj = json!({
                             "role": role,
                             "content": text_parts
@@ -116,12 +117,12 @@ impl OpenAiCompatClient {
                                     .collect::<Vec<_>>()
                             );
                         }
-                        
+
                         let user_obj = json!({
                             "role": "user",
                             "content": img_parts
                         });
-                        
+
                         return vec![tool_obj, user_obj];
                     }
 
@@ -427,7 +428,10 @@ impl AiClient for OpenAiCompatClient {
 
                     // Emit usage if present
                     if let Some(usage) = &sse.usage {
-                        let reasoning_tokens = usage.completion_tokens_details.as_ref().and_then(|d| d.reasoning_tokens);
+                        let reasoning_tokens = usage
+                            .completion_tokens_details
+                            .as_ref()
+                            .and_then(|d| d.reasoning_tokens);
                         let _ = tx.send(AiStreamEvent::Done {
                             finish_reason: "stop".into(),
                             usage: Some(UsageStats {
@@ -612,7 +616,9 @@ impl AiClient for OpenAiCompatClient {
     }
 
     fn supports_vision(&self) -> bool {
-        self.model_info.as_ref().is_some_and(|m| matches!(m.vision, crate::config::providers::Vision::Yes))
+        self.model_info
+            .as_ref()
+            .is_some_and(|m| matches!(m.vision, crate::config::providers::Vision::Yes))
     }
 
     fn supports_image_gen(&self) -> bool {

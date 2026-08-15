@@ -121,7 +121,9 @@ impl Agent {
             approval_disabled: false,
             max_loops,
             instruction_rx: None,
-            temp_memory: Arc::new(tokio::sync::RwLock::new(crate::tools::memory::TempMemory::new())),
+            temp_memory: Arc::new(tokio::sync::RwLock::new(
+                crate::tools::memory::TempMemory::new(),
+            )),
         })
     }
 
@@ -168,14 +170,14 @@ impl Agent {
         }
 
         let backup_messages = self.messages.clone();
-        
+
         let result = self.process_message_internal(user_input, cancel_rx).await;
-        
+
         if result.is_err() {
             // Restore messages on error so that a huge or corrupted request doesn't poison the conversation history
             self.messages = backup_messages;
         }
-        
+
         result
     }
 
@@ -342,22 +344,33 @@ impl Agent {
                             "load" => {
                                 if parts.len() >= 3 {
                                     let id = parts[2];
-                                    if let Some(sess) = session::Session::load_by_id(&self.settings.project_root, id) {
+                                    if let Some(sess) = session::Session::load_by_id(
+                                        &self.settings.project_root,
+                                        id,
+                                    ) {
                                         self.messages = sess.messages.clone();
                                         self.session = Some(sess);
                                         let model = self.session.as_ref().unwrap().model.clone();
-                                        let provider = self.session.as_ref().unwrap().provider.clone();
-                                        let _ = self.event_tx.send(AgentEvent::ModelSwitched { model, provider });
+                                        let provider =
+                                            self.session.as_ref().unwrap().provider.clone();
+                                        let _ = self
+                                            .event_tx
+                                            .send(AgentEvent::ModelSwitched { model, provider });
                                         let _ = self.event_tx.send(AgentEvent::Content(format!(
                                             "✅ Loaded session {} ({} messages)",
                                             &id[..6.min(id.len())],
                                             self.messages.len()
                                         )));
                                     } else {
-                                        let _ = self.event_tx.send(AgentEvent::Content(format!("Session {} not found.", id)));
+                                        let _ = self.event_tx.send(AgentEvent::Content(format!(
+                                            "Session {} not found.",
+                                            id
+                                        )));
                                     }
                                 } else {
-                                    let _ = self.event_tx.send(AgentEvent::Content("Usage: `/session load <id>`".into()));
+                                    let _ = self.event_tx.send(AgentEvent::Content(
+                                        "Usage: `/session load <id>`".into(),
+                                    ));
                                 }
                                 let _ = self.event_tx.send(AgentEvent::Done { usage: None });
                                 return Ok(());
@@ -512,7 +525,14 @@ impl Agent {
                                     for model in &models {
                                         let capabilities = format!(
                                             "{}{}{}",
-                                            if matches!(model.vision, crate::config::providers::Vision::Yes) { " 👁️" } else { "" },
+                                            if matches!(
+                                                model.vision,
+                                                crate::config::providers::Vision::Yes
+                                            ) {
+                                                " 👁️"
+                                            } else {
+                                                ""
+                                            },
                                             if model.tool_calling { " 🔧" } else { "" },
                                             if model.image_gen { " 🎨" } else { "" }
                                         );
@@ -528,14 +548,24 @@ impl Agent {
                                     );
                                 }
                             } else {
-                                let registry = crate::config::providers::build_registry_with_settings(&self.settings);
+                                let registry =
+                                    crate::config::providers::build_registry_with_settings(
+                                        &self.settings,
+                                    );
                                 if let Some(provider) =
                                     registry.iter().find(|p| &p.name == current_provider)
                                 {
                                     for model in &provider.models {
                                         let capabilities = format!(
                                             "{}{}{}",
-                                            if matches!(model.vision, crate::config::providers::Vision::Yes) { " 👁️" } else { "" },
+                                            if matches!(
+                                                model.vision,
+                                                crate::config::providers::Vision::Yes
+                                            ) {
+                                                " 👁️"
+                                            } else {
+                                                ""
+                                            },
                                             if model.tool_calling { " 🔧" } else { "" },
                                             if model.image_gen { " 🎨" } else { "" }
                                         );
@@ -708,7 +738,7 @@ impl Agent {
                         "📸 Loading {} image(s)...",
                         valid_images.len()
                     )));
-                    
+
                     let mut encoded_images = Vec::new();
                     for img_path in &valid_images {
                         match vision::encode_image_file(img_path) {
@@ -724,26 +754,33 @@ impl Agent {
                             }
                         }
                     }
-                    
+
                     if !encoded_images.is_empty() {
-                        user_msg = Some(Message::user_with_images(actual_user_input, encoded_images));
+                        user_msg =
+                            Some(Message::user_with_images(actual_user_input, encoded_images));
                     }
                 } else if let Some(gemini_key) = &self.settings.google_ai_api_key {
                     let _ = self.event_tx.send(AgentEvent::Status(format!(
                         "📸 Analyzing {} image(s) via Gemini Fallback...",
                         valid_images.len()
                     )));
-                    
+
                     let mut content_parts = vec![crate::ai::types::ContentPart::Text {
-                        text: format!("Please describe these {} images in detail so I can understand them:", valid_images.len()),
+                        text: format!(
+                            "Please describe these {} images in detail so I can understand them:",
+                            valid_images.len()
+                        ),
                     }];
-                    
+
                     let mut has_errors = false;
                     for img_path in &valid_images {
                         match vision::encode_image_file(img_path) {
                             Ok((b64, mime)) => {
                                 content_parts.push(crate::ai::types::ContentPart::Text {
-                                    text: format!("\n--- Image: {} ---", img_path.file_name().unwrap_or_default().to_string_lossy()),
+                                    text: format!(
+                                        "\n--- Image: {} ---",
+                                        img_path.file_name().unwrap_or_default().to_string_lossy()
+                                    ),
                                 });
                                 content_parts.push(crate::ai::types::ContentPart::Image {
                                     data: b64,
@@ -752,13 +789,15 @@ impl Agent {
                             }
                             Err(e) => {
                                 let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                    "Failed to load image '{}': {}", img_path.display(), e
+                                    "Failed to load image '{}': {}",
+                                    img_path.display(),
+                                    e
                                 )));
                                 has_errors = true;
                             }
                         }
                     }
-                    
+
                     if !has_errors {
                         let fallback_client = crate::ai::gemini::GeminiClient::new(
                             gemini_key.clone(),
@@ -773,13 +812,16 @@ impl Agent {
                             tool_name: None,
                             thought_signature: None,
                         };
-                        
-                        let request = crate::ai::types::AiRequest::new(vec![msg]).with_temperature(0.5);
+
+                        let request =
+                            crate::ai::types::AiRequest::new(vec![msg]).with_temperature(0.5);
                         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                        
+
                         use crate::ai::AiClient;
                         if let Err(e) = fallback_client.chat_stream(request, tx).await {
-                            let _ = self.event_tx.send(AgentEvent::Error(format!("Gemini fallback failed: {}", e)));
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::Error(format!("Gemini fallback failed: {}", e)));
                         } else {
                             let mut description = String::new();
                             while let Some(event) = rx.recv().await {
@@ -787,7 +829,7 @@ impl Agent {
                                     description.push_str(&text);
                                 }
                             }
-                            
+
                             if !description.trim().is_empty() {
                                 let enriched_prompt = format!(
                                     "[Image content described by Gemini Fallback]:\n{}\n\n{}",
@@ -802,12 +844,16 @@ impl Agent {
                         "📸 Performing OCR on {} image(s)...",
                         valid_images.len()
                     )));
-                    
+
                     let mut all_ocr_texts = Vec::new();
                     for img_path in &valid_images {
                         match vision::ocr_image(ocr_key, img_path).await {
                             Ok(text) => {
-                                all_ocr_texts.push(format!("--- {} ---\n{}", img_path.file_name().unwrap_or_default().to_string_lossy(), text));
+                                all_ocr_texts.push(format!(
+                                    "--- {} ---\n{}",
+                                    img_path.file_name().unwrap_or_default().to_string_lossy(),
+                                    text
+                                ));
                             }
                             Err(e) => {
                                 let _ = self.event_tx.send(AgentEvent::Error(format!(
@@ -818,11 +864,12 @@ impl Agent {
                             }
                         }
                     }
-                    
+
                     if !all_ocr_texts.is_empty() {
                         let enriched_prompt = format!(
                             "[Images analyzed via OCR]:\n{}\n\n{}",
-                            all_ocr_texts.join("\n\n"), actual_user_input
+                            all_ocr_texts.join("\n\n"),
+                            actual_user_input
                         );
                         user_msg = Some(crate::ai::types::Message::user(enriched_prompt));
                     }
@@ -837,7 +884,9 @@ impl Agent {
         let final_msg = user_msg.unwrap_or_else(|| Message::user(actual_user_input.to_string()));
 
         let root_str = self.settings.project_root.to_string_lossy().to_string();
-        let _ = self.event_tx.send(AgentEvent::Status(format!("📂 Agent root: {root_str}")));
+        let _ = self
+            .event_tx
+            .send(AgentEvent::Status(format!("📂 Agent root: {root_str}")));
 
         // Check if user input triggers a skill template
         if let Some(skill) =
@@ -895,10 +944,15 @@ impl Agent {
             // Check for new user instructions sent dynamically mid-run
             if let Some(ref mut rx) = self.instruction_rx {
                 while let Ok(new_prompt) = rx.try_recv() {
-                    let _ = self.event_tx.send(AgentEvent::Status(format!("📥 Received instruction: {}", new_prompt)));
+                    let _ = self.event_tx.send(AgentEvent::Status(format!(
+                        "📥 Received instruction: {}",
+                        new_prompt
+                    )));
                     if let Some(last) = self.messages.last_mut() {
                         if last.role == Role::User {
-                            last.content.push(ContentPart::Text { text: format!("\n\n{}", new_prompt) });
+                            last.content.push(ContentPart::Text {
+                                text: format!("\n\n{}", new_prompt),
+                            });
                             continue;
                         }
                     }
@@ -922,15 +976,16 @@ impl Agent {
             }
 
             // Create AI request with current conversation + tools
-            let mut request = AiRequest::new(active_messages)
-                .with_tools(self.tools.tool_defs());
+            let mut request = AiRequest::new(active_messages).with_tools(self.tools.tool_defs());
 
             let mut temp = 0.7;
             if let Some(effort) = &self.settings.thinking_effort {
                 if effort != "none" {
                     request = request.with_thinking_effort(Some(effort.clone()));
                     request = request.with_reasoning_type(self.settings.model_reasoning_type);
-                    if self.settings.model_reasoning_type == Some(crate::ai::types::ReasoningType::AnthropicThinking) {
+                    if self.settings.model_reasoning_type
+                        == Some(crate::ai::types::ReasoningType::AnthropicThinking)
+                    {
                         temp = 1.0;
                     }
                 }
@@ -1183,7 +1238,9 @@ impl Agent {
                         || name == "replace_file_content"
                         || name == "multi_replace_file_content";
 
-                    let path_opt = args["path"].as_str().or_else(|| args["TargetFile"].as_str());
+                    let path_opt = args["path"]
+                        .as_str()
+                        .or_else(|| args["TargetFile"].as_str());
 
                     if is_file_write {
                         if let Some(path_str) = path_opt {
@@ -1227,7 +1284,9 @@ impl Agent {
             let results = match results_opt {
                 Some(res) => res,
                 None => {
-                    let _ = self.event_tx.send(AgentEvent::Status("⏹️ Run stopped during tool execution".into()));
+                    let _ = self.event_tx.send(AgentEvent::Status(
+                        "⏹️ Run stopped during tool execution".into(),
+                    ));
                     for handle in handles {
                         handle.abort();
                     }
@@ -1244,19 +1303,16 @@ impl Agent {
                             .iter()
                             .find(|tc| tc.id == id)
                             .and_then(|tc| tc.thought_signature.clone());
-                        
+
                         let base64_img = tool_result.base64_image.clone();
-                        
-                        let mut msg = Message::tool_result(
-                            &id,
-                            &name,
-                            tool_result.to_message_content(),
-                        );
-                        
+
+                        let mut msg =
+                            Message::tool_result(&id, &name, tool_result.to_message_content());
+
                         if let Some((data, mime)) = base64_img {
                             msg = msg.with_image(data, mime);
                         }
-                        
+
                         msg.thought_signature = thought_signature;
                         self.messages.push(msg);
                     }

@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Tools — Registry, trait, and result types
 //
 // All tools:
@@ -202,8 +202,6 @@ impl ToolRegistry {
 
         // ── Shell command execution ──────────────────────────────────────
         registry.register(Arc::new(shell::ShellCommandTool));
-        
-
 
         // ── Git tools ────────────────────────────────────────────────────
         registry.register(Arc::new(git::GitStatusTool));
@@ -266,7 +264,9 @@ mod tests {
             settings: Arc::new(settings),
             cwd: root.clone(),
             client: None,
-            temp_memory: Arc::new(tokio::sync::RwLock::new(crate::tools::memory::TempMemory::new())),
+            temp_memory: Arc::new(tokio::sync::RwLock::new(
+                crate::tools::memory::TempMemory::new(),
+            )),
         };
         (root, context)
     }

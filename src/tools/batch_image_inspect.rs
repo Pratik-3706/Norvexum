@@ -63,7 +63,12 @@ impl Tool for BatchViewImageTool {
 
         let mut warning = String::new();
         if paths.len() > MAX_BATCH_SIZE {
-            warning = format!("Warning: {} images provided, but the maximum batch size is {}. Only the first {} images will be analyzed.\n\n", paths.len(), MAX_BATCH_SIZE, MAX_BATCH_SIZE);
+            warning = format!(
+                "Warning: {} images provided, but the maximum batch size is {}. Only the first {} images will be analyzed.\n\n",
+                paths.len(),
+                MAX_BATCH_SIZE,
+                MAX_BATCH_SIZE
+            );
             paths.truncate(MAX_BATCH_SIZE);
         }
 
@@ -72,9 +77,16 @@ impl Tool for BatchViewImageTool {
             .unwrap_or("Describe each image in detail and note any similarities or differences")
             .to_string();
 
-        let context_path = ctx.settings.project_root.join(crate::config::NORVEXUM_DIR).join(crate::config::CONTEXT_FILE);
+        let context_path = ctx
+            .settings
+            .project_root
+            .join(crate::config::NORVEXUM_DIR)
+            .join(crate::config::CONTEXT_FILE);
         if let Ok(context_json) = std::fs::read_to_string(&context_path) {
-            prompt.push_str(&format!("\n\n--- Project Context ---\n{}\n-----------------------", context_json));
+            prompt.push_str(&format!(
+                "\n\n--- Project Context ---\n{}\n-----------------------",
+                context_json
+            ));
         }
 
         // Resolve and validate all paths first
@@ -200,7 +212,12 @@ impl Tool for BatchViewImageTool {
                             mime_type: mime,
                         });
                     }
-                    Err(e) => return ToolResult::err(format!("Failed to encode image '{}': {}", name, e)),
+                    Err(e) => {
+                        return ToolResult::err(format!(
+                            "Failed to encode image '{}': {}",
+                            name, e
+                        ));
+                    }
                 }
             }
 
@@ -210,7 +227,7 @@ impl Tool for BatchViewImageTool {
                 None,
             );
             use crate::ai::AiClient;
-            
+
             let msg = Message {
                 role: Role::User,
                 content: content_parts,
@@ -219,10 +236,10 @@ impl Tool for BatchViewImageTool {
                 tool_name: None,
                 thought_signature: None,
             };
-            
+
             let request = AiRequest::new(vec![msg]).with_temperature(0.5);
             let (tx, mut rx) = mpsc::unbounded_channel();
-            
+
             if let Err(e) = client.chat_stream(request, tx).await {
                 return ToolResult::err(format!("Gemini fallback request failed: {}", e));
             }
@@ -233,7 +250,9 @@ impl Tool for BatchViewImageTool {
                 match event {
                     AiStreamEvent::ContentDelta(text) => description.push_str(&text),
                     AiStreamEvent::Error(err) => {
-                        if err.to_lowercase().contains("safety") || err.to_lowercase().contains("blocked") {
+                        if err.to_lowercase().contains("safety")
+                            || err.to_lowercase().contains("blocked")
+                        {
                             safety_blocked = true;
                         } else {
                             return ToolResult::err(format!("Gemini stream error: {}", err));
@@ -244,7 +263,9 @@ impl Tool for BatchViewImageTool {
             }
 
             if safety_blocked {
-                return ToolResult::err("One or more images may contain NSFW/unsafe content. You must rely on your own native vision capabilities to view them directly.");
+                return ToolResult::err(
+                    "One or more images may contain NSFW/unsafe content. You must rely on your own native vision capabilities to view them directly.",
+                );
             }
 
             if description.trim().is_empty() {
@@ -253,12 +274,19 @@ impl Tool for BatchViewImageTool {
 
             let image_names: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
             ToolResult::ok_with_data(
-                format!("{warning}🖼️ Batch Image Analysis ({} images via Gemini Fallback):\n\n{}", paths.len(), description),
+                format!(
+                    "{warning}🖼️ Batch Image Analysis ({} images via Gemini Fallback):\n\n{}",
+                    paths.len(),
+                    description
+                ),
                 json!({ "images": image_names, "count": paths.len(), "analysis": description, "method": "gemini_fallback" }),
             )
         } else if let Some(ocr_key) = &ctx.settings.ocr_space_api_key {
             let prefix = if ocr_fallback {
-                format!("⚠️ Vision API failed ({}), falling back to OCR...\n\n", vision_error)
+                format!(
+                    "⚠️ Vision API failed ({}), falling back to OCR...\n\n",
+                    vision_error
+                )
             } else {
                 String::new()
             };
@@ -272,12 +300,20 @@ impl Tool for BatchViewImageTool {
             }
 
             ToolResult::ok_with_data(
-                format!("{}{prefix}🖼️ Batch OCR Results ({} images):\n\n{}", warning, paths.len(), results.join("\n\n")),
+                format!(
+                    "{}{prefix}🖼️ Batch OCR Results ({} images):\n\n{}",
+                    warning,
+                    paths.len(),
+                    results.join("\n\n")
+                ),
                 json!({ "images": paths, "count": paths.len(), "method": "ocr" }),
             )
         } else {
             let err_reason = if ocr_fallback {
-                format!("Vision API failed: {}. No GOOGLE_AI_API_KEY available for SDK fallback, and no OCR API key set.", vision_error)
+                format!(
+                    "Vision API failed: {}. No GOOGLE_AI_API_KEY available for SDK fallback, and no OCR API key set.",
+                    vision_error
+                )
             } else {
                 "The current AI model does not support vision, no GOOGLE_AI_API_KEY is available for SDK fallback, and no OCR API key is set.".to_string()
             };

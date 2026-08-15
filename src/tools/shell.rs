@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Shell Command execution tool — with sandbox escape detection
 // ===========================================================================
 
@@ -18,7 +18,8 @@ pub struct ProcessInfo {
     pub kill_tx: tokio::sync::mpsc::Sender<()>,
 }
 
-pub static BACKGROUND_PROCESSES: Lazy<Mutex<HashMap<u32, ProcessInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+pub static BACKGROUND_PROCESSES: Lazy<Mutex<HashMap<u32, ProcessInfo>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn get_background_processes() -> Vec<ProcessInfo> {
     let map = BACKGROUND_PROCESSES.lock().unwrap();
@@ -33,7 +34,10 @@ pub fn kill_background_process(pid: u32) {
 }
 
 pub fn is_shell_builtin(cmd_name: &str) -> bool {
-    matches!(cmd_name, "exit" | "echo" | "set" | "export" | "dir" | "cls" | "start")
+    matches!(
+        cmd_name,
+        "exit" | "echo" | "set" | "export" | "dir" | "cls" | "start"
+    )
 }
 
 /// Check if a command is unparseable or contains shell metacharacters/wildcards
@@ -111,7 +115,11 @@ fn looks_like_path(s: &str) -> bool {
 
 fn clean_path_string(s: &str) -> String {
     let stripped = if let Some(stripped) = s.strip_prefix("file://") {
-        if cfg!(windows) && stripped.starts_with('/') && stripped.len() > 2 && stripped.chars().nth(2) == Some(':') {
+        if cfg!(windows)
+            && stripped.starts_with('/')
+            && stripped.len() > 2
+            && stripped.chars().nth(2) == Some(':')
+        {
             &stripped[1..]
         } else {
             stripped
@@ -253,12 +261,12 @@ impl Tool for ShellCommandTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let command_str = args["command"].as_str().unwrap_or("");
         let mut background = args["background"].as_bool().unwrap_or(false);
-        
+
         // Auto-detect common long-running servers and force background if the agent forgot
         if !background {
             let cmd_lower = command_str.to_lowercase();
-            if cmd_lower.contains("http.server") 
-                || cmd_lower.contains("npm start") 
+            if cmd_lower.contains("http.server")
+                || cmd_lower.contains("npm start")
                 || cmd_lower.contains("npm run dev")
                 || cmd_lower.contains("serve ")
                 || cmd_lower.contains("fastapi dev")
@@ -394,8 +402,8 @@ impl Tool for ShellCommandTool {
 
             let mut cmd = tokio::process::Command::new(shell);
             cmd.args(&command_args)
-               .current_dir(&ctx.cwd)
-               .kill_on_drop(!background);
+                .current_dir(&ctx.cwd)
+                .kill_on_drop(!background);
 
             #[cfg(windows)]
             {
@@ -410,12 +418,15 @@ impl Tool for ShellCommandTool {
                     Ok(mut child) => {
                         if let Some(pid) = child.id() {
                             let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
-                            BACKGROUND_PROCESSES.lock().unwrap().insert(pid, ProcessInfo {
+                            BACKGROUND_PROCESSES.lock().unwrap().insert(
                                 pid,
-                                command: command_str.to_string(),
-                                kill_tx,
-                            });
-                            
+                                ProcessInfo {
+                                    pid,
+                                    command: command_str.to_string(),
+                                    kill_tx,
+                                },
+                            );
+
                             tokio::spawn(async move {
                                 tokio::select! {
                                     _ = child.wait() => {}
@@ -425,12 +436,22 @@ impl Tool for ShellCommandTool {
                                 }
                                 BACKGROUND_PROCESSES.lock().unwrap().remove(&pid);
                             });
-                            
-                            return ToolResult::ok(format!("Command started in background with PID: {}", pid));
+
+                            return ToolResult::ok(format!(
+                                "Command started in background with PID: {}",
+                                pid
+                            ));
                         }
-                        return ToolResult::ok("Command started in background (no PID available)".to_string());
+                        return ToolResult::ok(
+                            "Command started in background (no PID available)".to_string(),
+                        );
                     }
-                    Err(e) => return ToolResult::err(format!("Failed to spawn background command: {}", e)),
+                    Err(e) => {
+                        return ToolResult::err(format!(
+                            "Failed to spawn background command: {}",
+                            e
+                        ));
+                    }
                 }
             }
 
@@ -446,8 +467,8 @@ impl Tool for ShellCommandTool {
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
-           .current_dir(&ctx.cwd)
-           .kill_on_drop(!background);
+            .current_dir(&ctx.cwd)
+            .kill_on_drop(!background);
 
         #[cfg(windows)]
         {
@@ -462,12 +483,15 @@ impl Tool for ShellCommandTool {
                 Ok(mut child) => {
                     if let Some(pid) = child.id() {
                         let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
-                        BACKGROUND_PROCESSES.lock().unwrap().insert(pid, ProcessInfo {
+                        BACKGROUND_PROCESSES.lock().unwrap().insert(
                             pid,
-                            command: command_str.to_string(),
-                            kill_tx,
-                        });
-                        
+                            ProcessInfo {
+                                pid,
+                                command: command_str.to_string(),
+                                kill_tx,
+                            },
+                        );
+
                         tokio::spawn(async move {
                             tokio::select! {
                                 _ = child.wait() => {}
@@ -477,12 +501,19 @@ impl Tool for ShellCommandTool {
                             }
                             BACKGROUND_PROCESSES.lock().unwrap().remove(&pid);
                         });
-                        
-                        return ToolResult::ok(format!("Command started in background with PID: {}", pid));
+
+                        return ToolResult::ok(format!(
+                            "Command started in background with PID: {}",
+                            pid
+                        ));
                     }
-                    return ToolResult::ok("Command started in background (no PID available)".to_string());
+                    return ToolResult::ok(
+                        "Command started in background (no PID available)".to_string(),
+                    );
                 }
-                Err(e) => return ToolResult::err(format!("Failed to spawn background command: {}", e)),
+                Err(e) => {
+                    return ToolResult::err(format!("Failed to spawn background command: {}", e));
+                }
             }
         }
 

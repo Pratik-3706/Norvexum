@@ -2,8 +2,8 @@
 // Config — Settings, .env loading, project-level config
 // ===========================================================================
 
-pub mod providers;
 pub mod model_fetch;
+pub mod providers;
 
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
@@ -138,7 +138,11 @@ impl Settings {
         let mut target_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         // If the current directory ends with target\release or target\debug, default to two levels up (project root)
-        if target_dir.ends_with("target/release") || target_dir.ends_with("target/debug") || target_dir.ends_with("target\\release") || target_dir.ends_with("target\\debug") {
+        if target_dir.ends_with("target/release")
+            || target_dir.ends_with("target/debug")
+            || target_dir.ends_with("target\\release")
+            || target_dir.ends_with("target\\debug")
+        {
             if let Some(parent) = target_dir.parent().and_then(|p| p.parent()) {
                 target_dir = parent.to_path_buf();
             }
@@ -146,7 +150,9 @@ impl Settings {
 
         settings.project_root = target_dir.clone();
 
-        let config_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| target_dir.join(NORVEXUM_DIR));
+        let config_dir = dirs::home_dir()
+            .map(|h| h.join(".norvexum"))
+            .unwrap_or_else(|| target_dir.join(NORVEXUM_DIR));
         let config_path = config_dir.join(CONFIG_FILE);
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)
@@ -231,11 +237,15 @@ impl Settings {
                                 settings.project_root = saved_path.clone();
 
                                 // Also load global config.toml
-                                let global_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| saved_path.join(NORVEXUM_DIR));
+                                let global_dir = dirs::home_dir()
+                                    .map(|h| h.join(".norvexum"))
+                                    .unwrap_or_else(|| saved_path.join(NORVEXUM_DIR));
                                 let config_path = global_dir.join(CONFIG_FILE);
                                 if config_path.exists() {
                                     if let Ok(cfg_content) = std::fs::read_to_string(&config_path) {
-                                        if let Ok(file_settings) = toml::from_str::<FileSettings>(&cfg_content) {
+                                        if let Ok(file_settings) =
+                                            toml::from_str::<FileSettings>(&cfg_content)
+                                        {
                                             if let Some(provider) = file_settings.active_provider {
                                                 settings.active_provider = provider;
                                             }
@@ -266,7 +276,9 @@ impl Settings {
 
     /// Save current config to global ~/.norvexum/config.toml
     pub fn save(&self) -> Result<()> {
-        let config_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| self.project_root.join(NORVEXUM_DIR));
+        let config_dir = dirs::home_dir()
+            .map(|h| h.join(".norvexum"))
+            .unwrap_or_else(|| self.project_root.join(NORVEXUM_DIR));
         std::fs::create_dir_all(&config_dir)?;
 
         let file_settings = FileSettings {

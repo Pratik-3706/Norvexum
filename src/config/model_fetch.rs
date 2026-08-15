@@ -8,7 +8,10 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const AICREDITS_BASE: &str = "https://api.aicredits.in/api";
 const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
-pub async fn fetch_anthropic_models(client: &Client, api_key: &str) -> eyre::Result<Vec<ModelInfo>> {
+pub async fn fetch_anthropic_models(
+    client: &Client,
+    api_key: &str,
+) -> eyre::Result<Vec<ModelInfo>> {
     let mut out = Vec::new();
     let mut after_id: Option<String> = None;
 
@@ -46,18 +49,24 @@ pub async fn fetch_anthropic_models(client: &Client, api_key: &str) -> eyre::Res
                 .await?;
 
             let caps = &detail["capabilities"];
-            
+
             let vision = match caps["image_input"]["supported"].as_bool() {
                 Some(true) => Vision::Yes,
                 Some(false) => Vision::No,
                 None => Vision::Unknown,
             };
 
-            let adaptive_thinking = caps["thinking"]["types"]["adaptive"]["supported"].as_bool().unwrap_or(false);
+            let adaptive_thinking = caps["thinking"]["types"]["adaptive"]["supported"]
+                .as_bool()
+                .unwrap_or(false);
 
             let effort_levels = ["low", "medium", "high", "xhigh", "max"]
                 .iter()
-                .filter(|lvl| caps["effort"][**lvl]["supported"].as_bool().unwrap_or(false))
+                .filter(|lvl| {
+                    caps["effort"][**lvl]["supported"]
+                        .as_bool()
+                        .unwrap_or(false)
+                })
                 .map(|s| s.to_string())
                 .collect();
 
@@ -201,20 +210,20 @@ pub async fn fetch_gemini_models(client: &Client, api_key: &str) -> eyre::Result
 pub fn spawn_background_fetch(settings: &crate::config::Settings) {
     let anthropic_key = settings.anthropic_api_key.clone();
     let gemini_key = settings.google_ai_api_key.clone();
-    
+
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let client = Client::new();
             let mut all_providers = crate::config::providers::build_static_registry();
-            
+
             // AICredits
             if let Ok(models) = fetch_aicredits_models(&client).await {
                 if let Some(p) = all_providers.iter_mut().find(|p| p.name == "aicredits") {
                     p.models = models;
                 }
             }
-            
+
             // Anthropic
             if let Some(key) = anthropic_key.filter(|k| !k.is_empty()) {
                 if let Ok(models) = fetch_anthropic_models(&client, &key).await {
@@ -223,7 +232,7 @@ pub fn spawn_background_fetch(settings: &crate::config::Settings) {
                     }
                 }
             }
-            
+
             // Gemini
             if let Some(key) = gemini_key.filter(|k| !k.is_empty()) {
                 if let Ok(models) = fetch_gemini_models(&client, &key).await {
@@ -232,7 +241,7 @@ pub fn spawn_background_fetch(settings: &crate::config::Settings) {
                     }
                 }
             }
-            
+
             crate::config::providers::update_dynamic_registry(all_providers);
         });
     });
