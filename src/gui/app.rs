@@ -1,3 +1,5 @@
+#![allow(float_literal_f32_fallback)]
+
 use crate::agent::AgentEvent;
 use crate::config::Settings;
 use crate::config::providers::build_registry;
