@@ -1,6 +1,6 @@
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Config — Settings, .env loading, project-level config
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub mod providers;
 pub mod model_fetch;
@@ -207,6 +207,14 @@ impl Settings {
     /// Use this ONLY at GUI startup to remember the last workspace.
     /// CLI and explicit folder changes should use `load()` which is CWD-based.
     pub fn load_remembered() -> Result<Self> {
+        // Pre-load global .env so Self::load() can pick up stored API keys
+        if let Some(home) = dirs::home_dir() {
+            let env_path = home.join(".norvexum").join(".env");
+            if env_path.exists() {
+                let _ = dotenvy::from_path(&env_path);
+            }
+        }
+
         let mut settings = Self::load()?;
 
         // Check global config for last-used project root
@@ -245,12 +253,6 @@ impl Settings {
                                             }
                                         }
                                     }
-                                }
-
-                                // Load .env from global dir
-                                let env_path = global_dir.join(".env");
-                                if env_path.exists() {
-                                    let _ = dotenvy::from_path(&env_path);
                                 }
                             }
                         }

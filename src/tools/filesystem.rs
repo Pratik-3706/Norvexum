@@ -1,9 +1,9 @@
-// ═══════════════════════════════════════════════════════════════════════════
+// ==========================================================================
 // Filesystem Tools — Sandboxed file operations
 //
 // All operations are restricted to the project root directory.
 // Attempting to access files outside the sandbox returns an error.
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -26,7 +26,7 @@ pub(super) fn resolve_path(path_str: &str, ctx: &ToolContext) -> Result<PathBuf,
     } else if Path::new(path_str).is_absolute() {
         // On Windows, if a path starts with a single slash/backslash (e.g. \test or /test)
         // and doesn't specify a drive letter or UNC prefix, it is drive-relative.
-        // We should resolve it relative to CWD instead of drive root to maintain sandbox containment.
+        // I should resolve it relative to CWD instead of drive root to maintain sandbox containment.
         if cfg!(windows)
             && (path_str.starts_with('/') || path_str.starts_with('\\'))
             && !path_str.starts_with("//")

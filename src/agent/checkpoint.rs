@@ -1,10 +1,10 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Checkpoint — File-level undo/rollback via pre-write snapshots
 //
 // Before any destructive file operation (write, edit, delete), the original
 // file content is snapshotted into .norvexum/checkpoints/<timestamp>/.
 // The /undo command restores the most recent checkpoint.
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use eyre::Result;
 use std::path::{Path, PathBuf};

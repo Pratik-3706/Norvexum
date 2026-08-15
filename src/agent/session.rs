@@ -1,9 +1,9 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Session Persistence — Save/load conversation state across restarts
 //
 // Sessions are stored as JSON in .norvexum/sessions/<hash>.json
 // Auto-saved after each agent turn for crash safety.
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use eyre::Result;
 use serde::{Deserialize, Serialize};

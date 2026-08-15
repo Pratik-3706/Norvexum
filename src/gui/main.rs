@@ -1,6 +1,6 @@
 #![allow(unused)]
 #![allow(clippy::all)]
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
 #[path = "../agent/mod.rs"]
 mod agent;
@@ -80,6 +80,13 @@ fn main() -> Result<()> {
     // Check if running in headless mode
     let is_headless = std::env::args().any(|arg| arg == "--headless");
 
+    // Load local .env file (silently ignore if missing)
+    let log_dir = dirs::home_dir()
+        .map(|h| h.join(".norvexum"))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_file_path = log_dir.join("norvexum.log");
+
     if is_headless {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -93,7 +100,7 @@ fn main() -> Result<()> {
         if let Ok(file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("norvexum.log")
+            .open(&log_file_path)
         {
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -103,7 +110,7 @@ fn main() -> Result<()> {
                 .with_writer(file)
                 .init();
         } else {
-            // Discard logs if we cannot open the log file
+            // Discard logs if I cannot open the log file
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -114,12 +121,9 @@ fn main() -> Result<()> {
         }
     }
 
-    // Load local .env file (silently ignore if missing)
-    dotenvy::dotenv().ok();
-
     let cli = Cli::parse();
 
-    // Determine if we should spawn GUI mode
+    // Determine if I should spawn GUI mode
     let is_gui = !cli.headless
         && match &cli.command {
             None => true,

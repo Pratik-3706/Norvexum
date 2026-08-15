@@ -22,5 +22,4 @@ desktop.ini
 
 # Temp & log files
 gui (1).rs
-norvexum.log
-
+*.log

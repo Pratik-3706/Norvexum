@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Agent — Core reasoning loop with thinking + truly parallel tool calling
 //
 // Loop:
@@ -10,7 +10,7 @@
 //   6. On "done" → break
 //   7. Auto-compact context when approaching window limit
 //   8. Auto-save session after each turn
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub mod checkpoint;
 pub mod compaction;
@@ -162,7 +162,7 @@ impl Agent {
         cancel_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
     ) -> Result<()> {
         // Strip images from all previous messages to save massive amounts of payload size on subsequent requests.
-        // The model already saw the images and processed them, so we just keep the text context.
+        // The model already saw the images and processed them, so I just keep the text context.
         for msg in &mut self.messages {
             msg.strip_images();
         }
@@ -1095,7 +1095,7 @@ impl Agent {
                 self.messages.push(Message::assistant(&assistant_text));
             }
 
-            // If no tool calls, we're done
+            // If no tool calls, I'm done
             if !has_tool_calls {
                 let _ = self.event_tx.send(AgentEvent::Done {
                     usage: Some(accumulated_usage.clone()),

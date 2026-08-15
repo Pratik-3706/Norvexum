@@ -1,6 +1,6 @@
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Image Search — DDG image search with relevance scoring
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -422,7 +422,7 @@ async fn query_zerochan_raw(
                         loc_str.to_string()
                     };
 
-                    // Zerochan redirects strip query parameters, so we must re-append them
+                    // Zerochan redirects strip query parameters, so I must re-append them
                     let base_url = absolute_loc.split('?').next().unwrap_or(&absolute_loc);
                     current_url = format!("{}?json&l={}&s=fav", base_url, limit);
                     attempts += 1;

@@ -1,6 +1,6 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Commands: init — Initializes Norvexum project directory and templates
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use crate::agent::history::ProjectContext;
 use crate::config::{CONFIG_FILE, HISTORY_DIR, NORVEXUM_DIR, Settings, VENVS_DIR};
@@ -28,8 +28,8 @@ pub async fn run(settings: &Settings) -> Result<()> {
     fs::create_dir_all(norvexum_path.join(VENVS_DIR))
         .wrap_err("Failed to create venvs directory")?;
 
-    // We no longer save settings.json here because it is global.
-    // Instead we just ensure the global config directory exists.
+    // I no longer save settings.json here because it is global.
+    // Instead I just ensure the global config directory exists.
     let global_config_dir = dirs::home_dir().map(|h| h.join(".norvexum")).unwrap_or_else(|| project_dir.join(NORVEXUM_DIR));
     let _ = fs::create_dir_all(&global_config_dir);
 
@@ -40,7 +40,7 @@ pub async fn run(settings: &Settings) -> Result<()> {
         .wrap_err("Failed to save initial project context")?;
     println!("Created project context index.");
 
-    // We no longer create a local .env file because API keys are stored globally.
+    // I no longer create a local .env file because API keys are stored globally.
 
     // Add to gitignore if git repo is present
     let gitignore_path = project_dir.join(".gitignore");

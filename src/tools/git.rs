@@ -1,16 +1,16 @@
-// ═══════════════════════════════════════════════════════════════════════════
+// =======================================================================
 // Git Tools — Version control awareness
 //
 // Provides git status, diff, commit, and log as agent tools.
 // All operations scoped to the project root.
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use super::{Tool, ToolContext, ToolResult};
 
-// ── git_status ────────────────────────────────────────────────────────────
+//==== git_status ======================
 
 pub struct GitStatusTool;
 
@@ -38,7 +38,7 @@ impl Tool for GitStatusTool {
     }
 }
 
-// ── git_diff ──────────────────────────────────────────────────────────────
+// ============= git_diff =================================
 
 pub struct GitDiffTool;
 

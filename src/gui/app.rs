@@ -117,7 +117,7 @@ pub struct GuiApp {
 
     // Debounce state for the filesystem watcher. When the agent writes a
     // burst of files in quick succession, notify fires dozens of events per
-    // second — without debouncing we'd relaunch `list_workspace_files` every
+    // second — without debouncing I'd relaunch `list_workspace_files` every
     // frame, which is what was making the app appear to freeze for a few
     // seconds after each batch of file writes.
     last_fs_event: Option<std::time::Instant>,
@@ -308,21 +308,57 @@ fn attachment_button(ui: &mut egui::Ui, dark_mode: bool) -> egui::Response {
 
 fn get_secure_key(name: &str) -> Option<String> {
     if let Ok(entry) = keyring::Entry::new("norvexum", name) {
-        entry.get_password().ok()
-    } else {
-        None
+        if let Ok(pw) = entry.get_password() {
+            return Some(pw);
+        }
     }
+    // Fallback to environment variables which might be loaded from .env
+    std::env::var(name.to_uppercase()).ok()
 }
 
 fn set_secure_key(name: &str, val: &str) {
     if let Ok(entry) = keyring::Entry::new("norvexum", name) {
         let _ = entry.set_password(val);
     }
+    
+    // Also explicitly save to ~/.norvexum/.env as a fallback because keyring can fail silently on some Windows setups
+    if let Some(home) = dirs::home_dir() {
+        let norv_dir = home.join(".norvexum");
+        let _ = std::fs::create_dir_all(&norv_dir);
+        let env_path = norv_dir.join(".env");
+        
+        let env_key = name.to_uppercase();
+        let mut lines = Vec::new();
+        if env_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&env_path) {
+                lines = content.lines().map(|s| s.to_string()).collect();
+            }
+        }
+        
+        lines.retain(|l| !l.starts_with(&format!("{}=", env_key)));
+        lines.push(format!("{}={}", env_key, val));
+        
+        let _ = std::fs::write(&env_path, lines.join("\n"));
+    }
 }
 
 fn delete_secure_key(name: &str) {
     if let Ok(entry) = keyring::Entry::new("norvexum", name) {
         let _ = entry.delete_password();
+    }
+    
+    if let Some(home) = dirs::home_dir() {
+        let env_path = home.join(".norvexum").join(".env");
+        if env_path.exists() {
+            let env_key = name.to_uppercase();
+            if let Ok(content) = std::fs::read_to_string(&env_path) {
+                let lines: Vec<String> = content.lines()
+                    .filter(|l| !l.starts_with(&format!("{}=", env_key)))
+                    .map(|s| s.to_string())
+                    .collect();
+                let _ = std::fs::write(&env_path, lines.join("\n"));
+            }
+        }
     }
 }
 
@@ -375,11 +411,11 @@ impl GuiApp {
         mut config: GuiConfig,
         cancel_token: CancellationToken,
     ) -> Self {
-        // Register custom panic hook to write log to %LOCALAPPDATA%
+        // Register custom panic hook to write log to ~/.norvexum
         std::panic::set_hook(Box::new(|info| {
-            let log_dir = std::env::var("LOCALAPPDATA")
-                .map(|p| std::path::PathBuf::from(p).join("Norvexum"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let log_dir = dirs::home_dir()
+                .map(|h| h.join(".norvexum"))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let _ = std::fs::create_dir_all(&log_dir);
             let log_file = log_dir.join("norvexum_crash.log");
             if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -707,8 +743,8 @@ impl GuiApp {
             let _ = self.user_tx.send(format!("/config_update {json}"));
         }
 
-        // Unload Ollama model from memory if we changed the active provider from Ollama to something else,
-        // or if we changed the Ollama model itself.
+        // Unload Ollama model from memory if I changed the active provider from Ollama to something else,
+        // or if I changed the Ollama model itself.
         let last_provider = self.last_active_provider.clone();
         let last_model = self.last_active_model.clone();
         let current_provider = self.settings.active_provider.clone();
@@ -1407,7 +1443,7 @@ impl GuiApp {
             }
         }
 
-        // Drain the filesystem watcher queue. We coalesce all pending events
+        // Drain the filesystem watcher queue. I coalesce all pending events
         // into a single `pending_fs_reload` flag and only actually re-scan
         // after the user (or agent) has stopped touching the filesystem for
         // FS_DEBOUNCE_MS. This is the difference between the UI stalling for
@@ -1435,7 +1471,7 @@ impl GuiApp {
                 self.pending_fs_reload = false;
                 self.trigger_load_files();
             } else {
-                // Keep the UI responsive while we wait for the debounce
+                // Keep the UI responsive while I wait for the debounce
                 // window to expire — without this the file list would feel
                 // like it updates with a stutter.
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -2067,7 +2103,7 @@ impl eframe::App for GuiApp {
                         }),
                 )
                 // Disable resize only while the open/close tween is running;
-                // once settled we let egui remember & control the user width.
+                // once settled I let egui remember & control the user width.
                 .resizable(!left_animating && self.left_sidebar_open)
                 .width_range(60.0..=1200.0);
             if left_animating {
@@ -3193,13 +3229,11 @@ impl eframe::App for GuiApp {
                                         };
                                         let (send_rect, send_resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
                                         ui.painter().circle_filled(send_rect.center(), 15.0, send_color);
-                                        ui.painter().text(
-                                            send_rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            "↑",
-                                            egui::FontId::proportional(16.0),
-                                            egui::Color32::WHITE,
-                                        );
+                                        let center = send_rect.center();
+                                        let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+                                        ui.painter().line_segment([center + egui::vec2(0.0, 5.0), center + egui::vec2(0.0, -5.0)], stroke);
+                                        ui.painter().line_segment([center + egui::vec2(-4.0, -1.0), center + egui::vec2(0.0, -6.0)], stroke);
+                                        ui.painter().line_segment([center + egui::vec2(4.0, -1.0), center + egui::vec2(0.0, -6.0)], stroke);
                                         if send_resp.clicked() && has_text {
                                             self.send_message();
                                             edit_response.request_focus();
@@ -3234,13 +3268,11 @@ impl eframe::App for GuiApp {
                                     };
                                     let (send_rect, send_resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
                                     ui.painter().circle_filled(send_rect.center(), 15.0, send_color);
-                                    ui.painter().text(
-                                        send_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "↑",
-                                        egui::FontId::proportional(16.0),
-                                        egui::Color32::WHITE,
-                                    );
+                                    let center = send_rect.center();
+                                    let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+                                    ui.painter().line_segment([center + egui::vec2(0.0, 5.0), center + egui::vec2(0.0, -5.0)], stroke);
+                                    ui.painter().line_segment([center + egui::vec2(-4.0, -1.0), center + egui::vec2(0.0, -6.0)], stroke);
+                                    ui.painter().line_segment([center + egui::vec2(4.0, -1.0), center + egui::vec2(0.0, -6.0)], stroke);
                                     if send_resp.clicked() && has_text {
                                         self.send_message();
                                         edit_response.request_focus();
@@ -4548,7 +4580,7 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], dark_mode: bool) {
         })
         .stroke(egui::Stroke::new(1.0, border_color))
         .inner_margin(0.0)
-        .rounding(10.0)
+        .rounding(6.0)
         .show(ui, |ui| {
             ui.set_min_width(total_width.min(ui.available_width()));
             egui::Grid::new(ui.next_auto_id())
@@ -4561,11 +4593,10 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], dark_mode: bool) {
                         let w = col_widths[i];
                         egui::Frame::default()
                             .fill(header_bg)
-                            .stroke(egui::Stroke::new(1.0, border_color))
                             .inner_margin(egui::Margin::symmetric(12.0, 9.0))
                             .show(ui, |ui| {
                                 ui.set_min_width(w);
-                                ui.set_max_width(w + 24.0);
+                                ui.set_max_width(w);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.style_mut().spacing.item_spacing.x = 0.0;
                                     render_styled_line_parts(ui, cell, header_fg, 12.5, true);
@@ -4585,11 +4616,10 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], dark_mode: bool) {
                             let w = col_widths[i];
                             egui::Frame::default()
                                 .fill(row_bg)
-                                .stroke(egui::Stroke::new(1.0, border_color))
                                 .inner_margin(egui::Margin::symmetric(12.0, 7.0))
                                 .show(ui, |ui| {
                                     ui.set_min_width(w);
-                                    ui.set_max_width(w + 24.0);
+                                    ui.set_max_width(w);
                                     ui.horizontal_wrapped(|ui| {
                                         ui.style_mut().spacing.item_spacing.x = 0.0;
                                         render_styled_line_parts(ui, cell, body_fg, 12.0, false);

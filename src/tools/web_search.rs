@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Web Search — Tavily (primary) + DuckDuckGo (fallback)
 //
 // Anti-bot:
@@ -6,7 +6,7 @@
 //   • Random delays between requests
 //   • Proper referer chains
 //   • DDG HTML endpoint (less detection than API)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use async_trait::async_trait;
 use eyre::Result;

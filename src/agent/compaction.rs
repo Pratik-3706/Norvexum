@@ -1,9 +1,9 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Agent Compaction — Context window management with auto-summarization
 //
 // Prevents context overflow by summarizing older messages when the
 // conversation approaches 80% of the model's context window.
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use crate::ai::types::{ContentPart, Message, Role};
 
@@ -27,7 +27,7 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
         .sum()
 }
 
-/// Check if we should compact the context.
+/// Check if I should compact the context.
 /// Returns true when estimated tokens exceed `threshold_pct`% of the context window.
 pub fn should_compact(messages: &[Message], context_window: usize, threshold_pct: usize) -> bool {
     if context_window == 0 {

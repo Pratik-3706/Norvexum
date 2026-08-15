@@ -1,9 +1,9 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Ollama — Local model support via Ollama's OpenAI-compatible API
 //
 // Auto-discovers locally available models by querying the Ollama API.
 // Reuses the OpenAI-compatible client since Ollama supports that protocol.
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use serde::Deserialize;
 

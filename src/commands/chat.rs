@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Commands: chat — Starts interactive agent session in TUI or Headless mode
 //
 // Supports:
@@ -6,7 +6,7 @@
 //   • Headless mode for CI/scripting with --headless flag
 //   • Session persistence with auto-save/resume
 //   • Tool approval flow for sandboxed execution
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use crate::agent::{Agent, AgentEvent};
 use crate::config::{NORVEXUM_DIR, Settings};

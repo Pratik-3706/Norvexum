@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Gemini Client — Google AI Studio direct (FREE tier)
 //
 // Features:
@@ -8,7 +8,7 @@
 //   • Image generation via gemini-3.1-flash-image
 //   • Thinking token extraction
 //   • Free-tier rate limit awareness
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use async_trait::async_trait;
 use eyre::Result;

@@ -1,9 +1,9 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Chat rendering helpers — Markdown rendering for terminal display
 //
 // Handles inline formatting, code blocks, tables, and structural elements.
 // Used by the TUI's render_message() for rich text display.
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 /// Format markdown text for terminal display.
 /// Returns the processed text with terminal-friendly formatting markers.
@@ -39,9 +39,9 @@ pub fn format_markdown(text: &str) -> String {
         if let Some(heading) = trimmed.strip_prefix("### ") {
             output.push_str(&format!("   {}\n", heading.to_uppercase()));
         } else if let Some(heading) = trimmed.strip_prefix("## ") {
-            output.push_str(&format!("  ═ {} ═\n", heading.to_uppercase()));
+            output.push_str(&format!("  = {} =\n", heading.to_uppercase()));
         } else if let Some(heading) = trimmed.strip_prefix("# ") {
-            output.push_str(&format!(" ══ {} ══\n", heading.to_uppercase()));
+            output.push_str(&format!(" == {} ==\n", heading.to_uppercase()));
         }
         // Blockquotes
         else if let Some(quote) = trimmed.strip_prefix("> ") {

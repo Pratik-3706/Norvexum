@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Image Generation — Unified dispatcher across multiple free/paid providers
 //
 // Priority:
@@ -9,7 +9,7 @@
 // The agent decides WHEN to generate vs scrape:
 //   • "create/generate/make an image" → image generation
 //   • "find/search/get an image of X" → image_search tool
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use eyre::Result;
 use reqwest::Client;

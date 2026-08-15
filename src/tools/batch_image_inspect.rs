@@ -1,9 +1,9 @@
-// ═══════════════════════════════════════════════════════════════════════════
+// ====================================================================
 // Batch Image Inspect — View and analyze up to 10 images at once
 //
 // Sends multiple images in a single vision request for efficient batch
 // analysis. Falls back to sequential OCR for non-vision models.
-// ═══════════════════════════════════════════════════════════════════════════
+// =====================================================================
 
 use async_trait::async_trait;
 use serde_json::json;

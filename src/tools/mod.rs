@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Tools — Registry, trait, and result types
 //
 // All tools:
@@ -6,7 +6,7 @@
 //   • Are registered by name in the ToolRegistry
 //   • Return ToolResult with structured output
 //   • Are sandboxed to the project directory
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub mod batch_image_inspect;
 pub mod filesystem;

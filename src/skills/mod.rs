@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Skills — Prebuilt and Custom extensible behavioral templates
 //
 // Triggers the agent with specialized instructions for specific tasks.
@@ -6,7 +6,7 @@
 //   - <project_root>/skills/
 //   - <project_root>/.norvexum/skills/
 //   - ~/.norvexum/skills/
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

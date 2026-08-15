@@ -1,9 +1,9 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // AI — Multi-provider AI client layer
 //
 // Unified trait for chat completions, tool calling, streaming, vision,
 // and image generation across all providers including Ollama (local).
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub mod anthropic;
 pub mod gemini;

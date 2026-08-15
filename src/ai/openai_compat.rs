@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // OpenAI-Compatible Client — Covers aicredits.in, OpenAI direct, and any
 // OpenAI-compatible endpoint.
 //
@@ -7,7 +7,7 @@
 //   • Parallel tool calling
 //   • Thinking/reasoning token extraction
 //   • Anti-bot headers for all HTTP requests
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -52,7 +52,7 @@ impl OpenAiCompatClient {
         }
     }
 
-    /// Convert our Message types to OpenAI API format.
+    /// Convert my Message types to OpenAI API format.
     fn format_messages(&self, messages: &[Message]) -> Vec<serde_json::Value> {
         messages
             .iter()
@@ -73,7 +73,7 @@ impl OpenAiCompatClient {
                 if has_image {
                     if role == "tool" {
                         // CRITICAL FIX: APIs often strictly reject `image_url` inside `tool` messages.
-                        // We must split the `tool` message into a text-only tool message, 
+                        // I must split the `tool` message into a text-only tool message, 
                         // and append a new `user` message containing the image.
                         let mut text_parts = Vec::new();
                         let mut img_parts = Vec::new();
@@ -496,7 +496,7 @@ impl AiClient for OpenAiCompatClient {
                                                 .send(AiStreamEvent::ContentDelta(content.clone()));
                                         } else {
                                             think_buf.push_str(content);
-                                            // Try to drain as much as we can safely classify.
+                                            // Try to drain as much as I can safely classify.
                                             loop {
                                                 if !in_thinking {
                                                     if let Some(pos) = think_buf.find("<think>") {

@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ===========================================================================
 // Anthropic Client — Anthropic Messages API with streaming
 //
 // Features:
@@ -6,7 +6,7 @@
 //   • Thinking / extended thinking support
 //   • Tool use (function calling)
 //   • Vision (base64 image input)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -267,7 +267,7 @@ impl AiClient for AnthropicClient {
 
                 // Anthropic uses "event: type\ndata: json" format
                 if line.starts_with("event:") {
-                    continue; // We parse the data line next
+                    continue; // I parse the data line next
                 }
 
                 if let Some(data) = line.strip_prefix("data: ") {
