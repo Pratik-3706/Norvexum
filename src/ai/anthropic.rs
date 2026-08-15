@@ -221,7 +221,7 @@ impl AiClient for AnthropicClient {
         let response = self
             .client
             .post(url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.trim())
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")

@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Image Generation — Unified dispatcher across multiple free/paid providers
 //
 // Priority:
@@ -198,7 +198,7 @@ async fn generate_via_openai(
 
     let response = client
         .post("https://api.openai.com/v1/images/generations")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()

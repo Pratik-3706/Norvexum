@@ -723,9 +723,10 @@ impl GuiApp {
 
                 ui.add(text_edit);
                 if ui.button("Save").clicked() {
-                    if !val.trim().is_empty() {
-                        set_secure_key(field_name, &val);
-                        let key_val = Some(val.clone());
+                    let trimmed_val = val.trim().to_string();
+                    if !trimmed_val.is_empty() {
+                        set_secure_key(field_name, &trimmed_val);
+                        let key_val = Some(trimmed_val.clone());
                         match field_name {
                             "google_ai_api_key" => self.settings.google_ai_api_key = key_val,
                             "openai_api_key" => self.settings.openai_api_key = key_val,

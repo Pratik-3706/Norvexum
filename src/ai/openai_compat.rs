@@ -346,7 +346,7 @@ impl AiClient for OpenAiCompatClient {
         let response = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", self.api_key.trim()))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(&body)
