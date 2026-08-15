@@ -3139,13 +3139,13 @@ impl eframe::App for GuiApp {
                         ui.style_mut().spacing.interact_size.y = 20.0;
                         ui.style_mut().spacing.item_spacing.x = 6.0;
                         ui.label(egui::RichText::new("✨").size(11.0).color(egui::Color32::from_rgb(130, 110, 200)));
-                        
+
                         let registry = build_registry();
                         let mut current_provider_idx = registry
                             .iter()
                             .position(|p| p.name == self.settings.active_provider)
                             .unwrap_or(0);
-                            
+
                         egui::ComboBox::from_id_salt("provider_select_bottom")
                             .selected_text(&registry[current_provider_idx].display_name)
                             .show_ui(ui, |ui| {
@@ -3184,7 +3184,7 @@ impl eframe::App for GuiApp {
                             ui.add(egui::TextEdit::singleline(&mut self.model_search_query).hint_text("Search models..."));
                             ui.separator();
                             egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
-                                
+
                                 let mut starred = Vec::new();
                                 let mut unstarred = Vec::new();
                                 let query = self.model_search_query.to_lowercase();
@@ -3198,7 +3198,7 @@ impl eframe::App for GuiApp {
                                         unstarred.push(model);
                                     }
                                 }
-                                
+
                                 let mut render_model = |ui: &mut egui::Ui, model: &crate::config::providers::ModelInfo| {
                                     ui.horizontal(|ui| {
                                         let is_starred = self.settings.starred_models.contains(&model.id);
@@ -3462,7 +3462,7 @@ impl eframe::App for GuiApp {
                             {
                                 self.terminal_entries.clear();
                             }
-                            
+
                             let bg_procs = crate::tools::shell::get_background_processes();
                             if !bg_procs.is_empty() {
                                 if ui
@@ -3579,11 +3579,11 @@ impl eframe::App for GuiApp {
                                                 .color(egui::Color32::from_rgb(167, 139, 250)) // Purple prompt for active
                                                 .monospace(),
                                         );
-                                        
+
                                         // Make block character blink slightly (using sinus animation)
                                         let time = ui.input(|i| i.time);
                                         let cursor = if (time * 2.0) as i64 % 2 == 0 { "█" } else { " " };
-                                        
+
                                         ui.label(
                                             egui::RichText::new(format!("{} {}", cmd_line, cursor))
                                                 .size(12.0)
@@ -3592,7 +3592,7 @@ impl eframe::App for GuiApp {
                                                 .monospace(),
                                         );
                                     });
-                                    
+
                                     // Request repaint for blinking cursor
                                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
                                 }
