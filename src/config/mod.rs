@@ -75,8 +75,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            active_provider: "google_direct".into(),
-            active_model: "gemini-2.5-flash".into(),
+            active_provider: "openai".into(),
+            active_model: "gpt-4o".into(),
             aicredits_api_key: None,
             google_ai_api_key: None,
             openai_api_key: None,
@@ -193,16 +193,16 @@ impl Settings {
         }
 
         // Auto-select provider based on available keys if using defaults
-        if settings.active_provider == "google_direct" && settings.google_ai_api_key.is_none() {
-            if settings.aicredits_api_key.is_some() {
-                settings.active_provider = "aicredits".into();
-                settings.active_model = "google/gemini-2.5-flash".into();
-            } else if settings.openai_api_key.is_some() {
-                settings.active_provider = "openai".into();
-                settings.active_model = "gpt-4o-mini".into();
-            } else if settings.anthropic_api_key.is_some() {
+        if settings.active_provider == "openai" && settings.openai_api_key.is_none() {
+            if settings.anthropic_api_key.is_some() {
                 settings.active_provider = "anthropic".into();
                 settings.active_model = "claude-3-5-haiku-latest".into();
+            } else if settings.google_ai_api_key.is_some() {
+                settings.active_provider = "google_direct".into();
+                settings.active_model = "gemini-2.5-flash".into();
+            } else if settings.aicredits_api_key.is_some() {
+                settings.active_provider = "aicredits".into();
+                settings.active_model = "google/gemini-2.5-flash".into();
             }
         }
 
