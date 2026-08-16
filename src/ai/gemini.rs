@@ -231,7 +231,9 @@ impl AiClient for GeminiClient {
     ) -> Result<()> {
         let url = format!(
             "{}/models/{}:streamGenerateContent?alt=sse&key={}",
-            GEMINI_BASE, self.model, self.api_key.trim()
+            GEMINI_BASE,
+            self.model,
+            self.api_key.trim()
         );
 
         let (system_instruction, contents) = self.format_contents(&request.messages);
@@ -442,7 +444,9 @@ impl AiClient for GeminiClient {
 
         let url = format!(
             "{}/models/{}:generateContent?key={}",
-            GEMINI_BASE, image_model, self.api_key.trim()
+            GEMINI_BASE,
+            image_model,
+            self.api_key.trim()
         );
 
         let body = json!({
