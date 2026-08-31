@@ -210,6 +210,10 @@ pub async fn fetch_gemini_models(client: &Client, api_key: &str) -> eyre::Result
 pub fn spawn_background_fetch(settings: &crate::config::Settings) {
     let anthropic_key = settings.anthropic_api_key.clone();
     let gemini_key = settings.google_ai_api_key.clone();
+    let ollama_url = settings
+        .ollama_base_url
+        .clone()
+        .unwrap_or_else(|| crate::ai::ollama::DEFAULT_OLLAMA_URL.to_string());
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -239,6 +243,15 @@ pub fn spawn_background_fetch(settings: &crate::config::Settings) {
                     if let Some(p) = all_providers.iter_mut().find(|p| p.name == "google_direct") {
                         p.models = models;
                     }
+                }
+            }
+
+            // Ollama — discover actual local models with their real capabilities
+            // (vision, context window, family) instead of relying on the static
+            // llama3/mistral fallback.
+            if let Some(models) = crate::ai::ollama::discover_models(&ollama_url).await {
+                if let Some(p) = all_providers.iter_mut().find(|p| p.name == "ollama") {
+                    p.models = models;
                 }
             }
 

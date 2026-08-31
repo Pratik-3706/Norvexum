@@ -65,13 +65,20 @@ pub async fn run(mut settings: Settings, initial_msg: Option<String>) -> Result<
     let agent_tx_err = agent_tx.clone();
     let mut settings_local = settings.clone();
     let is_processing_task = is_processing.clone();
+    let active_user_tx_for_unhandled = active_user_tx.clone();
     let process_task = tokio::spawn(async move {
         // Send initial message if provided
         if let Some(msg) = initial_msg {
             is_processing_task.store(true, std::sync::atomic::Ordering::SeqCst);
-            let res = agent.process_message(&msg, &mut cancel_rx).await;
-            if let Err(e) = res {
-                let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
+            match agent.process_message(&msg, &mut cancel_rx).await {
+                Ok(unhandled) => {
+                    for umsg in unhandled {
+                        let _ = active_user_tx_for_unhandled.send(umsg);
+                    }
+                }
+                Err(e) => {
+                    let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
+                }
             }
             is_processing_task.store(false, std::sync::atomic::Ordering::SeqCst);
         }
@@ -109,9 +116,15 @@ pub async fn run(mut settings: Settings, initial_msg: Option<String>) -> Result<
             }
 
             is_processing_task.store(true, std::sync::atomic::Ordering::SeqCst);
-            let res = agent.process_message(&msg, &mut cancel_rx).await;
-            if let Err(e) = res {
-                let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
+            match agent.process_message(&msg, &mut cancel_rx).await {
+                Ok(unhandled) => {
+                    for umsg in unhandled {
+                        let _ = active_user_tx_for_unhandled.send(umsg);
+                    }
+                }
+                Err(e) => {
+                    let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
+                }
             }
             is_processing_task.store(false, std::sync::atomic::Ordering::SeqCst);
         }

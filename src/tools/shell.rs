@@ -68,7 +68,7 @@ fn contains_single_ampersand(s: &str) -> bool {
 }
 
 pub fn has_shell_metacharacters(command_str: &str) -> bool {
-    command_str.contains('|')
+    let mut has_meta = command_str.contains('|')
         || command_str.contains(';')
         || command_str.contains("&&")
         || command_str.contains('>')
@@ -78,7 +78,13 @@ pub fn has_shell_metacharacters(command_str: &str) -> bool {
         || command_str.contains('*')
         || command_str.contains('?')
         || command_str.contains('[')
-        || contains_single_ampersand(command_str)
+        || contains_single_ampersand(command_str);
+        
+    if cfg!(windows) {
+        has_meta = has_meta || command_str.contains('\\');
+    }
+    
+    has_meta
 }
 
 fn is_url_with_non_file_scheme(s: &str) -> bool {
@@ -394,15 +400,17 @@ impl Tool for ShellCommandTool {
 
         if fallback {
             // Fallback path: Run command via cmd.exe on Windows, or sh on Unix
-            let (shell, command_args) = if cfg!(target_os = "windows") {
-                ("cmd.exe", vec!["/C", command_str])
+            let mut cmd = if cfg!(target_os = "windows") {
+                let mut c = tokio::process::Command::new("cmd.exe");
+                c.arg("/C").raw_arg(command_str);
+                c
             } else {
-                ("sh", vec!["-c", command_str])
+                let mut c = tokio::process::Command::new("sh");
+                c.arg("-c").arg(command_str);
+                c
             };
-
-            let mut cmd = tokio::process::Command::new(shell);
-            cmd.args(&command_args)
-                .current_dir(&ctx.cwd)
+            
+            cmd.current_dir(&ctx.cwd)
                 .kill_on_drop(!background);
 
             #[cfg(windows)]

@@ -148,6 +148,7 @@ impl Agent {
 
         self.client = client;
         self.tools = tools;
+        self.max_loops = settings.max_thinking_loops;
         self.settings = settings;
 
         // Replace the first message (which is always the system prompt)
@@ -162,7 +163,7 @@ impl Agent {
         &mut self,
         user_input: &str,
         cancel_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         // Strip images from all previous messages to save massive amounts of payload size on subsequent requests.
         // The model already saw the images and processed them, so I just keep the text context.
         for msg in &mut self.messages {
@@ -185,7 +186,7 @@ impl Agent {
         &mut self,
         user_input: &str,
         cancel_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let mut actual_user_input = user_input;
         let mut explicit_images = Vec::new();
 
@@ -230,7 +231,7 @@ impl Agent {
                         ].join("\n");
                         let _ = self.event_tx.send(AgentEvent::Content(msg));
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/ask_perms" => {
                         if parts.len() > 1 {
@@ -266,7 +267,7 @@ impl Agent {
                             )));
                         }
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/loops" => {
                         if parts.len() > 1 {
@@ -294,7 +295,7 @@ impl Agent {
                             )));
                         }
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/clear" => {
                         if self.messages.len() > 1 {
@@ -302,7 +303,7 @@ impl Agent {
                         }
                         let _ = self.event_tx.send(AgentEvent::ClearChat);
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/undo" => {
                         match checkpoint::undo_last(&self.settings.project_root) {
@@ -329,7 +330,7 @@ impl Agent {
                             }
                         }
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/session" => {
                         if parts.len() < 2 {
@@ -338,7 +339,7 @@ impl Agent {
                                     .into(),
                             ));
                             let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                            return Ok(());
+                            return Ok(self.drain_instructions());
                         }
                         match parts[1] {
                             "load" => {
@@ -373,7 +374,7 @@ impl Agent {
                                     ));
                                 }
                                 let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                                return Ok(());
+                                return Ok(self.drain_instructions());
                             }
                             "resume" => {
                                 if let Some(sess) =
@@ -427,7 +428,7 @@ impl Agent {
                             }
                         }
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/copy" => {
                         let mut content_to_copy = String::new();
@@ -492,20 +493,20 @@ impl Agent {
                             }
                         }
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/exit" | "/quit" => {
                         // Save session before quitting
                         self.save_session();
                         let _ = self.event_tx.send(AgentEvent::Quit);
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/stop" => {
                         let msg = "⏹️ Already stopped".to_string();
                         let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
                         let _ = self.event_tx.send(AgentEvent::Content(msg));
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/model" => {
                         if parts.len() < 2 {
@@ -584,7 +585,7 @@ impl Agent {
 
                             let _ = self.event_tx.send(AgentEvent::Content(list.join("\n")));
                             let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                            return Ok(());
+                            return Ok(self.drain_instructions());
                         }
                         let model_id = parts[1].to_string();
 
@@ -622,7 +623,7 @@ impl Agent {
                             }
                         }
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     "/provider" => {
                         if parts.len() < 2 {
@@ -639,7 +640,7 @@ impl Agent {
 
                             let _ = self.event_tx.send(AgentEvent::Content(list.join("\n")));
                             let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                            return Ok(());
+                            return Ok(self.drain_instructions());
                         }
                         let provider_id = parts[1].to_string();
                         let mut settings = (*self.settings).clone();
@@ -696,7 +697,7 @@ impl Agent {
                             }
                         }
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                     _ => {
                         let unknown_cmd = parts[0];
@@ -705,7 +706,7 @@ impl Agent {
                         );
                         let _ = self.event_tx.send(AgentEvent::Error(msg));
                         let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(());
+                        return Ok(self.drain_instructions());
                     }
                 }
             }
@@ -940,7 +941,20 @@ impl Agent {
             reasoning_tokens: None,
         };
 
-        for loop_num in 0..max_loops {
+        let mut loop_num = 0;
+        loop {
+            if max_loops > 0 && loop_num >= max_loops {
+                let _ = self.event_tx.send(AgentEvent::Error(format!(
+                    "Max thinking loops ({}) reached",
+                    max_loops
+                )));
+                let _ = self.event_tx.send(AgentEvent::Done {
+                    usage: Some(accumulated_usage.clone()),
+                });
+                self.save_session();
+                return Ok(self.drain_instructions());
+            }
+
             // Check for new user instructions sent dynamically mid-run
             if let Some(ref mut rx) = self.instruction_rx {
                 while let Ok(new_prompt) = rx.try_recv() {
@@ -960,14 +974,19 @@ impl Agent {
                 }
             }
 
+            let loop_display = if max_loops > 0 {
+                format!("{}/{}", loop_num + 1, max_loops)
+            } else {
+                format!("{}", loop_num + 1)
+            };
+
             let _ = self.event_tx.send(AgentEvent::Status(format!(
-                "Thinking (loop {}/{})...",
-                loop_num + 1,
-                max_loops
+                "Thinking (loop {})...",
+                loop_display
             )));
 
             let mut active_messages = self.messages.clone();
-            if loop_num >= max_loops.saturating_sub(1) {
+            if max_loops > 0 && loop_num >= max_loops.saturating_sub(1) {
                 active_messages.push(Message::system(format!(
                     "⚠️ SYSTEM WARNING: You are on the final cycle ({} of {}). You are about to reach the loop limit. \
                      You MUST stop calling tools now, summarize your current progress, and ask the user to type 'continue' to let you proceed in the next turn.",
@@ -1137,7 +1156,7 @@ impl Agent {
                 }
                 let _ = self.event_tx.send(AgentEvent::Done { usage: None });
                 self.save_session();
-                return Ok(());
+                return Ok(self.drain_instructions());
             }
 
             // Tool APIs require the assistant call message immediately before results.
@@ -1156,7 +1175,7 @@ impl Agent {
                     usage: Some(accumulated_usage.clone()),
                 });
                 self.save_session();
-                return Ok(());
+                return Ok(self.drain_instructions());
             }
 
             // ── Check approvals ──────────────────────────────────────────
@@ -1291,7 +1310,7 @@ impl Agent {
                         handle.abort();
                     }
                     self.save_session();
-                    return Ok(());
+                    return Ok(self.drain_instructions());
                 }
             };
 
@@ -1306,8 +1325,20 @@ impl Agent {
 
                         let base64_img = tool_result.base64_image.clone();
 
+                        let mut content_str = tool_result.to_message_content();
+                        
+                        // Prevent massive payloads from crashing the API by truncating extremely long tool outputs.
+                        // We use the configured max_content_chars, but cap it at 40,000 characters just in case the user set it excessively high.
+                        let max_tool_chars = self.settings.max_content_chars.min(40000);
+                        if content_str.len() > max_tool_chars {
+                            content_str = format!(
+                                "{}...\n\n[OUTPUT TRUNCATED: Exceeded {} characters]",
+                                &content_str[..max_tool_chars], max_tool_chars
+                            );
+                        }
+
                         let mut msg =
-                            Message::tool_result(&id, &name, tool_result.to_message_content());
+                            Message::tool_result(&id, &name, content_str);
 
                         if let Some((data, mime)) = base64_img {
                             msg = msg.with_image(data, mime);
@@ -1327,18 +1358,19 @@ impl Agent {
             }
 
             // Continue the loop — the model will see tool results and continue
+            self.save_session();
         }
+        Ok(self.drain_instructions())
+    }
 
-        let _ = self.event_tx.send(AgentEvent::Error(format!(
-            "Max thinking loops ({}) reached",
-            max_loops
-        )));
-        let _ = self.event_tx.send(AgentEvent::Done {
-            usage: Some(accumulated_usage),
-        });
-        self.save_session();
-
-        Ok(())
+    fn drain_instructions(&mut self) -> Vec<String> {
+        let mut unhandled = Vec::new();
+        if let Some(ref mut rx) = self.instruction_rx {
+            while let Ok(msg) = rx.try_recv() {
+                unhandled.push(msg);
+            }
+        }
+        unhandled
     }
 
     /// Get the current conversation history.

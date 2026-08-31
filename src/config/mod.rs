@@ -190,6 +190,18 @@ impl Settings {
             if let Some(effort) = file_settings.thinking_effort {
                 settings.thinking_effort = Some(effort);
             }
+            if let Some(ask) = file_settings.ask_perms {
+                settings.ask_perms = ask;
+            }
+            if let Some(fs) = file_settings.fullscreen {
+                settings.fullscreen = fs;
+            }
+            if let Some(max) = file_settings.maximized {
+                settings.maximized = max;
+            }
+            if let Some(csp) = file_settings.custom_system_prompt {
+                settings.custom_system_prompt = Some(csp);
+            }
         }
 
         // Auto-select provider based on available keys if using defaults
@@ -304,6 +316,10 @@ impl Settings {
                 Some(self.starred_models.clone())
             },
             thinking_effort: self.thinking_effort.clone(),
+            ask_perms: Some(self.ask_perms),
+            fullscreen: Some(self.fullscreen),
+            maximized: Some(self.maximized),
+            custom_system_prompt: self.custom_system_prompt.clone(),
         };
 
         let content = toml::to_string_pretty(&file_settings)?;
@@ -378,4 +394,8 @@ struct FileSettings {
     custom_models: Option<Vec<String>>,
     starred_models: Option<Vec<String>>,
     thinking_effort: Option<String>,
+    ask_perms: Option<bool>,
+    fullscreen: Option<bool>,
+    maximized: Option<bool>,
+    custom_system_prompt: Option<String>,
 }

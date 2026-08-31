@@ -1057,8 +1057,18 @@ impl GuiApp {
         };
 
         if is_writing {
-            let streaming_content =
+            let mut streaming_content =
                 extract_streaming_content(&self.current_tool_args, "CodeContent");
+            if streaming_content.is_empty() {
+                streaming_content = extract_streaming_content(&self.current_tool_args, "content");
+            }
+            if streaming_content.is_empty() {
+                streaming_content = extract_streaming_content(&self.current_tool_args, "ReplacementContent");
+            }
+            if streaming_content.is_empty() {
+                streaming_content = extract_streaming_content(&self.current_tool_args, "TargetContent");
+            }
+            
             if !streaming_content.is_empty() {
                 self.inspected_file_content = streaming_content;
                 return;
@@ -1827,18 +1837,36 @@ impl GuiApp {
                         );
                         ui.add_space(6.0);
 
-                        ui.label(
-                            egui::RichText::new("Max thinking loops per cycle:").color(label_color),
-                        );
-                        if ui
-                            .add(egui::Slider::new(
-                                &mut self.settings.max_thinking_loops,
-                                1..=100,
-                            ))
-                            .changed()
-                        {
-                            changed = true;
-                        }
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Max thinking loops per cycle:").color(label_color),
+                            );
+                            
+                            let mut is_infinite = self.settings.max_thinking_loops == 0;
+                            if ui.checkbox(&mut is_infinite, "Infinite").changed() {
+                                if is_infinite {
+                                    self.settings.max_thinking_loops = 0;
+                                } else {
+                                    self.settings.max_thinking_loops = 25; // default back to 25
+                                }
+                                changed = true;
+                            }
+                        });
+
+                        ui.add_enabled_ui(self.settings.max_thinking_loops != 0, |ui| {
+                            let mut temp_loops = if self.settings.max_thinking_loops == 0 {
+                                25
+                            } else {
+                                self.settings.max_thinking_loops
+                            };
+                            if ui
+                                .add(egui::Slider::new(&mut temp_loops, 1..=100))
+                                .changed()
+                            {
+                                self.settings.max_thinking_loops = temp_loops;
+                                changed = true;
+                            }
+                        });
 
                         ui.label(
                             egui::RichText::new("Browser timeout (seconds):").color(label_color),
@@ -3215,8 +3243,22 @@ impl eframe::App for GuiApp {
                                             }
                                             self.sync_settings();
                                         }
-                                        let v_icon = if matches!(model.vision, crate::config::providers::Vision::Yes) { " 👁" } else { "" };
-                                        let display_text = format!("{}{}", model.id, v_icon);
+
+                                        // Build capability badges
+                                        let mut badges = String::new();
+                                        if matches!(model.vision, crate::config::providers::Vision::Yes) {
+                                            badges.push_str(" 👁");
+                                        }
+                                        if model.tool_calling {
+                                            badges.push_str(" 🔧");
+                                        }
+                                        // Show context window in compact form (e.g. "128k")
+                                        let ctx_k = model.context_window / 1000;
+                                        if ctx_k > 0 {
+                                            badges.push_str(&format!(" {}k", ctx_k));
+                                        }
+
+                                        let display_text = format!("{}{}", model.id, badges);
                                         if ui.selectable_value(&mut self.settings.active_model, model.id.clone(), display_text).clicked() {
                                             self.sync_settings();
                                             ui.memory_mut(|mem| mem.close_popup());
