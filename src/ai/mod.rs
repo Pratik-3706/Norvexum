@@ -10,6 +10,7 @@ pub mod gemini;
 pub mod image_gen;
 pub mod ollama;
 pub mod openai_compat;
+pub mod sse;
 pub mod types;
 
 use async_trait::async_trait;
@@ -18,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Settings;
 use crate::config::providers::{ApiStyle, find_provider};
-use types::{AiRequest, AiStreamEvent, ImageGenRequest, ImageGenResult};
+use types::{AiRequest, AiStreamEvent};
 
 /// Unified AI client interface.
 /// All providers implement this trait so the agent loop is provider-agnostic.
@@ -34,20 +35,55 @@ pub trait AiClient: Send + Sync {
 
     /// Whether this model supports vision (image input).
     fn supports_vision(&self) -> bool;
+}
 
-    /// Whether this model supports image generation.
-    fn supports_image_gen(&self) -> bool;
+/// HTTP client for streaming model APIs.
+///
+/// A total-request `timeout` would abort long answers mid-stream, so only the
+/// connection and the gap between received chunks are bounded.
+pub fn streaming_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(300))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
+        .build()
+        .unwrap_or_default()
+}
 
-    /// Generate an image (only if supports_image_gen() is true).
-    async fn generate_image(&self, _request: ImageGenRequest) -> Result<ImageGenResult> {
-        eyre::bail!("Image generation not supported by this provider/model")
+/// Turn an HTTP error response into a one-line message: the provider's own
+/// `error.message` instead of the whole JSON body, plus any `retry-after` hint
+/// (the agent's retry logic reads "retry in Ns").
+pub async fn describe_http_error(provider: &str, response: reqwest::Response) -> String {
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let body = response.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            let err = if v["error"].is_object() {
+                &v["error"]
+            } else {
+                &v
+            };
+            err["message"]
+                .as_str()
+                .or_else(|| v["error"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+    let mut out = format!(
+        "{provider} API error {status}: {}",
+        crate::util::truncate_chars(&message, 600)
+    );
+    if let Some(secs) = retry_after {
+        out.push_str(&format!(" (retry in {secs}s)"));
     }
-
-    /// Provider name for display purposes.
-    fn provider_name(&self) -> &str;
-
-    /// Model ID for display purposes.
-    fn model_id(&self) -> &str;
+    out
 }
 
 /// Build the appropriate AI client based on settings.
@@ -59,26 +95,30 @@ pub fn build_client(settings: &Settings) -> Result<Box<dyn AiClient>> {
             .as_deref()
             .unwrap_or(ollama::DEFAULT_OLLAMA_URL);
 
+        let model_info = ollama::cached_model_info(&settings.active_model);
         // Ollama uses OpenAI-compatible API at /v1
         let api_url = format!("{}/v1", base_url.trim_end_matches('/'));
         return Ok(Box::new(openai_compat::OpenAiCompatClient::new(
             api_url,
             "ollama".to_string(), // Ollama doesn't need a real API key
             settings.active_model.clone(),
-            None, // Model info will be discovered dynamically
+            model_info,
         )));
     }
 
     let provider = find_provider(&settings.active_provider)
         .ok_or_else(|| eyre::eyre!("Unknown provider: {}", settings.active_provider))?;
 
-    let api_key = settings.active_api_key().unwrap_or_default().to_string();
+    let api_key = settings
+        .active_api_key()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
-    let model_info = provider
-        .models
-        .iter()
-        .find(|m| m.id == settings.active_model)
-        .cloned();
+    let model_info = crate::config::providers::build_registry_with_settings(settings)
+        .into_iter()
+        .find(|p| p.name == provider.name)
+        .and_then(|p| p.models.into_iter().find(|m| m.id == settings.active_model));
 
     match provider.api_style {
         ApiStyle::OpenAiCompat => Ok(Box::new(openai_compat::OpenAiCompatClient::new(
@@ -100,58 +140,75 @@ pub fn build_client(settings: &Settings) -> Result<Box<dyn AiClient>> {
     }
 }
 
-/// Guess reasoning support based on model/provider name (heuristic fallback)
+/// Stand-in used when the configured provider cannot be built (e.g. a typo in
+/// `active_provider`). The app still starts; every request explains the problem.
+pub struct UnavailableClient {
+    pub reason: String,
+}
+
+#[async_trait]
+impl AiClient for UnavailableClient {
+    async fn chat_stream(
+        &self,
+        _request: AiRequest,
+        tx: mpsc::UnboundedSender<AiStreamEvent>,
+    ) -> Result<()> {
+        let _ = tx.send(AiStreamEvent::Error(format!(
+            "{} — pick a valid provider/model with /provider and /model, or `norvexum config set`.",
+            self.reason
+        )));
+        Ok(())
+    }
+
+    fn supports_vision(&self) -> bool {
+        false
+    }
+}
+
+/// Guess reasoning support from the model/provider name (used until a probe
+/// result is cached, and whenever probing is inconclusive).
 pub fn guess_reasoning_support_by_name(
     provider: &str,
     model: &str,
 ) -> Option<types::ReasoningType> {
     let model_lower = model.to_lowercase();
     let provider_lower = provider.to_lowercase();
+    // Gateways prefix ids with the vendor, e.g. "openai/o3-mini".
+    let bare = model_lower.rsplit('/').next().unwrap_or(&model_lower);
 
-    // Google Gemini (Gemini 2.0+ support thinking config)
-    if provider_lower.contains("google") || model_lower.contains("gemini") {
-        if model_lower.contains("gemini-2.0")
-            || model_lower.contains("gemini-2.5")
-            || model_lower.contains("gemini-3")
-            || model_lower.contains("gemini-pro")
-        {
-            return Some(types::ReasoningType::GeminiThinking);
-        }
+    if provider_lower == "anthropic" || bare.starts_with("claude") {
+        return anthropic::model_supports_thinking(bare)
+            .then_some(types::ReasoningType::AnthropicThinking);
     }
 
-    // Anthropic Claude (Claude 3.7+ support extended thinking)
-    if provider_lower.contains("anthropic") || model_lower.contains("claude") {
-        if model_lower.contains("claude-3-7")
-            || model_lower.contains("claude-3.7")
-            || model_lower.contains("claude-4")
-        {
-            return Some(types::ReasoningType::AnthropicThinking);
-        }
+    if provider_lower.contains("google") || bare.starts_with("gemini") {
+        let thinking = ["gemini-2.5", "gemini-3", "gemini-pro"]
+            .iter()
+            .any(|p| bare.starts_with(p))
+            && !bare.contains("image");
+        return thinking.then_some(types::ReasoningType::GeminiThinking);
     }
 
-    // OpenAI o1 / o3 / o4
-    if provider_lower.contains("openai")
-        || model_lower.contains("o1")
-        || model_lower.contains("o3")
-        || model_lower.contains("o4")
-    {
-        if model_lower.contains("o1-")
-            || model_lower.contains("o3-")
-            || model_lower.contains("o4-")
-            || model_lower == "o1"
-            || model_lower == "o3"
-            || model_lower == "o4"
-        {
-            return Some(types::ReasoningType::OpenAiEffort);
-        }
+    // OpenAI o-series and gpt-5 family accept `reasoning_effort`.
+    let o_series = ["o1", "o3", "o4"]
+        .iter()
+        .any(|p| bare == *p || bare.starts_with(&format!("{p}-")));
+    if o_series || bare.starts_with("gpt-5") {
+        return Some(types::ReasoningType::OpenAiEffort);
     }
 
-    // DeepSeek R1 / Reasoner / Think models
-    if model_lower.contains("-r1")
-        || model_lower.contains("r1-")
-        || model_lower.contains("reasoner")
-        || model_lower.contains("-think")
-        || model_lower.contains("thinking")
+    // DeepSeek V3.1+ / V4 are hybrid models: they only stream reasoning when
+    // `reasoning_effort` is sent.
+    let deepseek_hybrid =
+        regex::Regex::new(r"^deepseek-v(?:3\.[1-9]|[4-9])").is_ok_and(|re| re.is_match(bare));
+
+    // DeepSeek R1 / reasoner / "thinking" variants
+    if deepseek_hybrid
+        || bare.contains("-r1")
+        || bare.starts_with("r1-")
+        || bare.contains("reasoner")
+        || bare.contains("-think")
+        || bare.contains("thinking")
     {
         return Some(types::ReasoningType::OpenAiEffort);
     }
@@ -159,148 +216,173 @@ pub fn guess_reasoning_support_by_name(
     None
 }
 
-/// Dynamically probe if a model supports reasoning by sending a 1-token test prompt
+/// Probe whether a model accepts reasoning parameters by sending a tiny request.
+/// Falls back to the name heuristic when the probe is inconclusive (auth
+/// errors, rate limits, timeouts).
 pub async fn probe_model_reasoning(
     settings: &Settings,
     provider_name: &str,
     model_name: &str,
 ) -> Option<types::ReasoningType> {
+    let heuristic = guess_reasoning_support_by_name(provider_name, model_name);
+
     let mut temp_settings = settings.clone();
     temp_settings.active_provider = provider_name.to_string();
     temp_settings.active_model = model_name.to_string();
 
-    let client = match build_client(&temp_settings) {
-        Ok(c) => c,
-        Err(_) => return None,
+    let Ok(client) = build_client(&temp_settings) else {
+        return heuristic;
+    };
+    let Some(provider) = find_provider(provider_name) else {
+        return heuristic;
     };
 
-    let provider = match find_provider(provider_name) {
-        Some(p) => p,
-        None => return None,
+    let candidates: &[types::ReasoningType] = match provider.api_style {
+        ApiStyle::GeminiDirect => &[types::ReasoningType::GeminiThinking],
+        ApiStyle::Anthropic => &[types::ReasoningType::AnthropicThinking],
+        ApiStyle::OpenAiCompat => &[
+            types::ReasoningType::OpenAiEffort,
+            types::ReasoningType::AnthropicThinking,
+        ],
     };
 
-    match provider.api_style {
-        ApiStyle::GeminiDirect => {
-            if test_gemini_thinking(&*client).await {
-                Some(types::ReasoningType::GeminiThinking)
-            } else {
-                None
-            }
-        }
-        ApiStyle::Anthropic => {
-            if test_anthropic_thinking(&*client).await {
-                Some(types::ReasoningType::AnthropicThinking)
-            } else {
-                None
-            }
-        }
-        ApiStyle::OpenAiCompat => {
-            // First try OpenAI-style reasoning_effort
-            if test_openai_effort(&*client).await {
-                Some(types::ReasoningType::OpenAiEffort)
-            } else if test_anthropic_thinking(&*client).await {
-                // Then try Anthropic/DeepSeek-style thinking configuration
-                Some(types::ReasoningType::AnthropicThinking)
-            } else {
-                None
-            }
+    for &kind in candidates {
+        match probe_once(&*client, kind).await {
+            ProbeOutcome::Supported => return Some(kind),
+            ProbeOutcome::Unsupported => continue,
+            ProbeOutcome::Inconclusive => return heuristic,
         }
     }
+    None
 }
 
-async fn test_openai_effort(client: &dyn AiClient) -> bool {
-    let request = types::AiRequest::new(vec![types::Message::user("h")])
+enum ProbeOutcome {
+    Supported,
+    Unsupported,
+    Inconclusive,
+}
+
+async fn probe_once(client: &dyn AiClient, kind: types::ReasoningType) -> ProbeOutcome {
+    // Anthropic budgets must stay below max_tokens; reasoning models also need
+    // room to emit at least a few reasoning tokens.
+    let max_tokens = match kind {
+        types::ReasoningType::AnthropicThinking => 2048,
+        _ => 256,
+    };
+    let request = types::AiRequest::new(vec![types::Message::user("Reply with: ok")])
         .with_temperature(1.0)
-        .with_max_tokens(1)
+        .with_max_tokens(max_tokens)
         .with_thinking_effort(Some("low".to_string()))
-        .with_reasoning_type(Some(types::ReasoningType::OpenAiEffort));
-    run_test_request(client, request).await
-}
+        .with_reasoning_type(Some(kind));
 
-async fn test_anthropic_thinking(client: &dyn AiClient) -> bool {
-    let request = types::AiRequest::new(vec![types::Message::user("h")])
-        .with_temperature(1.0)
-        // Anthropic requires max_tokens to be strictly greater than budget_tokens
-        .with_max_tokens(2048)
-        .with_thinking_effort(Some("low".to_string()))
-        .with_reasoning_type(Some(types::ReasoningType::AnthropicThinking));
-    run_test_request(client, request).await
-}
-
-async fn test_gemini_thinking(client: &dyn AiClient) -> bool {
-    let request = types::AiRequest::new(vec![types::Message::user("h")])
-        .with_temperature(1.0)
-        .with_max_tokens(1)
-        .with_thinking_effort(Some("low".to_string()))
-        .with_reasoning_type(Some(types::ReasoningType::GeminiThinking));
-    run_test_request(client, request).await
-}
-
-async fn run_test_request(client: &dyn AiClient, request: types::AiRequest) -> bool {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = client.chat_stream(request, tx);
-
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let mut has_reasoning = false;
-    let mut is_unsupported_param_error = false;
-    let mut has_any_error = false;
-    let mut stream_succeeded = false;
+    let mut succeeded = false;
+    let mut errors: Vec<String> = Vec::new();
 
-    let receive_future = async {
-        while let Some(event) = rx.recv().await {
-            match event {
-                types::AiStreamEvent::Error(err) => {
-                    has_any_error = true;
-                    let err_lower = err.to_lowercase();
-                    if err_lower.contains("parameter")
-                        || err_lower.contains("unknown")
-                        || err_lower.contains("support")
-                        || err_lower.contains("invalid")
-                        || err_lower.contains("400")
-                    {
-                        is_unsupported_param_error = true;
+    // The request future must actually be polled — it is joined with the
+    // receiver so events are consumed while it streams.
+    let run = async {
+        let stream = client.chat_stream(request, tx);
+        let receive = async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    AiStreamEvent::Error(err) => errors.push(err),
+                    AiStreamEvent::ThinkingDelta(_)
+                    | AiStreamEvent::ThinkingDone
+                    | AiStreamEvent::ThinkingBlock(_) => {
+                        has_reasoning = true;
+                        succeeded = true;
                     }
-                }
-                types::AiStreamEvent::ThinkingDelta(_) | types::AiStreamEvent::ThinkingDone => {
-                    has_reasoning = true;
-                    stream_succeeded = true;
-                }
-                types::AiStreamEvent::ContentDelta(_) => {
-                    stream_succeeded = true;
-                }
-                types::AiStreamEvent::Done { usage, .. } => {
-                    stream_succeeded = true;
-                    if let Some(u) = usage {
-                        if let Some(r_tokens) = u.reasoning_tokens {
-                            if r_tokens > 0 {
-                                has_reasoning = true;
-                            }
+                    AiStreamEvent::ContentDelta(_) => succeeded = true,
+                    AiStreamEvent::Done { usage, .. } => {
+                        succeeded = true;
+                        if usage
+                            .and_then(|u| u.reasoning_tokens)
+                            .is_some_and(|r| r > 0)
+                        {
+                            has_reasoning = true;
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
+        };
+        let (result, ()) = tokio::join!(stream, receive);
+        result
     };
 
-    let timeout_result =
-        tokio::time::timeout(std::time::Duration::from_secs(5), receive_future).await;
-    if timeout_result.is_err() {
-        has_any_error = true; // Mark as error if it timed out
+    match tokio::time::timeout(std::time::Duration::from_secs(20), run).await {
+        Err(_) => return ProbeOutcome::Inconclusive,
+        Ok(Err(e)) => errors.push(e.to_string()),
+        Ok(Ok(())) => {}
     }
 
-    // Drop rx so the background stream task will naturally terminate if it tries to send more
-    drop(rx);
-
-    if is_unsupported_param_error {
-        return false;
+    if let Some(err) = errors.first() {
+        let lower = err.to_lowercase();
+        let rejected_param = lower.contains("400")
+            || lower.contains("unsupported")
+            || lower.contains("not supported")
+            || lower.contains("unrecognized")
+            || lower.contains("unknown parameter")
+            || lower.contains("extra inputs");
+        return if rejected_param {
+            ProbeOutcome::Unsupported
+        } else {
+            ProbeOutcome::Inconclusive
+        };
     }
 
-    if has_any_error && !stream_succeeded {
-        // Rate limits, auth errors, etc. keep the check optimistic
-        return true;
+    // Aggregators sometimes silently drop the parameter, so a plain success
+    // without any reasoning output counts as "unsupported".
+    if has_reasoning {
+        ProbeOutcome::Supported
+    } else if succeeded {
+        ProbeOutcome::Unsupported
+    } else {
+        ProbeOutcome::Inconclusive
     }
+}
 
-    // If stream succeeded without error, it must have actually used reasoning.
-    // This prevents false positives on aggregators that silently strip the parameter.
-    has_reasoning
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::ReasoningType::*;
+
+    #[test]
+    fn reasoning_heuristic_matches_current_model_names() {
+        assert_eq!(
+            guess_reasoning_support_by_name("anthropic", "claude-sonnet-4-5-20250929"),
+            Some(AnthropicThinking)
+        );
+        assert_eq!(
+            guess_reasoning_support_by_name("anthropic", "claude-opus-5-5"),
+            Some(AnthropicThinking)
+        );
+        assert_eq!(
+            guess_reasoning_support_by_name("anthropic", "claude-3-5-haiku-latest"),
+            None
+        );
+        assert_eq!(
+            guess_reasoning_support_by_name("openai", "o3-mini"),
+            Some(OpenAiEffort)
+        );
+        assert_eq!(
+            guess_reasoning_support_by_name("openai", "gpt-5"),
+            Some(OpenAiEffort)
+        );
+        assert_eq!(guess_reasoning_support_by_name("openai", "gpt-4o"), None);
+        assert_eq!(
+            guess_reasoning_support_by_name("aicredits", "openai/o4-mini"),
+            Some(OpenAiEffort)
+        );
+        assert_eq!(
+            guess_reasoning_support_by_name("google_direct", "gemini-2.5-flash"),
+            Some(GeminiThinking)
+        );
+        assert_eq!(
+            guess_reasoning_support_by_name("aicredits", "deepseek/deepseek-r1"),
+            Some(OpenAiEffort)
+        );
+    }
 }

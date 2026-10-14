@@ -11,6 +11,12 @@ pub struct TempMemory {
     current_size: usize,
 }
 
+impl Default for TempMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TempMemory {
     pub fn new() -> Self {
         Self {
@@ -20,25 +26,27 @@ impl TempMemory {
     }
 
     pub fn store(&mut self, key: String, value: String) -> Result<(), String> {
-        let value_size = value.len();
-
-        // Check if value itself is too large
-        if value_size > MAX_MEMORY_SIZE {
-            return Err(format!("Value too large to store. Max size is 20MB."));
+        let replaced = self.storage.get(&key).map_or(0, String::len);
+        let new_size = self.current_size - replaced + value.len();
+        if new_size > MAX_MEMORY_SIZE {
+            // Evicting other keys silently would lose data the model still relies on.
+            return Err(format!(
+                "Not enough space: storing {} bytes would use {} of {} bytes. Overwrite or drop other keys first (stored keys: {}).",
+                value.len(),
+                new_size,
+                MAX_MEMORY_SIZE,
+                self.keys().join(", ")
+            ));
         }
-
-        // If storing this exceeds max memory, flush everything
-        if self.current_size + value_size > MAX_MEMORY_SIZE {
-            self.storage.clear();
-            self.current_size = 0;
-        }
-
-        if let Some(old_val) = self.storage.insert(key.clone(), value) {
-            self.current_size -= old_val.len();
-        }
-        self.current_size += value_size;
-
+        self.storage.insert(key, value);
+        self.current_size = new_size;
         Ok(())
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.storage.keys().cloned().collect();
+        keys.sort();
+        keys
     }
 
     pub fn read(&self, key: &str) -> Option<String> {
@@ -57,7 +65,7 @@ impl Tool for StoreInMemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Store a string value in temporary RAM storage (max 20MB). Useful for stashing code, drafts, or fetched web content without creating files."
+        "Store a string in temporary in-memory storage (max 20MB total, lost when the app exits) to pass data between steps."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -81,11 +89,12 @@ impl Tool for StoreInMemoryTool {
             None => return ToolResult::err("Missing 'value' argument"),
         };
 
+        let size = value.len();
         let mut mem = ctx.temp_memory.write().await;
         match mem.store(key.clone(), value) {
             Ok(_) => ToolResult::ok(format!(
-                "Successfully stored {} bytes under key '{}'. Current memory usage: {}/20MB.",
-                mem.current_size, key, mem.current_size
+                "Stored {size} bytes under '{key}'. Memory in use: {:.1} KB of 20 MB.",
+                mem.current_size as f64 / 1024.0
             )),
             Err(e) => ToolResult::err(e),
         }
@@ -126,7 +135,15 @@ impl Tool for ReadFromMemoryTool {
         if let Some(val) = mem.read(key) {
             ToolResult::ok(val)
         } else {
-            ToolResult::err(format!("Key '{}' not found in temporary memory.", key))
+            let keys = mem.keys();
+            ToolResult::err(format!(
+                "Key '{key}' not found. Stored keys: {}",
+                if keys.is_empty() {
+                    "none".to_string()
+                } else {
+                    keys.join(", ")
+                }
+            ))
         }
     }
 }

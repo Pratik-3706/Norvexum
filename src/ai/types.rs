@@ -22,6 +22,22 @@ pub struct Message {
     /// Thought signature for Gemini tool calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// Signed reasoning blocks (Anthropic). They must be sent back unchanged
+    /// while a tool loop is in progress, or the API rejects the request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_blocks: Vec<ThinkingBlock>,
+}
+
+/// A reasoning block exactly as the provider returned it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThinkingBlock {
+    #[serde(default)]
+    pub thinking: String,
+    #[serde(default)]
+    pub signature: String,
+    /// Opaque payload of a `redacted_thinking` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_data: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +72,7 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             thought_signature: None,
+            thinking_blocks: vec![],
         }
     }
 
@@ -67,6 +84,7 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             thought_signature: None,
+            thinking_blocks: vec![],
         }
     }
 
@@ -84,6 +102,7 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             thought_signature: None,
+            thinking_blocks: vec![],
         }
     }
 
@@ -102,6 +121,7 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             thought_signature: None,
+            thinking_blocks: vec![],
         }
     }
 
@@ -113,6 +133,7 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             thought_signature: None,
+            thinking_blocks: vec![],
         }
     }
 
@@ -124,6 +145,7 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             thought_signature: None,
+            thinking_blocks: vec![],
         }
     }
 
@@ -141,6 +163,7 @@ impl Message {
             tool_call_id: Some(call_id.into()),
             tool_name: Some(tool_name.into()),
             thought_signature: None,
+            thinking_blocks: vec![],
         }
     }
 
@@ -256,6 +279,8 @@ pub enum AiStreamEvent {
     ThinkingDelta(String),
     /// End of thinking block
     ThinkingDone,
+    /// A complete signed reasoning block to keep in history (Anthropic)
+    ThinkingBlock(ThinkingBlock),
     /// A chunk of response text (displayed in chat)
     ContentDelta(String),
     /// The model wants to call tool(s)
@@ -290,18 +315,6 @@ pub struct ImageGenRequest {
     pub prompt: String,
     pub width: u32,
     pub height: u32,
-    pub num_images: u32,
-}
-
-impl ImageGenRequest {
-    pub fn new(prompt: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-            width: 1024,
-            height: 1024,
-            num_images: 1,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

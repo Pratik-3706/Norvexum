@@ -145,6 +145,7 @@ impl Tool for BatchViewImageTool {
                 tool_call_id: None,
                 tool_name: None,
                 thought_signature: None,
+                thinking_blocks: vec![],
             };
 
             if let Some(client) = &ctx.client {
@@ -235,6 +236,7 @@ impl Tool for BatchViewImageTool {
                 tool_call_id: None,
                 tool_name: None,
                 thought_signature: None,
+                thinking_blocks: vec![],
             };
 
             let request = AiRequest::new(vec![msg]).with_temperature(0.5);

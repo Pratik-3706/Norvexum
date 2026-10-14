@@ -1,223 +1,80 @@
-﻿// ===========================================================================
-// Commands: chat — Starts interactive agent session in TUI or Headless mode
-//
-// Supports:
-//   • Full TUI mode with streaming, tool calls, and text selection
-//   • Headless mode for CI/scripting with --headless flag
-//   • Session persistence with auto-save/resume
-//   • Tool approval flow for sandboxed execution
+// ===========================================================================
+// Commands: chat — Starts an interactive agent session in TUI or headless mode
 // ===========================================================================
 
-use crate::agent::{Agent, AgentEvent};
-use crate::config::{NORVEXUM_DIR, Settings};
-use crate::ui::{App, run_tui};
 use eyre::{Result, WrapErr};
-use tokio::sync::mpsc;
 
-/// Verify if the project is initialized
-pub fn is_initialized() -> bool {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    cwd.join(NORVEXUM_DIR).exists()
+use crate::config::{NORVEXUM_DIR, Settings};
+use crate::runtime::{HeadlessOptions, run_headless, spawn_agent};
+use crate::ui::{App, run_tui};
+
+pub struct ChatOptions {
+    pub initial_message: Option<String>,
+    pub resume: bool,
+    pub auto_approve: bool,
+    pub verbose: bool,
 }
 
-/// Ensure the project is initialized, otherwise return error
-pub fn ensure_initialized(settings: &Settings) -> Result<()> {
-    if !settings.project_root.join(NORVEXUM_DIR).exists() {
-        eyre::bail!(
-            "Norvexum is not initialized in this directory ({}).\n\
-             Run `norvexum init` to initialize first.",
-            settings.project_root.display()
-        );
-    }
-    Ok(())
+/// Whether `.norvexum/` exists in the project root.
+pub fn is_initialized(settings: &Settings) -> bool {
+    settings.project_root.join(NORVEXUM_DIR).exists()
 }
 
-pub async fn run(settings: Settings, initial_msg: Option<String>) -> Result<()> {
-    let model_info = format!("{} ({})", settings.active_model, settings.active_provider);
-    let initial_for_ui = initial_msg.clone();
-
-    let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let (user_tx, mut user_rx) = mpsc::unbounded_channel::<String>();
-    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
-    let (inst_tx, inst_rx) = mpsc::unbounded_channel::<String>();
-
-    // Instantiate the agent
-    let mut agent = Agent::new(settings.clone(), agent_tx.clone())?;
-    agent.set_instruction_receiver(inst_rx);
-    let approval_tx = agent.approval_sender();
-
-    let (active_user_tx, mut active_user_rx) = mpsc::unbounded_channel::<String>();
-    let is_processing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let is_processing_router = is_processing.clone();
-    let inst_tx_router = inst_tx.clone();
-    let active_user_tx_router = active_user_tx.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = user_rx.recv().await {
-            if is_processing_router.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = inst_tx_router.send(msg);
-            } else {
-                let _ = active_user_tx_router.send(msg);
-            }
-        }
-    });
-
-    // Spawn agent processing task
-    let agent_tx_err = agent_tx.clone();
-    let is_processing_task = is_processing.clone();
-    let process_task = tokio::spawn(async move {
-        // Send initial message if provided
-        if let Some(msg) = initial_msg {
-            is_processing_task.store(true, std::sync::atomic::Ordering::SeqCst);
-            let res = agent.process_message(&msg, &mut cancel_rx).await;
-            if let Err(e) = res {
-                let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
-            }
-            is_processing_task.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        while let Some(msg) = {
-            while cancel_rx.try_recv().is_ok() {}
-            active_user_rx.recv().await
-        } {
-            is_processing_task.store(true, std::sync::atomic::Ordering::SeqCst);
-            let res = agent.process_message(&msg, &mut cancel_rx).await;
-            if let Err(e) = res {
-                let _ = agent_tx_err.send(AgentEvent::Error(format!("Agent error: {}", e)));
-            }
-            is_processing_task.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    });
-
-    if settings.headless {
-        // Print message and run in plain stdout/stdin mode
-        println!(
-            "Norvexum interactive chat (Headless mode) - model: {}",
-            model_info
-        );
-        println!("Press Ctrl+C to exit.\n");
-
-        let agent_rx_print = agent_rx;
-        let approval_tx_print = approval_tx.clone();
-        let print_task = tokio::spawn(async move {
-            let mut rx = agent_rx_print;
-            while let Some(event) = rx.recv().await {
-                match event {
-                    AgentEvent::Thinking(text) => {
-                        print!("{}", text);
-                        use std::io::Write;
-                        let _ = std::io::stdout().flush();
-                    }
-                    AgentEvent::ThinkingDone => {
-                        println!("\n--- Thinking Done ---");
-                    }
-                    AgentEvent::Content(text) => {
-                        print!("{}", text);
-                        use std::io::Write;
-                        let _ = std::io::stdout().flush();
-                    }
-                    AgentEvent::ToolStart { name, id: _ } => {
-                        println!("\n🔧 Calling tool: {}...", name);
-                    }
-                    AgentEvent::ToolResult {
-                        id: _,
-                        name,
-                        result: _,
-                        success,
-                    } => {
-                        println!(
-                            "🔧 Tool {} finished: {}",
-                            name,
-                            if success { "✅ Success" } else { "❌ Failed" }
-                        );
-                    }
-                    AgentEvent::FileWrite {
-                        path,
-                        content_preview: _,
-                    } => {
-                        println!("📝 File written: {}", path);
-                    }
-                    AgentEvent::Done { usage } => {
-                        if let Some(u) = usage {
-                            println!("\n--- Done ({} tokens) ---", u.total_tokens);
-                        } else {
-                            println!("\n--- Done ---");
-                        }
-                    }
-                    AgentEvent::Error(e) => {
-                        eprintln!("\n❌ Error: {}", e);
-                    }
-                    AgentEvent::Status(s) => {
-                        println!("Status: {}", s);
-                    }
-                    AgentEvent::ApprovalRequest {
-                        id: _,
-                        tool_name,
-                        args_preview,
-                    } => {
-                        let mut approved = true;
-                        let mut reason = "[Auto-approved in headless mode]".to_string();
-
-                        if tool_name == "run_command" {
-                            if let Ok(args_val) =
-                                serde_json::from_str::<serde_json::Value>(&args_preview)
-                            {
-                                if let Some(cmd_str) =
-                                    args_val.get("command").and_then(|v| v.as_str())
-                                {
-                                    if crate::tools::shell::is_unparseable_or_fallback(cmd_str) {
-                                        approved = false;
-                                        reason = "[Auto-denied in headless mode: forced shell fallback containing wildcards/metacharacters is blocked]".to_string();
-                                    }
-                                }
-                            }
-                        }
-
-                        println!(
-                            "\n⚠️  Tool '{}' wants to execute:\n  {}\n  {}",
-                            tool_name, args_preview, reason
-                        );
-                        let _ = approval_tx_print.send(approved);
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        // Read lines from stdin
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
-        loop {
-            print!("\n> ");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            if handle.read_line(&mut line)? == 0 {
-                break; // EOF
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed == "exit" || trimmed == "quit" {
-                break;
-            }
-            let _ = user_tx.send(trimmed.to_string());
-        }
-
-        print_task.abort();
-    } else {
-        // Run standard interactive TUI mode
-        let mut app = App::new(&model_info, settings.project_root.clone());
-        if let Some(message) = initial_for_ui {
-            app.add_user_message(message);
-        }
-        run_tui(app, agent_rx, user_tx, cancel_tx, approval_tx)
-            .await
-            .wrap_err("TUI runtime encountered an error")?;
+pub async fn run(settings: Settings, opts: ChatOptions) -> Result<()> {
+    if let Some(problem) = settings.missing_api_key_message() {
+        eyre::bail!("{problem}");
     }
 
-    process_task.abort();
-    Ok(())
+    let model_info = format!("{} / {}", settings.active_model, settings.active_provider);
+    let project_root = settings.project_root.clone();
+    let headless = settings.headless;
+
+    let mut initial = Vec::new();
+    if opts.resume {
+        initial.push("/session resume".to_string());
+    }
+    let one_shot = opts.initial_message.is_some() && headless;
+    if let Some(message) = &opts.initial_message {
+        initial.push(with_piped_stdin(message, headless));
+    }
+    let initial_count = initial.len();
+
+    let handle = spawn_agent(settings, initial);
+
+    if headless {
+        return run_headless(
+            handle,
+            HeadlessOptions {
+                initial_count,
+                one_shot,
+                auto_approve: opts.auto_approve,
+                verbose: opts.verbose,
+            },
+        )
+        .await;
+    }
+
+    let mut app = App::new(&model_info, project_root);
+    if let Some(message) = opts.initial_message {
+        app.add_user_message(message);
+    } else if opts.resume {
+        app.is_processing = true;
+        app.status = "Resuming session".into();
+    }
+    run_tui(app, handle)
+        .await
+        .wrap_err("TUI runtime encountered an error")
+}
+
+/// `git diff | norvexum -p "review this"` — append piped stdin to the prompt.
+fn with_piped_stdin(message: &str, headless: bool) -> String {
+    use std::io::{IsTerminal, Read};
+    if !headless || std::io::stdin().is_terminal() {
+        return message.to_string();
+    }
+    let mut piped = String::new();
+    if std::io::stdin().read_to_string(&mut piped).is_err() || piped.trim().is_empty() {
+        return message.to_string();
+    }
+    format!("{message}\n\n<stdin>\n{}\n</stdin>", piped.trim_end())
 }

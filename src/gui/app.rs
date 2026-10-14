@@ -1,16 +1,11 @@
-#![allow(float_literal_f32_fallback)]
-
 use crate::agent::AgentEvent;
 use crate::config::Settings;
 use crate::config::providers::build_registry;
 use notify::{RecursiveMode, Result as NotifyResult, Watcher};
-use std::sync::OnceLock;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-pub static GUI_SENDER: OnceLock<std_mpsc::Sender<GuiConfig>> = OnceLock::new();
 
 const LAST_LAYER_BYTES: &[u8] = include_bytes!("../../assets/loading_animation/last_layer.png");
 const MIDDLE_LAYER_BYTES: &[u8] = include_bytes!("../../assets/loading_animation/middle_layer.png");
@@ -42,7 +37,6 @@ pub struct TerminalEntry {
     pub command: String,
     pub output: String,
     pub success: bool,
-    pub timestamp: std::time::Instant,
 }
 
 pub struct GuiApp {
@@ -84,7 +78,6 @@ pub struct GuiApp {
 
     // Settings & Custom Skills Fields
     show_settings_modal: bool,
-    show_custom_model_input: bool,
     custom_skill_name: String,
     custom_skill_desc: String,
     custom_skill_triggers: String,
@@ -110,7 +103,6 @@ pub struct GuiApp {
     history_sessions: Vec<crate::agent::session::SessionSummary>,
     current_session_id: Option<String>,
     active_messages_backup: Option<Vec<GuiMessage>>,
-    active_written_files_backup: Option<Vec<String>>,
     selected_file: Option<String>,
     inspected_file_content: String,
     inspector_error: Option<String>,
@@ -513,7 +505,6 @@ impl GuiApp {
             top_layer_tex,
             logo_tex,
             show_settings_modal: false,
-            show_custom_model_input: false,
             custom_skill_name: String::new(),
             custom_skill_desc: String::new(),
             custom_skill_triggers: String::new(),
@@ -534,7 +525,6 @@ impl GuiApp {
             history_sessions,
             current_session_id: None,
             active_messages_backup: None,
-            active_written_files_backup: None,
             selected_file: None,
             inspected_file_content: String::new(),
             inspector_error: None,
@@ -774,8 +764,8 @@ impl GuiApp {
         let current_provider = self.settings.active_provider.clone();
         let current_model = self.settings.active_model.clone();
 
-        if (last_provider == "ollama" && current_provider != "ollama")
-            || (last_provider == "ollama" && last_model != current_model)
+        if last_provider == "ollama"
+            && (current_provider != "ollama" || last_model != current_model)
         {
             let ollama_url = self
                 .settings
@@ -789,7 +779,7 @@ impl GuiApp {
                     .enable_all()
                     .build()
                 {
-                    let _ = rt.block_on(async {
+                    rt.block_on(async {
                         let payload = serde_json::json!({
                             "model": last_model,
                             "keep_alive": 0
@@ -945,8 +935,10 @@ impl GuiApp {
                 .enable_all()
                 .build()
             {
-                let mut temp_settings = Settings::default();
-                temp_settings.project_root = path_clone;
+                let temp_settings = Settings {
+                    project_root: path_clone,
+                    ..Settings::default()
+                };
                 let _ = rt.block_on(crate::commands::init::run(&temp_settings));
             }
         }
@@ -1063,12 +1055,14 @@ impl GuiApp {
                 streaming_content = extract_streaming_content(&self.current_tool_args, "content");
             }
             if streaming_content.is_empty() {
-                streaming_content = extract_streaming_content(&self.current_tool_args, "ReplacementContent");
+                streaming_content =
+                    extract_streaming_content(&self.current_tool_args, "ReplacementContent");
             }
             if streaming_content.is_empty() {
-                streaming_content = extract_streaming_content(&self.current_tool_args, "TargetContent");
+                streaming_content =
+                    extract_streaming_content(&self.current_tool_args, "TargetContent");
             }
-            
+
             if !streaming_content.is_empty() {
                 self.inspected_file_content = streaming_content;
                 return;
@@ -1101,8 +1095,8 @@ impl GuiApp {
                             .max(self.line_range_start)
                             - 1;
                         let mut filtered_content = String::new();
-                        for i in start..=end.min(lines.len() - 1) {
-                            filtered_content.push_str(lines[i]);
+                        for line in lines.iter().take(end + 1).skip(start) {
+                            filtered_content.push_str(line);
                             filtered_content.push('\n');
                         }
                         self.inspected_file_content = filtered_content;
@@ -1134,20 +1128,25 @@ impl GuiApp {
                     .max(self.line_range_start)
                     - 1;
 
-                let mut new_lines = Vec::new();
-                for i in 0..start {
-                    if i < original_lines.len() {
-                        new_lines.push(original_lines[i].to_string());
-                    }
-                }
-                for line in self.inspected_file_content.lines() {
-                    new_lines.push(line.to_string());
-                }
-                for i in (end + 1)..original_lines.len() {
-                    new_lines.push(original_lines[i].to_string());
-                }
+                let mut new_lines: Vec<String> = original_lines
+                    .iter()
+                    .take(start)
+                    .map(|l| l.to_string())
+                    .collect();
+                new_lines.extend(self.inspected_file_content.lines().map(str::to_string));
+                new_lines.extend(original_lines.iter().skip(end + 1).map(|l| l.to_string()));
 
-                std::fs::write(&path, new_lines.join("\n"))?;
+                // Keep the file's line endings and trailing newline.
+                let eol = if original_content.contains("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                let mut joined = new_lines.join(eol);
+                if original_content.ends_with('\n') {
+                    joined.push_str(eol);
+                }
+                std::fs::write(&path, joined)?;
             } else {
                 std::fs::write(&path, &self.inspected_file_content)?;
             }
@@ -1206,6 +1205,12 @@ impl GuiApp {
                             self.status_text = s.clone();
                             // Only attach status logs to an assistant message if there's an active conversation
                             if self.messages.iter().any(|m| m.role == "user") {
+                                // A new step starts a new bubble if the current one already has
+                                // text, so the step header and the reasoning streamed under it
+                                // stay in the same bubble and render live.
+                                if s.starts_with("Thinking (") {
+                                    self.check_and_split_assistant_message();
+                                }
                                 let msg = self.get_or_create_assistant_message();
                                 msg.tool_logs.push(format!("ℹ️ {s}"));
                             }
@@ -1214,7 +1219,8 @@ impl GuiApp {
                             self.is_processing = true;
                             // Only create assistant messages if there's an active conversation
                             if self.messages.iter().any(|m| m.role == "user") {
-                                self.check_and_split_assistant_message();
+                                // Reasoning belongs to the bubble holding the current step
+                                // header; splitting here orphaned it from its header.
                                 let msg = self.get_or_create_assistant_message();
                                 if let Some(ref mut thinking) = msg.thinking {
                                     thinking.push_str(&t);
@@ -1355,7 +1361,6 @@ impl GuiApp {
                                         command: cmd,
                                         output: result.clone(),
                                         success,
-                                        timestamp: std::time::Instant::now(),
                                     });
                                 }
                             }
@@ -1483,10 +1488,22 @@ impl GuiApp {
                                 err
                             };
 
+                            let clean_err = display_err.replace('\u{fe0f}', "");
                             let msg = self.get_or_create_assistant_message();
-                            msg.tool_logs.push(format!("⚠️ Error: {display_err}"));
-                            msg.content
-                                .push_str(&format!("\n\n⚠️ **Execution Error:** {display_err}"));
+                            msg.tool_logs.push(format!("⚠️ Error: {clean_err}"));
+                            let error_line = format!("⚠️ **Execution Error:** {clean_err}");
+                            if !msg.content.contains(&error_line) {
+                                if !msg.content.is_empty() {
+                                    msg.content.push_str("\n\n");
+                                }
+                                msg.content.push_str(&error_line);
+                            }
+                        }
+                        AgentEvent::Warning(warning) => {
+                            let clean = warning.replace('\u{fe0f}', "");
+                            self.status_text = clean.clone();
+                            let msg = self.get_or_create_assistant_message();
+                            msg.tool_logs.push(format!("⚠️ {clean}"));
                         }
                         AgentEvent::ApprovalRequest {
                             id,
@@ -1585,12 +1602,9 @@ impl GuiApp {
 
         let mut final_attached_image = None;
         if let Some(ref file_path) = self.attached_image.take() {
-            let filename = file_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file");
-            let dest_path = self.settings.project_root.join(filename);
-            if std::fs::copy(file_path, &dest_path).is_ok() {
+            let dest_path = attachment_destination(&self.settings.project_root, file_path);
+            let already_inside = dest_path == *file_path;
+            if already_inside || std::fs::copy(file_path, &dest_path).is_ok() {
                 raw_prompt = format!(
                     "/image_prompt |{}| {}",
                     dest_path.to_string_lossy(),
@@ -1653,7 +1667,7 @@ impl GuiApp {
                 egui::ScrollArea::vertical()
                     .max_height(420.0)
                     .show(ui, |ui| {
-                        let text_color = if self.dark_mode {
+                        let _text_color = if self.dark_mode {
                             egui::Color32::WHITE
                         } else {
                             egui::Color32::BLACK
@@ -1839,9 +1853,10 @@ impl GuiApp {
 
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("Max thinking loops per cycle:").color(label_color),
+                                egui::RichText::new("Max thinking loops per cycle:")
+                                    .color(label_color),
                             );
-                            
+
                             let mut is_infinite = self.settings.max_thinking_loops == 0;
                             if ui.checkbox(&mut is_infinite, "Infinite").changed() {
                                 if is_infinite {
@@ -2091,10 +2106,10 @@ impl eframe::App for GuiApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let screen_width = ui.ctx().screen_rect().width();
-                    let show_text_labels = screen_width >= 1100.0;
+                    let _show_text_labels = screen_width >= 1100.0;
                     let show_brand_name = screen_width >= 850.0;
                     let compact_buttons = screen_width < 900.0;
-                    let spacing = if screen_width < 700.0 { 4.0 } else { 12.0 };
+                    let _spacing = if screen_width < 700.0 { 4.0 } else { 12.0 };
 
                     ui.add(egui::Image::new(&self.logo_tex).max_width(30.0));
                     ui.add_space(2.0);
@@ -2854,13 +2869,11 @@ impl eframe::App for GuiApp {
                                 self.inspect_file(&filename);
                             }
                         }
-                        if self.manual_edits_enabled {
-                            if ui.button("💾 Save").clicked() {
-                                if let Err(e) = self.save_inspected_file_changes() {
-                                    self.inspector_error = Some(format!("Failed to save: {e}"));
-                                } else {
-                                    self.status_text = "Saved!".to_string();
-                                }
+                        if self.manual_edits_enabled && ui.button("💾 Save").clicked() {
+                            if let Err(e) = self.save_inspected_file_changes() {
+                                self.inspector_error = Some(format!("Failed to save: {e}"));
+                            } else {
+                                self.status_text = "Saved!".to_string();
                             }
                         }
                     });
@@ -2877,9 +2890,7 @@ impl eframe::App for GuiApp {
                         let is_active_writing = self
                             .current_writing_file
                             .as_ref()
-                            .map_or(false, |(name, _, _)| {
-                                Some(name) == self.selected_file.as_ref()
-                            });
+                            .is_some_and(|(name, _, _)| Some(name) == self.selected_file.as_ref());
 
                         let active_range = self.get_active_editing_range();
                         let is_active_file = self.selected_file.as_ref().is_some()
@@ -2913,7 +2924,7 @@ impl eframe::App for GuiApp {
                                         for (idx, line_content) in lines.iter().enumerate() {
                                             let line_num = start_line_num + idx;
                                             let is_highlighted = is_active_file
-                                                && active_range.map_or(false, |(start, end)| {
+                                                && active_range.is_some_and(|(start, end)| {
                                                     line_num >= start && line_num <= end
                                                 });
 
@@ -3076,9 +3087,9 @@ impl eframe::App for GuiApp {
                                                         let val_str = val.to_string();
                                                         if val_str.len() > 60 {
                                                             parts.push(format!(
-                                                                "{}: {}...",
+                                                                "{}: {}",
                                                                 k,
-                                                                &val_str[..60]
+                                                                crate::util::truncate_chars(&val_str, 60)
                                                             ));
                                                         } else {
                                                             parts.push(format!(
@@ -3199,8 +3210,8 @@ impl eframe::App for GuiApp {
                             if matches!(m.vision, crate::config::providers::Vision::Yes) { " 👁" } else { "" }
                         } else { "" };
                         let mut model_display = format!("{}{}", self.settings.active_model, vision_icon);
-                        if model_display.len() > 30 {
-                            model_display = format!("{}…", &model_display[..27]);
+                        if model_display.chars().count() > 30 {
+                            model_display = crate::util::truncate_chars(&model_display, 27);
                         }
 
                         let popup_id = ui.make_persistent_id("model_search_popup");
@@ -3295,11 +3306,10 @@ impl eframe::App for GuiApp {
                                                     self.sync_settings();
                                                 }
                                             }
-                                            if model.adaptive_thinking {
-                                                if ui.selectable_value(&mut self.settings.thinking_effort, Some("adaptive".to_string()), "Adaptive").clicked() {
+                                            if model.adaptive_thinking
+                                                && ui.selectable_value(&mut self.settings.thinking_effort, Some("adaptive".to_string()), "Adaptive").clicked() {
                                                     self.sync_settings();
                                                 }
-                                            }
                                         });
                                 }
                             }
@@ -3509,8 +3519,8 @@ impl eframe::App for GuiApp {
                             }
 
                             let bg_procs = crate::tools::shell::get_background_processes();
-                            if !bg_procs.is_empty() {
-                                if ui
+                            if !bg_procs.is_empty()
+                                && ui
                                     .add(
                                         egui::Button::new(
                                             egui::RichText::new(format!("Kill {} Background Processes", bg_procs.len()))
@@ -3526,12 +3536,11 @@ impl eframe::App for GuiApp {
                                         crate::tools::shell::kill_background_process(proc.pid);
                                     }
                                 }
-                            }
                         });
                     });
                     ui.add_space(4.0);
 
-                    let is_running_cmd = self.is_processing && self.current_tool_name.as_ref().map_or(false, |name| {
+                    let is_running_cmd = self.is_processing && self.current_tool_name.as_ref().is_some_and(|name| {
                         name == "run_command" || name == "shell" || name == "shell_command" || name == "execute"
                     });
 
@@ -3576,7 +3585,7 @@ impl eframe::App for GuiApp {
                                     // Output (truncated to prevent huge renders)
                                     if !entry.output.is_empty() {
                                         let output_text = if entry.output.len() > 2000 {
-                                            format!("{}…\n(truncated)", &entry.output[..2000])
+                                            format!("{}\n(truncated)", crate::util::truncate_chars(&entry.output, 2000))
                                         } else {
                                             entry.output.clone()
                                         };
@@ -3772,10 +3781,11 @@ impl eframe::App for GuiApp {
                                 if msg.role == "system" {
                                     continue;
                                 }
-                                // Skip ghost assistant messages: empty content + no thinking
+                                // Skip ghost assistant messages: empty content + no thinking + no tool activity
                                 if msg.role == "assistant"
                                     && msg.content.trim().is_empty()
-                                    && msg.thinking.as_ref().map_or(true, |t| t.trim().is_empty())
+                                    && msg.thinking.as_ref().is_none_or(|t| t.trim().is_empty())
+                                    && msg.tool_logs.is_empty()
                                 {
                                     continue;
                                 }
@@ -3978,8 +3988,7 @@ impl eframe::App for GuiApp {
                                                                 ui,
                                                                 &msg.tool_logs,
                                                                 self.dark_mode,
-                                                                curr_name,
-                                                                curr_args,
+                                                                curr_name.as_deref().map(|n| (n, curr_args)),
                                                                 self.is_processing
                                                                     && is_latest_agent,
                                                                 &msg.thinking,
@@ -3987,10 +3996,12 @@ impl eframe::App for GuiApp {
                                                             );
                                                             ui.add_space(8.0);
                                                         }
-                                                        ui.add_space(8.0);
 
                                                         // Render message body text directly
                                                         if !msg.content.is_empty() {
+                                                            if has_activity {
+                                                                ui.add_space(8.0);
+                                                            }
                                                             render_formatted_markdown(
                                                                 ui,
                                                                 &msg.content,
@@ -3998,9 +4009,9 @@ impl eframe::App for GuiApp {
                                                             );
                                                         }
 
-                                                        // Paint the left accent bar
+                                                        // Paint the left accent bar only when there is actual content or activity
                                                         let content_end_y = ui.cursor().top();
-                                                        if content_end_y > content_start_y + 2.0 {
+                                                        if (has_activity || !msg.content.is_empty()) && content_end_y > content_start_y + 2.0 {
                                                             let bar_x = before_rect.left() - 6.0;
                                                             ui.painter().line_segment(
                                                                 [
@@ -4293,8 +4304,14 @@ impl eframe::App for GuiApp {
                             self.send_message();
                         }
                         PendingAction::Undo => {
-                            let _ = self.user_tx.send("/undo".to_string());
-                            self.status_text = "Undo command sent...".to_string();
+                            let has_checkpoints =
+                                crate::agent::checkpoint::has_checkpoints(&self.settings.project_root);
+                            if !has_checkpoints {
+                                self.status_text = "Undo unavailable: no checkpoints found.".to_string();
+                            } else {
+                                let _ = self.user_tx.send("/undo".to_string());
+                                self.status_text = "Undo command sent...".to_string();
+                            }
                         }
                     }
                 }
@@ -4406,7 +4423,6 @@ fn get_file_diff_stats(project_root: &std::path::Path, file_path: &str) -> (i32,
 /// Spawn an external command on Windows without flashing a console window.
 /// This is the same helper the agent's `run_command` tool should use to
 /// keep cmd.exe from popping up on every tool call.
-#[allow(dead_code)]
 fn spawn_silent_command(
     program: &str,
     args: &[&str],
@@ -4426,33 +4442,6 @@ fn spawn_silent_command(
     }
 
     cmd.output()
-}
-
-#[allow(dead_code)]
-fn _unused_git_diff_compat(project_root: &std::path::Path, file_path: &str) -> (i32, i32) {
-    // Kept for reference / fallback if anyone ever wants to re-enable the
-    // git-based diff. Uses spawn_silent_command so it never flashes a window.
-    let output = spawn_silent_command("git", &["diff", "--numstat", "--", file_path], project_root);
-
-    if let Ok(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Some(line) = stdout.lines().next() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let added = parts[0].parse::<i32>().unwrap_or(0);
-                let deleted = parts[1].parse::<i32>().unwrap_or(0);
-                return (added, deleted);
-            }
-        }
-    }
-
-    // Fallback: if not in git or no changes, read file and count total lines as additions
-    let full_path = project_root.join(file_path);
-    if let Ok(content) = std::fs::read_to_string(&full_path) {
-        let lines = content.lines().count() as i32;
-        return (lines, 0);
-    }
-    (0, 0)
 }
 
 fn get_relative_path(path: &str, project_root: &std::path::Path) -> String {
@@ -4483,7 +4472,8 @@ fn get_relative_path(path: &str, project_root: &std::path::Path) -> String {
 }
 
 fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, dark_mode: bool) {
-    let mut lines = text.lines().peekable();
+    let sanitized_text = text.replace('\u{fe0f}', "");
+    let mut lines = sanitized_text.lines().peekable();
     let text_color = if dark_mode {
         egui::Color32::from_rgb(226, 232, 240) // Slate 200
     } else {
@@ -4552,7 +4542,7 @@ fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, dark_mode: bool) {
         }
 
         // Ordered list
-        if trimmed.chars().next().map_or(false, |c| c.is_ascii_digit()) && trimmed.contains(". ") {
+        if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) && trimmed.contains(". ") {
             if let Some(pos) = trimmed.find(". ") {
                 let num = &trimmed[..pos + 2];
                 let content = &trimmed[pos + 2..];
@@ -4803,50 +4793,6 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], dark_mode: bool) {
         });
     ui.add_space(2.0);
 }
-
-fn scan_written_files(
-    messages: &[crate::ai::types::Message],
-    project_root: &std::path::Path,
-) -> Vec<String> {
-    let mut files = Vec::new();
-    for msg in messages {
-        for call in &msg.tool_calls {
-            if call.name == "write_file"
-                || call.name == "write_to_file"
-                || call.name == "edit_file"
-                || call.name == "replace_file_content"
-                || call.name == "multi_replace_file_content"
-            {
-                let mut path_str = String::new();
-                if let serde_json::Value::Object(map) = &call.arguments {
-                    if let Some(serde_json::Value::String(p)) = map.get("path") {
-                        path_str = p.clone();
-                    } else if let Some(serde_json::Value::String(p)) = map.get("TargetFile") {
-                        path_str = p.clone();
-                    }
-                } else if let serde_json::Value::String(s) = &call.arguments {
-                    if let Ok(serde_json::Value::Object(map)) =
-                        serde_json::from_str::<serde_json::Value>(s)
-                    {
-                        if let Some(serde_json::Value::String(p)) = map.get("path") {
-                            path_str = p.clone();
-                        } else if let Some(serde_json::Value::String(p)) = map.get("TargetFile") {
-                            path_str = p.clone();
-                        }
-                    }
-                }
-                if !path_str.is_empty() {
-                    let rel = get_relative_path(&path_str, project_root);
-                    if !files.contains(&rel) {
-                        files.push(rel);
-                    }
-                }
-            }
-        }
-    }
-    files
-}
-
 fn get_file_icon(filename: &str) -> &'static str {
     let lower = filename.to_lowercase();
     if lower.ends_with(".rs") {
@@ -4935,14 +4881,8 @@ fn extract_streaming_number(json_accumulated: &str, key: &str) -> Option<usize> 
             for c in after_colon.chars() {
                 if c.is_ascii_digit() {
                     val_str.push(c);
-                } else if c.is_whitespace() {
-                    if !val_str.is_empty() {
-                        break;
-                    }
-                } else {
-                    if !val_str.is_empty() {
-                        break;
-                    }
+                } else if !val_str.is_empty() {
+                    break;
                 }
             }
             if let Ok(num) = val_str.parse::<usize>() {
@@ -5139,11 +5079,10 @@ fn format_tool_args_summary(name: &str, args_json: &str) -> String {
             if path.is_empty() {
                 "file".to_string()
             } else {
-                let filename = std::path::Path::new(&path)
+                std::path::Path::new(&path)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or(path);
-                filename
+                    .unwrap_or(path)
             }
         }
         "write_file"
@@ -5158,11 +5097,10 @@ fn format_tool_args_summary(name: &str, args_json: &str) -> String {
             if path.is_empty() {
                 "file".to_string()
             } else {
-                let filename = std::path::Path::new(&path)
+                std::path::Path::new(&path)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or(path);
-                filename
+                    .unwrap_or(path)
             }
         }
         "shell" | "run_command" | "shell_command" => {
@@ -5173,8 +5111,8 @@ fn format_tool_args_summary(name: &str, args_json: &str) -> String {
             if cmd.is_empty() {
                 "command".to_string()
             } else {
-                if cmd.len() > 60 {
-                    format!("{}...", &cmd[..57])
+                if cmd.chars().count() > 60 {
+                    crate::util::truncate_chars(&cmd, 57)
                 } else {
                     cmd
                 }
@@ -5263,8 +5201,8 @@ fn render_chronological_activity(
     ui: &mut egui::Ui,
     logs: &[String],
     dark_mode: bool,
-    current_tool_name: &Option<String>,
-    current_tool_args: &str,
+    // (name, streamed JSON args) of the tool currently running, if any
+    current_tool: Option<(&str, &str)>,
     is_processing: bool,
     fallback_thinking: &Option<String>,
     project_root: &std::path::Path,
@@ -5308,12 +5246,13 @@ fn render_chronological_activity(
     let mut current_loop_title: Option<String> = None;
     let mut current_loop_thinking = String::new();
 
-    let mut render_loop_block = |ui: &mut egui::Ui, title: &str, thinking: &str| {
+    let render_loop_block = |ui: &mut egui::Ui, title: &str, thinking: &str| {
+        let clean_title = title.replace('\u{fe0f}', "");
         if thinking.trim().is_empty() {
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!("⚙️ {}", title))
+                    egui::RichText::new(format!("⚙ {}", clean_title))
                         .size(12.0)
                         .color(if dark_mode {
                             egui::Color32::from_rgb(148, 163, 184)
@@ -5324,7 +5263,7 @@ fn render_chronological_activity(
             });
         } else {
             egui::CollapsingHeader::new(
-                egui::RichText::new(format!("💭 {}", title))
+                egui::RichText::new(format!("💭 {}", clean_title))
                     .size(12.0)
                     .strong()
                     .color(if dark_mode {
@@ -5334,7 +5273,7 @@ fn render_chronological_activity(
                     }),
             )
             .id_salt(ui.next_auto_id())
-            .default_open(is_processing)
+            .default_open(true)
             .show(ui, |ui| {
                 let thinking_bg = if dark_mode {
                     egui::Color32::from_rgb(16, 17, 26)
@@ -5373,7 +5312,8 @@ fn render_chronological_activity(
     for log in logs {
         if let Some(delta) = log.strip_prefix("THINKING_DELTA|") {
             current_loop_thinking.push_str(delta);
-        } else if log.starts_with("ℹ️ Thinking (loop ") {
+        } else if log.starts_with("ℹ️ Thinking (loop ") || log.starts_with("ℹ️ Thinking (step ")
+        {
             if let Some(ref title) = current_loop_title {
                 render_loop_block(ui, title, &current_loop_thinking);
             }
@@ -5381,11 +5321,13 @@ fn render_chronological_activity(
             current_loop_title = Some(raw_title.to_string());
             current_loop_thinking.clear();
         } else if log.starts_with("TOOL_RESULT|") {
-            if let Some(ref title) = current_loop_title {
-                render_loop_block(ui, title, &current_loop_thinking);
-                current_loop_title = None;
-                current_loop_thinking.clear();
+            let title = current_loop_title
+                .take()
+                .unwrap_or_else(|| "Thinking".to_string());
+            if !current_loop_thinking.trim().is_empty() || title != "Thinking" {
+                render_loop_block(ui, &title, &current_loop_thinking);
             }
+            current_loop_thinking.clear();
 
             if let Some(payload) = log.strip_prefix("TOOL_RESULT|") {
                 let parts: Vec<&str> = payload.split('|').collect();
@@ -5404,11 +5346,13 @@ fn render_chronological_activity(
                 }
             }
         } else if log.starts_with("FILE_CHANGE|") {
-            if let Some(ref title) = current_loop_title {
-                render_loop_block(ui, title, &current_loop_thinking);
-                current_loop_title = None;
-                current_loop_thinking.clear();
+            let title = current_loop_title
+                .take()
+                .unwrap_or_else(|| "Thinking".to_string());
+            if !current_loop_thinking.trim().is_empty() || title != "Thinking" {
+                render_loop_block(ui, &title, &current_loop_thinking);
             }
+            current_loop_thinking.clear();
 
             if let Some(payload) = log.strip_prefix("FILE_CHANGE|") {
                 // Payload format: <icon>|<path>|+<added>|-<deleted>
@@ -5494,12 +5438,16 @@ fn render_chronological_activity(
         }
     }
 
-    if let Some(ref title) = current_loop_title {
-        render_loop_block(ui, title, &current_loop_thinking);
+    match current_loop_title {
+        Some(ref title) => render_loop_block(ui, title, &current_loop_thinking),
+        None if !current_loop_thinking.trim().is_empty() => {
+            render_loop_block(ui, "Thinking", &current_loop_thinking)
+        }
+        None => {}
     }
 
     if is_processing {
-        if let Some(name) = current_tool_name {
+        if let Some((name, current_tool_args)) = current_tool {
             let icon = get_tool_icon(name);
             let args_summary = format_tool_args_summary(name, current_tool_args);
             let text = format_tool_text(name, true, &args_summary);
@@ -5607,4 +5555,41 @@ fn render_chronological_activity(
             ui.add_space(3.0);
         }
     }
+}
+
+/// Where an attached file is placed so the sandboxed agent can read it.
+/// Files already inside the project are used in place; others are copied to
+/// `.norvexum/attachments/` under a name that never overwrites anything.
+fn attachment_destination(
+    project_root: &std::path::Path,
+    source: &std::path::Path,
+) -> std::path::PathBuf {
+    let root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    if let Ok(canonical) = source.canonicalize() {
+        if canonical.starts_with(&root) {
+            return source.to_path_buf();
+        }
+    }
+    let dir = project_root
+        .join(crate::config::NORVEXUM_DIR)
+        .join("attachments");
+    let _ = std::fs::create_dir_all(&dir);
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment");
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let mut candidate = dir.join(format!("{stem}{ext}"));
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = dir.join(format!("{stem}-{n}{ext}"));
+        n += 1;
+    }
+    candidate
 }

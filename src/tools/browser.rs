@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use super::{Tool, ToolContext, ToolResult};
 
-static BROWSER_SESSION: Lazy<Mutex<Option<(headless_chrome::Browser, Arc<headless_chrome::Tab>)>>> =
-    Lazy::new(|| Mutex::new(None));
+type BrowserSession = (headless_chrome::Browser, Arc<headless_chrome::Tab>);
+
+static BROWSER_SESSION: Lazy<Mutex<Option<BrowserSession>>> = Lazy::new(|| Mutex::new(None));
 
 pub struct BrowserInteractTool;
 

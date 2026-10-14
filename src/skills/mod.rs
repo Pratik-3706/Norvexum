@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Skills — Prebuilt and Custom extensible behavioral templates
 //
 // Triggers the agent with specialized instructions for specific tasks.
@@ -19,6 +19,23 @@ pub struct Skill {
     pub system_instructions: String,
     pub default_tools: Vec<String>,
 }
+
+/// Skills shipped inside the binary, so they work in every project (they used
+/// to be read from `<project>/src/skills`, which only existed in this repo).
+const BUILTIN_SKILL_FILES: &[&str] = &[
+    include_str!("backend/SKILL.md"),
+    include_str!("debugging/SKILL.md"),
+    include_str!("documentation/SKILL.md"),
+    include_str!("find_free_apis/SKILL.md"),
+    include_str!("frontend/SKILL.md"),
+    include_str!("planning/SKILL.md"),
+    include_str!("presentation/SKILL.md"),
+    include_str!("selfknowladge/SKILL.md"),
+    include_str!("tavily_skills/SKILL.md"),
+    include_str!("testing/SKILL.md"),
+    include_str!("ux_copywriting/SKILL.md"),
+    include_str!("visual_design_system/SKILL.md"),
+];
 
 /// Load default prebuilt fallback skills
 pub fn load_default_skills() -> Vec<Skill> {
@@ -44,19 +61,9 @@ pub fn load_default_skills() -> Vec<Skill> {
     ]
 }
 
-/// Helper to get user's home directory cross-platform
-fn get_home_dir() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        return Some(PathBuf::from(home));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return Some(PathBuf::from(home));
-    }
-    None
-}
-
 /// Parse a markdown file with YAML frontmatter into a Skill
 pub fn parse_skill_markdown(content: &str) -> Option<Skill> {
+    let content = content.trim_start_matches('\u{feff}');
     if !content.starts_with("---") {
         return None;
     }
@@ -72,7 +79,7 @@ pub fn parse_skill_markdown(content: &str) -> Option<Skill> {
     let mut remaining_lines = Vec::new();
     let mut current_key = String::new();
 
-    while let Some(line) = lines.next() {
+    for line in lines {
         if in_frontmatter {
             let trimmed = line.trim();
             if trimmed == "---" {
@@ -81,8 +88,8 @@ pub fn parse_skill_markdown(content: &str) -> Option<Skill> {
             }
             if trimmed.starts_with('-') {
                 let item = trimmed.trim_start_matches('-').trim();
-                let unquoted = item.trim_matches('"').trim_matches('\'').to_string();
-                if current_key == "trigger_patterns" {
+                let unquoted = item.trim_matches('"').trim_matches('\'').to_lowercase();
+                if current_key == "trigger_patterns" && !unquoted.is_empty() {
                     trigger_patterns.push(unquoted);
                 }
             } else if let Some((key, val)) = trimmed.split_once(':') {
@@ -97,11 +104,12 @@ pub fn parse_skill_markdown(content: &str) -> Option<Skill> {
                     if v.starts_with('[') && v.ends_with(']') {
                         let parsed: Vec<String> = v[1..v.len() - 1]
                             .split(',')
-                            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_lowercase())
+                            .filter(|s| !s.is_empty())
                             .collect();
                         trigger_patterns.extend(parsed);
                     } else {
-                        trigger_patterns.push(v);
+                        trigger_patterns.push(v.to_lowercase());
                     }
                 }
             }
@@ -150,45 +158,110 @@ fn scan_skills_dir(dir: &Path, skills: &mut Vec<Skill>) {
     }
 }
 
-/// Load default and all custom skills from project and home paths
+/// Load built-in skills, then custom ones from the project and home folders.
+/// A custom skill with the same name (case-insensitive) replaces the built-in.
 pub fn load_all_skills(project_root: &Path) -> Vec<Skill> {
     let mut skills = load_default_skills();
+    skills.extend(
+        BUILTIN_SKILL_FILES
+            .iter()
+            .filter_map(|c| parse_skill_markdown(c)),
+    );
 
-    // 1. Scan <project_root>/src/skills/
-    scan_skills_dir(&project_root.join("src").join("skills"), &mut skills);
+    let mut custom = Vec::new();
+    scan_skills_dir(&project_root.join("skills"), &mut custom);
+    scan_skills_dir(&project_root.join(".norvexum").join("skills"), &mut custom);
+    scan_skills_dir(&get_global_skills_dir(), &mut custom);
 
-    // 2. Scan <project_root>/skills/
-    scan_skills_dir(&project_root.join("skills"), &mut skills);
-
-    // 3. Scan <project_root>/.norvexum/skills/
-    scan_skills_dir(&project_root.join(".norvexum").join("skills"), &mut skills);
-
-    // 4. Scan ~/.norvexum/skills/
-    if let Some(home) = get_home_dir() {
-        scan_skills_dir(&home.join(".norvexum").join("skills"), &mut skills);
+    for skill in custom {
+        let key = skill.name.to_lowercase();
+        match skills.iter_mut().find(|s| s.name.to_lowercase() == key) {
+            Some(existing) => *existing = skill,
+            None => skills.push(skill),
+        }
     }
-
     skills
 }
 
-/// Load default and all custom skills, checking trigger patterns against query.
-pub fn find_matching_skill(query: &str, project_root: &Path) -> Option<Skill> {
-    let skills = load_all_skills(project_root);
-    let query_lower = query.to_lowercase();
-    for skill in skills {
-        for pattern in &skill.trigger_patterns {
-            if query_lower.contains(pattern) {
-                return Some(skill);
-            }
+/// Does `pattern` occur in `text` as whole words? ("api" matches "REST api"
+/// but not "rapid"; "unit test" matches "add a unit test".)
+fn matches_words(text: &str, pattern: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(pattern) {
+        let begin = start + pos;
+        let end = begin + pattern.len();
+        let before_ok = text[..begin]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = text[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
         }
+        start = begin + text[begin..].chars().next().map_or(1, char::len_utf8);
     }
-    None
+    false
+}
+
+/// Find the skill whose trigger best matches the query (longest matching
+/// trigger wins, so "unit test" beats "test").
+pub fn find_matching_skill(query: &str, project_root: &Path) -> Option<Skill> {
+    if query.trim_start().starts_with('/') {
+        return None;
+    }
+    let query_lower = query.to_lowercase();
+    load_all_skills(project_root)
+        .into_iter()
+        .filter_map(|skill| {
+            let best = skill
+                .trigger_patterns
+                .iter()
+                .filter(|p| !p.is_empty() && matches_words(&query_lower, p))
+                .map(|p| p.len())
+                .max()?;
+            Some((best, skill))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, skill)| skill)
 }
 
 /// Helper to get the global skills folder (~/.norvexum/skills)
 pub fn get_global_skills_dir() -> PathBuf {
-    get_home_dir()
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".norvexum")
         .join("skills")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_skills_are_embedded() {
+        let skills = load_all_skills(Path::new("definitely-not-a-real-dir"));
+        assert!(skills.len() >= 14, "got {}", skills.len());
+        assert!(skills.iter().any(|s| s.name == "Frontend Specialist"));
+    }
+
+    #[test]
+    fn triggers_match_whole_words_only() {
+        assert!(matches_words("build a rest api please", "api"));
+        assert!(!matches_words("make it rapid", "api"));
+        assert!(!matches_words("explain this", "plan"));
+        assert!(!matches_words("get the latest version", "test"));
+        assert!(matches_words("write a unit test", "unit test"));
+        assert!(matches_words("café api", "api"));
+    }
+
+    #[test]
+    fn longest_trigger_wins() {
+        let skill =
+            find_matching_skill("please add a unit test for this", Path::new("nope")).unwrap();
+        assert_eq!(skill.name, "Testing Engineer");
+        assert!(find_matching_skill("/help", Path::new("nope")).is_none());
+    }
 }

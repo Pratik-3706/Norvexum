@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Agent History — Project-aware context management
 // ===========================================================================
 
@@ -122,24 +122,6 @@ impl ProjectContext {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
-    }
-
-    /// Add a change entry.
-    pub fn add_change(&mut self, summary: &str, files: Vec<String>) {
-        self.recent_changes.push(ChangeEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            summary: summary.to_string(),
-            files_changed: files,
-        });
-
-        // Keep only last 50 changes
-        if self.recent_changes.len() > 50 {
-            self.recent_changes = self
-                .recent_changes
-                .split_off(self.recent_changes.len() - 50);
-        }
-
-        self.updated_at = chrono::Utc::now().to_rfc3339();
     }
 
     /// Generate a summary string for inclusion in the system prompt.

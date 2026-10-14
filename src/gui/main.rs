@@ -1,240 +1,116 @@
-#![allow(unused)]
-#![allow(clippy::all)]
 #![windows_subsystem = "windows"]
 
-#[path = "../agent/mod.rs"]
-mod agent;
-#[path = "../ai/mod.rs"]
-mod ai;
+// ===========================================================================
+// norvexum-gui — desktop entry point
+//
+// The GUI runs on the main thread (required by eframe/winit); the agent runs
+// on a Tokio runtime in a background thread and talks to the GUI through the
+// channels in `runtime::AgentHandle`.
+// ===========================================================================
+
 mod app;
-mod commands;
-#[path = "../config/mod.rs"]
-mod config;
-#[path = "../skills/mod.rs"]
-mod skills;
-#[path = "../tools/mod.rs"]
-mod tools;
-#[path = "../ui/mod.rs"]
-mod ui;
 
-use clap::{Parser, Subcommand};
+// Re-export the shared library modules so `crate::agent`, `crate::config`, …
+// keep resolving inside `app.rs`.
+pub(crate) use norvexum::{agent, ai, commands, config, skills, tools, ui, util};
+
+use clap::Parser;
 use color_eyre::eyre::Result;
-
-/// Norvexum GUI — Standalone desktop assistant interface
-#[derive(Parser)]
-#[command(
-    name = "norvexum-gui",
-    version,
-    about = "An advanced agentic GUI with multi-provider AI and parallel tool calling",
-    long_about = None,
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// Override the AI model to use (e.g. "gemini-3-flash", "claude-haiku-4.5")
-    #[arg(long, global = true)]
-    model: Option<String>,
-
-    /// Override the AI provider (e.g. "google_direct", "aicredits", "openai")
-    #[arg(long, global = true)]
-    provider: Option<String>,
-
-    /// Run in headless mode (no GUI, plain text output)
-    #[arg(long, global = true)]
-    headless: bool,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Initialize Norvexum in the current directory
-    Init,
-
-    /// Start an interactive chat session (default if no subcommand)
-    Chat {
-        /// Optional initial message to send
-        #[arg(trailing_var_arg = true)]
-        message: Vec<String>,
-    },
-
-    /// Manage configuration
-    Config {
-        #[command(subcommand)]
-        action: ConfigAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum ConfigAction {
-    /// List all configuration values
-    List,
-    /// Set a configuration value
-    Set { key: String, value: String },
-    /// Get a configuration value
-    Get { key: String },
-}
+use norvexum::cli::{Cli, Commands};
+use norvexum::commands::chat::ChatOptions;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+    let cli = Cli::parse();
+    norvexum::cli::init_logging(cli.is_headless());
 
-    // Check if running in headless mode
-    let is_headless = std::env::args().any(|arg| arg == "--headless");
-
-    // Load local .env file (silently ignore if missing)
-    let log_dir = dirs::home_dir()
-        .map(|h| h.join(".norvexum"))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let _ = std::fs::create_dir_all(&log_dir);
-    let log_file_path = log_dir.join("norvexum.log");
-
-    if is_headless {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "norvexum=info,warn".into()),
-            )
-            .with_writer(std::io::stderr)
-            .init();
-    } else {
-        // GUI mode: write logs to file to prevent console pollution/corruption
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file_path)
-        {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "norvexum=info,warn".into()),
-                )
-                .with_writer(file)
-                .init();
-        } else {
-            // Discard logs if I cannot open the log file
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "norvexum=info,warn".into()),
-                )
-                .with_writer(std::io::sink)
-                .init();
-        }
+    let wants_gui = !cli.is_headless() && matches!(cli.command, None | Some(Commands::Chat { .. }));
+    if wants_gui {
+        return run_gui_mode(cli);
     }
 
-    let cli = Cli::parse();
-
-    // Determine if I should spawn GUI mode
-    let is_gui = !cli.headless
-        && match &cli.command {
-            None => true,
-            Some(Commands::Chat { .. }) => true,
-            _ => false,
-        };
-
-    if is_gui {
-        // Setup channels for passing GuiConfig to the main thread
-        let (gui_tx, gui_rx) = std::sync::mpsc::channel::<crate::app::GuiConfig>();
-        crate::app::GUI_SENDER.set(gui_tx).unwrap();
-
-        // Spawn agent processing on a separate Tokio runtime background thread
-        let cli_clone = cli;
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                if let Err(e) = run_async(cli_clone).await {
-                    eprintln!("Async background error: {}", e);
-                    tracing::error!("Async background error: {:?}", e);
+    // Subcommands and headless mode behave exactly like the `norvexum` binary.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let mut settings = config::Settings::load_remembered()?;
+        cli.apply_overrides(&mut settings);
+        let initial_message = cli.initial_message();
+        match cli.command {
+            Some(Commands::Init) => commands::init::run(&settings).await,
+            Some(Commands::Config { action }) => commands::config::run(&settings, action).await,
+            _ => {
+                if !commands::chat::is_initialized(&settings) {
+                    commands::init::run(&settings).await?;
                 }
-            });
-        });
-
-        // Block main thread waiting for GUI configuration
-        if let Ok(config) = gui_rx.recv() {
-            if let Err(e) = crate::app::run_gui(config) {
-                eprintln!("GUI Launch Error: {}", e);
-                std::process::exit(1);
+                let opts = ChatOptions {
+                    initial_message,
+                    resume: cli.resume,
+                    auto_approve: cli.yes,
+                    verbose: cli.verbose,
+                };
+                commands::chat::run(settings, opts).await
             }
         }
-    } else {
-        // Run synchronously on the main thread for headless or subcommands
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(async {
-            run_async(cli).await?;
-            Ok::<(), color_eyre::eyre::Report>(())
-        })?;
-    }
-
-    Ok(())
+    })?;
+    std::process::exit(0);
 }
 
-async fn run_async(cli: Cli) -> Result<()> {
-    // Build settings from env + config file + CLI overrides
-    let mut settings = config::Settings::load_remembered().unwrap_or_default();
-    if let Some(model) = &cli.model {
-        settings.active_model = model.clone();
-    }
-    if let Some(provider) = &cli.provider {
-        settings.active_provider = provider.clone();
-    }
-    settings.headless = cli.headless;
+fn run_gui_mode(cli: Cli) -> Result<()> {
+    let (config_tx, config_rx) = std::sync::mpsc::channel::<app::GuiConfig>();
 
-    // Spawn background model fetcher (loads dynamic models from APIs)
-    crate::config::model_fetch::spawn_background_fetch(&settings);
-
-    let result = match cli.command {
-        Some(Commands::Init) => commands::init::run(&settings).await,
-        Some(Commands::Config { action }) => commands::config::run(&settings, action).await,
-        Some(Commands::Chat { message }) => {
-            if !commands::chat::is_initialized() {
-                commands::init::run(&settings).await?;
-                // Force reload env variables from the newly created .env
-                let _ = dotenvy::dotenv();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!("Failed to start async runtime: {e}");
+                return;
             }
-            let initial_msg = if message.is_empty() {
-                None
-            } else {
-                Some(message.join(" "))
-            };
-            commands::chat::run(settings, initial_msg).await
-        }
-        None => {
-            if !commands::chat::is_initialized() {
-                commands::init::run(&settings).await?;
-                // Force reload env variables from the newly created .env
-                let _ = dotenvy::dotenv();
-            }
-            // Reload settings so newly created config/env is loaded
+        };
+        rt.block_on(async move {
             let mut settings = config::Settings::load_remembered().unwrap_or_default();
-            if let Some(model) = &cli.model {
-                settings.active_model = model.clone();
+            cli.apply_overrides(&mut settings);
+            if !commands::chat::is_initialized(&settings) {
+                let _ = commands::init::run(&settings).await;
             }
-            if let Some(provider) = &cli.provider {
-                settings.active_provider = provider.clone();
-            }
-            settings.headless = cli.headless;
+            config::model_fetch::spawn_background_fetch(&settings);
 
-            commands::chat::run(settings, None).await
+            let initial_message = cli.initial_message();
+            let initial: Vec<String> = initial_message.iter().cloned().collect();
+            let handle = norvexum::runtime::spawn_agent(settings.clone(), initial);
+            let gui_config = app::GuiConfig {
+                settings,
+                initial_message,
+                agent_rx: handle.events,
+                user_tx: handle.user_tx,
+                inst_tx: handle.inst_tx,
+                cancel_tx: handle.cancel_tx,
+                approval_tx: handle.approval_tx,
+            };
+            if config_tx.send(gui_config).is_err() {
+                return;
+            }
+            // Keep the runtime (and the agent task on it) alive for the GUI's lifetime;
+            // the GUI thread ends the process with `std::process::exit`.
+            std::future::pending::<()>().await;
+        });
+    });
+
+    match config_rx.recv() {
+        Ok(config) => {
+            if let Err(e) = app::run_gui(config) {
+                eprintln!("GUI launch error: {e}");
+                std::process::exit(1);
+            }
+            Ok(())
         }
-    };
-
-    if let Err(e) = result {
-        let err_str = e.to_string();
-        if err_str.contains("No API key found") {
-            eprintln!(
-                "\n⚠️  Norvexum Setup Required:\n{}\n\n\
-                 Please open the '.env' file generated in this folder and add your keys.\n",
-                err_str
-            );
+        Err(_) => {
+            eprintln!("Norvexum failed to start its agent runtime. See ~/.norvexum/norvexum.log.");
             std::process::exit(1);
-        } else {
-            return Err(e);
         }
     }
-
-    Ok(())
 }

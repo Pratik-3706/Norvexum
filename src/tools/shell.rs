@@ -11,26 +11,178 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Foreground commands are stopped after this long unless the call asks for more.
+const DEFAULT_TIMEOUT_SECS: u64 = 300;
+const MAX_TIMEOUT_SECS: u64 = 1800;
+
 #[derive(Clone, Debug)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub command: String,
     pub kill_tx: tokio::sync::mpsc::Sender<()>,
+    pub started: std::time::Instant,
+    /// stdout + stderr of the process.
+    pub log_path: std::path::PathBuf,
 }
 
 pub static BACKGROUND_PROCESSES: Lazy<Mutex<HashMap<u32, ProcessInfo>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+fn processes() -> std::sync::MutexGuard<'static, HashMap<u32, ProcessInfo>> {
+    // A panic while holding the lock must not disable process management.
+    BACKGROUND_PROCESSES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub fn get_background_processes() -> Vec<ProcessInfo> {
-    let map = BACKGROUND_PROCESSES.lock().unwrap();
-    map.values().cloned().collect()
+    let mut list: Vec<ProcessInfo> = processes().values().cloned().collect();
+    list.sort_by_key(|p| p.started);
+    list
 }
 
 pub fn kill_background_process(pid: u32) {
     // Remove the process and send the kill signal to the background task
-    if let Some(info) = BACKGROUND_PROCESSES.lock().unwrap().remove(&pid) {
+    if let Some(info) = processes().remove(&pid) {
         let _ = info.kill_tx.try_send(());
     }
+}
+
+/// Kill a process and everything it started. On Windows, killing `cmd.exe`
+/// alone leaves the actual server (python, node, …) running.
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let mut taskkill = tokio::process::Command::new("taskkill");
+        taskkill
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x08000000);
+        let _ = taskkill.status().await;
+    }
+    let _ = child.kill().await;
+}
+
+/// Start `cmd` detached from the agent, logging its output to `.norvexum/logs/`.
+fn spawn_background(
+    mut cmd: tokio::process::Command,
+    command_str: &str,
+    ctx: &ToolContext,
+) -> ToolResult {
+    let log_dir = ctx
+        .settings
+        .project_root
+        .join(crate::config::NORVEXUM_DIR)
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join(format!(
+        "bg-{}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
+    ));
+    let (stdout, stderr) =
+        match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
+            Ok((out, err)) => (
+                std::process::Stdio::from(out),
+                std::process::Stdio::from(err),
+            ),
+            Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+        };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .kill_on_drop(false);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return ToolResult::err(format!("Failed to spawn background command: {e}")),
+    };
+    let Some(pid) = child.id() else {
+        return ToolResult::ok("Command started in background (no PID available)");
+    };
+
+    let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
+    processes().insert(
+        pid,
+        ProcessInfo {
+            pid,
+            command: command_str.to_string(),
+            kill_tx,
+            started: std::time::Instant::now(),
+            log_path: log_path.clone(),
+        },
+    );
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = child.wait() => {}
+            _ = kill_rx.recv() => kill_tree(&mut child).await,
+        }
+        processes().remove(&pid);
+    });
+
+    ToolResult::ok(format!(
+        "Started in background with PID {pid}. Output is logged; check it with          manage_processes(action=\"logs\", pid={pid}) and stop it with manage_processes(action=\"stop\", pid={pid})."
+    ))
+}
+
+/// Run `cmd` to completion with a timeout; the process tree is killed on timeout.
+async fn run_foreground(mut cmd: tokio::process::Command, timeout_secs: u64) -> ToolResult {
+    // A child reading stdin would hang forever (and steal the TUI's keystrokes).
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return ToolResult::err(format!("Failed to execute command: {e}")),
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let read_all = |pipe: Option<tokio::process::ChildStdout>| async move {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut p, &mut buf).await;
+        }
+        buf
+    };
+    let read_err = |pipe: Option<tokio::process::ChildStderr>| async move {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut p, &mut buf).await;
+        }
+        buf
+    };
+
+    let run = async {
+        let (out, err, status) = tokio::join!(read_all(stdout), read_err(stderr), child.wait());
+        (out, err, status)
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run).await {
+        Ok((out, err, status)) => handle_output(status.map(|status| std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        })),
+        Err(_) => {
+            kill_tree(&mut child).await;
+            ToolResult::err(format!(
+                "Command timed out after {timeout_secs}s and was stopped. If it is a server or watcher,                  run it with background=true; if it waits for input, use non-interactive flags;                  otherwise pass a larger timeout_secs (max {MAX_TIMEOUT_SECS})."
+            ))
+        }
+    }
+}
+
+/// Commands that never exit on their own (dev servers, watchers).
+fn looks_long_running(command: &str) -> bool {
+    static RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(
+            r"(?i)(\bhttp\.server\b|\bnpm\s+(start|run\s+(dev|serve|start|watch))\b|\b(yarn|pnpm)\s+(dev|start|serve)\b|^\s*(npx\s+)?serve\b|\bfastapi\s+dev\b|\buvicorn\s|\bflask\s+run\b|\bmanage\.py\s+runserver\b|\bvite(\s|$)|\bnext\s+dev\b|\bcargo\s+watch\b|\blive-server\b)",
+        )
+        .expect("valid regex")
+    });
+    RE.is_match(command)
 }
 
 pub fn is_shell_builtin(cmd_name: &str) -> bool {
@@ -68,7 +220,7 @@ fn contains_single_ampersand(s: &str) -> bool {
 }
 
 pub fn has_shell_metacharacters(command_str: &str) -> bool {
-    let mut has_meta = command_str.contains('|')
+    let has_meta = command_str.contains('|')
         || command_str.contains(';')
         || command_str.contains("&&")
         || command_str.contains('>')
@@ -79,12 +231,8 @@ pub fn has_shell_metacharacters(command_str: &str) -> bool {
         || command_str.contains('?')
         || command_str.contains('[')
         || contains_single_ampersand(command_str);
-        
-    if cfg!(windows) {
-        has_meta = has_meta || command_str.contains('\\');
-    }
-    
-    has_meta
+
+    has_meta || (cfg!(windows) && command_str.contains('\\'))
 }
 
 fn is_url_with_non_file_scheme(s: &str) -> bool {
@@ -196,25 +344,24 @@ fn is_chmod_mode(arg: &str) -> bool {
 fn handle_output(output_res: std::io::Result<std::process::Output>) -> ToolResult {
     match output_res {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let success = output.status.success();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let code = output.status.code().unwrap_or(-1);
 
-            let summary = format!(
-                "Command finished with exit code: {}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
-                output.status.code().unwrap_or(-1),
-                stdout,
-                stderr
-            );
+            // Empty sections are omitted — they'd cost tokens on every later request.
+            let mut summary = format!("Exit code: {code}");
+            if !stdout.trim().is_empty() {
+                summary.push_str(&format!("\n\nSTDOUT:\n{}", stdout.trim_end()));
+            }
+            if !stderr.trim().is_empty() {
+                summary.push_str(&format!("\n\nSTDERR:\n{}", stderr.trim_end()));
+            }
+            if stdout.trim().is_empty() && stderr.trim().is_empty() {
+                summary.push_str(" (no output)");
+            }
 
-            if success {
-                ToolResult::ok_with_data(
-                    summary,
-                    json!({
-                        "exit_code": output.status.code().unwrap_or(-1),
-                        "success": true
-                    }),
-                )
+            if output.status.success() {
+                ToolResult::ok(summary)
             } else {
                 ToolResult::err(summary)
             }
@@ -228,9 +375,7 @@ fn check_raw_command_paths(command_str: &str, ctx: &ToolContext) -> Result<(), S
     for word in words {
         let clean = clean_path_string(word.trim());
         if !clean.is_empty() && looks_like_path(&clean) {
-            if let Err(e) = super::filesystem::resolve_path(&clean, ctx) {
-                return Err(e);
-            }
+            super::filesystem::resolve_path(&clean, ctx)?;
         }
     }
     Ok(())
@@ -245,12 +390,10 @@ impl Tool for ShellCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command inside the project directory. \
-         IMPORTANT RULES: 1) NEVER run interactive commands (like `nano`, `vim`, or blocking scripts) that wait for user input. \
-         2) Always use non-interactive flags (e.g. `apt-get -y`, `npm install --no-fund`). \
-         3) DO NOT use this tool for text replacement (like `sed` or `awk`); use the `edit_file` tool instead. \
-         4) Use background=true to run long-running servers without deadlocking. \
-         Commands are sandboxed — attempts to escape the project directory will be blocked."
+        "Run a shell command in the project directory (stdin is closed, so interactive prompts fail). \
+         Use non-interactive flags (e.g. `npm init -y`). Use edit_file instead of sed/awk. \
+         Servers and watchers need background=true (manage them with manage_processes). \
+         Foreground commands time out after 300s by default. Paths outside the project are blocked."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -258,30 +401,22 @@ impl Tool for ShellCommandTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "The command line string to run (must be non-interactive)" },
-                "background": { "type": "boolean", "description": "Set to true to run the command in the background (detached). Useful for long-running servers." }
+                "background": { "type": "boolean", "description": "Run detached (servers, watchers). Returns a PID." },
+                "timeout_secs": { "type": "integer", "description": "Foreground timeout in seconds (default 300, max 1800)" }
             },
             "required": ["command"]
         })
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let command_str = args["command"].as_str().unwrap_or("");
-        let mut background = args["background"].as_bool().unwrap_or(false);
-
-        // Auto-detect common long-running servers and force background if the agent forgot
-        if !background {
-            let cmd_lower = command_str.to_lowercase();
-            if cmd_lower.contains("http.server")
-                || cmd_lower.contains("npm start")
-                || cmd_lower.contains("npm run dev")
-                || cmd_lower.contains("serve ")
-                || cmd_lower.contains("fastapi dev")
-                || cmd_lower.contains("uvicorn ")
-                || cmd_lower.contains("flask run")
-            {
-                background = true;
-            }
-        }
+        let command_str = args["command"].as_str().unwrap_or("").trim();
+        // Auto-detect common long-running servers in case the model forgot the flag.
+        let background =
+            args["background"].as_bool().unwrap_or(false) || looks_long_running(command_str);
+        let timeout_secs = args["timeout_secs"]
+            .as_u64()
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, MAX_TIMEOUT_SECS);
         if command_str.is_empty() {
             return ToolResult::err("Command string cannot be empty");
         }
@@ -409,9 +544,8 @@ impl Tool for ShellCommandTool {
                 c.arg("-c").arg(command_str);
                 c
             };
-            
-            cmd.current_dir(&ctx.cwd)
-                .kill_on_drop(!background);
+
+            cmd.current_dir(&ctx.cwd);
 
             #[cfg(windows)]
             {
@@ -419,52 +553,9 @@ impl Tool for ShellCommandTool {
             }
 
             if background {
-                cmd.stdin(std::process::Stdio::null());
-                cmd.stdout(std::process::Stdio::null());
-                cmd.stderr(std::process::Stdio::null());
-                match cmd.spawn() {
-                    Ok(mut child) => {
-                        if let Some(pid) = child.id() {
-                            let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
-                            BACKGROUND_PROCESSES.lock().unwrap().insert(
-                                pid,
-                                ProcessInfo {
-                                    pid,
-                                    command: command_str.to_string(),
-                                    kill_tx,
-                                },
-                            );
-
-                            tokio::spawn(async move {
-                                tokio::select! {
-                                    _ = child.wait() => {}
-                                    _ = kill_rx.recv() => {
-                                        let _ = child.kill().await;
-                                    }
-                                }
-                                BACKGROUND_PROCESSES.lock().unwrap().remove(&pid);
-                            });
-
-                            return ToolResult::ok(format!(
-                                "Command started in background with PID: {}",
-                                pid
-                            ));
-                        }
-                        return ToolResult::ok(
-                            "Command started in background (no PID available)".to_string(),
-                        );
-                    }
-                    Err(e) => {
-                        return ToolResult::err(format!(
-                            "Failed to spawn background command: {}",
-                            e
-                        ));
-                    }
-                }
+                return spawn_background(cmd, command_str, ctx);
             }
-
-            let output_res = cmd.output().await;
-            return handle_output(output_res);
+            return run_foreground(cmd, timeout_secs).await;
         }
 
         // Direct execution path
@@ -474,9 +565,7 @@ impl Tool for ShellCommandTool {
         }
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .current_dir(&ctx.cwd)
-            .kill_on_drop(!background);
+        cmd.args(&argv[1..]).current_dir(&ctx.cwd);
 
         #[cfg(windows)]
         {
@@ -484,48 +573,24 @@ impl Tool for ShellCommandTool {
         }
 
         if background {
-            cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::null());
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    if let Some(pid) = child.id() {
-                        let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
-                        BACKGROUND_PROCESSES.lock().unwrap().insert(
-                            pid,
-                            ProcessInfo {
-                                pid,
-                                command: command_str.to_string(),
-                                kill_tx,
-                            },
-                        );
-
-                        tokio::spawn(async move {
-                            tokio::select! {
-                                _ = child.wait() => {}
-                                _ = kill_rx.recv() => {
-                                    let _ = child.kill().await;
-                                }
-                            }
-                            BACKGROUND_PROCESSES.lock().unwrap().remove(&pid);
-                        });
-
-                        return ToolResult::ok(format!(
-                            "Command started in background with PID: {}",
-                            pid
-                        ));
-                    }
-                    return ToolResult::ok(
-                        "Command started in background (no PID available)".to_string(),
-                    );
-                }
-                Err(e) => {
-                    return ToolResult::err(format!("Failed to spawn background command: {}", e));
-                }
-            }
+            return spawn_background(cmd, command_str, ctx);
         }
+        run_foreground(cmd, timeout_secs).await
+    }
+}
 
-        let output_res = cmd.output().await;
-        handle_output(output_res)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_running_detection_uses_word_boundaries() {
+        assert!(looks_long_running("python -m http.server 8080"));
+        assert!(looks_long_running("npm run dev"));
+        assert!(looks_long_running("npx serve ."));
+        assert!(looks_long_running("uvicorn app:app --reload"));
+        assert!(!looks_long_running("echo observe this"));
+        assert!(!looks_long_running("cargo test --test server"));
+        assert!(!looks_long_running("npm install express"));
     }
 }

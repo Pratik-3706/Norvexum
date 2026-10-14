@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Web Fetch — URL content extraction with anti-bot evasion
 // ===========================================================================
 
@@ -81,12 +81,13 @@ fn truncate_text(text: &str, max: usize) -> String {
 
 /// Check if response looks like a Cloudflare/bot block.
 fn is_blocked(status: u16, body: &str) -> bool {
-    if matches!(status, 403 | 429 | 503) {
+    if matches!(status, 403 | 429 | 503) && (body.len() < 2048 || has_challenge_marker(body)) {
         return true;
     }
-    if body.len() < 512 {
-        return true;
-    }
+    status < 400 && body.len() < 4096 && has_challenge_marker(body)
+}
+
+fn has_challenge_marker(body: &str) -> bool {
     let cf_signals = [
         "cf-browser-verification",
         "cf_clearance",
@@ -106,8 +107,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL and extract clean readable text. \
-         Strips ads, navigation, images. Returns the main article/page text."
+        "Fetch a URL and return its readable text (HTML is converted to text; JSON and plain text are returned as-is)."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -121,12 +121,17 @@ impl Tool for WebFetchTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
-        let url_str = args["url"].as_str().unwrap_or("");
-        let max_chars = args["max_chars"].as_u64().unwrap_or(8000) as usize;
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let url_str = args["url"].as_str().unwrap_or("").trim();
+        let max_chars = (args["max_chars"].as_u64().unwrap_or(8000) as usize)
+            .clamp(500, ctx.settings.max_content_chars.max(8000));
 
         if url_str.is_empty() {
             return ToolResult::err("URL cannot be empty");
+        }
+        match url::Url::parse(url_str) {
+            Ok(u) if matches!(u.scheme(), "http" | "https") => {}
+            _ => return ToolResult::err("Only http(s) URLs can be fetched"),
         }
 
         let client = build_client();
@@ -145,8 +150,9 @@ impl Tool for WebFetchTool {
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             )
+            // No manual Accept-Encoding: setting it disables reqwest's automatic
+            // decompression and the body would arrive as compressed bytes.
             .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Accept-Encoding", "gzip, deflate, br")
             .header("Referer", "https://www.google.com/")
             .header("DNT", "1")
             .header("Sec-Fetch-Dest", "document")
@@ -160,6 +166,26 @@ impl Tool for WebFetchTool {
         };
 
         let status = response.status().as_u16();
+        let final_url = response.url().to_string();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+
+        if content_type.starts_with("image/")
+            || content_type.starts_with("video/")
+            || content_type.starts_with("audio/")
+            || content_type.contains("octet-stream")
+            || content_type.contains("application/pdf")
+            || content_type.contains("application/zip")
+        {
+            return ToolResult::err(format!(
+                "{url_str} is binary content ({content_type}); use download_image for images."
+            ));
+        }
+
         let body = match response.text().await {
             Ok(t) => t,
             Err(e) => return ToolResult::err(format!("Failed to read response: {}", e)),
@@ -167,23 +193,33 @@ impl Tool for WebFetchTool {
 
         if is_blocked(status, &body) {
             return ToolResult::err(format!(
-                "Blocked by bot protection (HTTP {}). Try browser_open for this URL.",
-                status
+                "Blocked by bot protection (HTTP {status}). Try browser_interact for this URL."
             ));
         }
 
-        let content = extract_content(&body, max_chars);
+        let is_html = content_type.contains("html")
+            || (content_type.is_empty() && body.trim_start().starts_with('<'));
+        let content = if is_html {
+            extract_content(&body, max_chars)
+        } else {
+            truncate_text(&body, max_chars)
+        };
+
+        if status >= 400 {
+            return ToolResult::err(format!(
+                "HTTP {status} from {final_url}\n{}",
+                truncate_text(&content, 1000)
+            ));
+        }
         if content.trim().is_empty() {
             return ToolResult::err("No readable content extracted from this page.");
         }
 
-        ToolResult::ok_with_data(
-            content,
-            json!({
-                "url": url_str,
-                "status": status,
-                "method": "reqwest"
-            }),
-        )
+        let header = if final_url != url_str {
+            format!("[{final_url} (redirected), HTTP {status}]\n\n")
+        } else {
+            format!("[HTTP {status}]\n\n")
+        };
+        ToolResult::ok(format!("{header}{content}"))
     }
 }

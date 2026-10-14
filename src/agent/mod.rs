@@ -3,13 +3,13 @@
 //
 // Loop:
 //   1. Send conversation + tools to AI model (streaming)
-//   2. Display thinking tokens live in TUI
-//   3. On tool calls → execute in parallel (futures::join_all)
+//   2. Display thinking tokens live in the UI
+//   3. On tool calls → ask for approval where required, execute in parallel
 //   4. Append results → repeat
-//   5. On content → stream text live to TUI
+//   5. On content → stream text live to the UI
 //   6. On "done" → break
-//   7. Auto-compact context when approaching window limit
-//   8. Auto-save session after each turn
+//   7. Auto-compact context when approaching the window limit
+//   8. Auto-save session after each step
 // ===========================================================================
 
 pub mod checkpoint;
@@ -19,6 +19,8 @@ pub mod session;
 pub mod vision;
 
 use eyre::Result;
+use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -54,8 +56,10 @@ pub enum AgentEvent {
     },
     /// Agent turn complete
     Done { usage: Option<UsageStats> },
-    /// Error
+    /// Error (a `Done` always follows when the run ends)
     Error(String),
+    /// A problem worth showing that does not stop the run
+    Warning(String),
     /// Status message
     Status(String),
     /// Model/Provider switch event
@@ -74,6 +78,22 @@ pub enum AgentEvent {
     TriggeredSkill(String),
 }
 
+const FILE_WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "multi_edit"];
+
+/// Everything one model response produced.
+#[derive(Default)]
+struct ModelTurn {
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    thinking_blocks: Vec<ThinkingBlock>,
+    finish_reason: String,
+    /// Tool call ids whose arguments were already streamed as deltas.
+    streamed_args: HashSet<String>,
+    error: Option<String>,
+    cancelled: bool,
+    thinking_chars: usize,
+}
+
 /// The core agent that orchestrates AI ↔ Tool interaction.
 pub struct Agent {
     client: Arc<dyn AiClient>,
@@ -83,7 +103,7 @@ pub struct Agent {
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     session: Option<session::Session>,
     /// Channel for receiving approval responses from the UI
-    approval_rx: Option<mpsc::UnboundedReceiver<bool>>,
+    approval_rx: mpsc::UnboundedReceiver<bool>,
     /// Sender side stored so the UI can clone it
     approval_tx: mpsc::UnboundedSender<bool>,
     /// Flag to dynamically disable tool approvals check
@@ -94,29 +114,49 @@ pub struct Agent {
     pub instruction_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// Temporary volatile RAM storage shared across the agent's lifetime
     pub temp_memory: Arc<tokio::sync::RwLock<crate::tools::memory::TempMemory>>,
+    /// Skills whose guidance has already been added to this conversation.
+    injected_skills: HashSet<String>,
+    /// Whether the current turn has already executed tools (affects error recovery).
+    turn_ran_tools: bool,
+}
+
+fn build_client_or_placeholder(settings: &Settings) -> Arc<dyn AiClient> {
+    match ai::build_client(settings) {
+        Ok(client) => Arc::from(client),
+        Err(e) => Arc::new(ai::UnavailableClient {
+            reason: e.to_string(),
+        }),
+    }
 }
 
 impl Agent {
-    pub fn new(settings: Settings, event_tx: mpsc::UnboundedSender<AgentEvent>) -> Result<Self> {
-        let client = Arc::from(ai::build_client(&settings)?);
+    /// Never fails: a misconfigured provider yields a client that reports the
+    /// problem on use, so the UI can still start and let the user fix it.
+    pub fn new(mut settings: Settings, event_tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        if settings.model_reasoning_type.is_none() {
+            settings.model_reasoning_type = ai::guess_reasoning_support_by_name(
+                &settings.active_provider,
+                &settings.active_model,
+            );
+        }
+        let client = build_client_or_placeholder(&settings);
         let tools = Arc::new(ToolRegistry::new(&settings));
         let settings = Arc::new(settings);
 
-        // Build system prompt with project context
-        let system = build_system_prompt(&settings, &tools);
+        let system = build_system_prompt(&settings);
         let messages = vec![Message::system(system)];
 
         let (approval_tx, approval_rx) = mpsc::unbounded_channel();
         let max_loops = settings.max_thinking_loops;
 
-        Ok(Self {
+        Self {
             client,
             tools,
             settings,
             messages,
             event_tx,
             session: None,
-            approval_rx: Some(approval_rx),
+            approval_rx,
             approval_tx,
             approval_disabled: false,
             max_loops,
@@ -124,7 +164,9 @@ impl Agent {
             temp_memory: Arc::new(tokio::sync::RwLock::new(
                 crate::tools::memory::TempMemory::new(),
             )),
-        })
+            injected_skills: HashSet::new(),
+            turn_ran_tools: false,
+        }
     }
 
     pub fn set_instruction_receiver(&mut self, rx: mpsc::UnboundedReceiver<String>) {
@@ -137,804 +179,621 @@ impl Agent {
     }
 
     /// Update the settings, AiClient, tools, and system prompt dynamically without losing message history.
-    pub fn update_settings(&mut self, settings: Settings) -> Result<()> {
+    pub fn update_settings(&mut self, mut settings: Settings) -> Result<()> {
         let _ = std::env::set_current_dir(&settings.project_root);
-        let client = Arc::from(ai::build_client(&settings)?);
+        if settings.model_reasoning_type.is_none() {
+            settings.model_reasoning_type = ai::guess_reasoning_support_by_name(
+                &settings.active_provider,
+                &settings.active_model,
+            );
+        }
+        let built = ai::build_client(&settings);
         let tools = Arc::new(ToolRegistry::new(&settings));
         let settings = Arc::new(settings);
 
-        // Build system prompt with project context
-        let system = build_system_prompt(&settings, &tools);
+        let system = build_system_prompt(&settings);
 
-        self.client = client;
+        self.client = match &built {
+            Ok(_) => build_client_or_placeholder(&settings),
+            Err(e) => Arc::new(ai::UnavailableClient {
+                reason: e.to_string(),
+            }),
+        };
         self.tools = tools;
         self.max_loops = settings.max_thinking_loops;
         self.settings = settings;
 
         // Replace the first message (which is always the system prompt)
-        if !self.messages.is_empty() && self.messages[0].role == Role::System {
+        if self
+            .messages
+            .first()
+            .is_some_and(|m| m.role == Role::System)
+        {
             self.messages[0] = Message::system(system);
         }
 
-        Ok(())
+        built.map(|_| ())
     }
 
     pub async fn process_message(
         &mut self,
         user_input: &str,
-        cancel_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+        cancel_rx: &mut mpsc::UnboundedReceiver<()>,
     ) -> Result<Vec<String>> {
-        // Strip images from all previous messages to save massive amounts of payload size on subsequent requests.
-        // The model already saw the images and processed them, so I just keep the text context.
+        // Earlier images were already seen by the model; resending them on every
+        // request would multiply the payload size.
         for msg in &mut self.messages {
             msg.strip_images();
         }
 
         let backup_messages = self.messages.clone();
+        self.turn_ran_tools = false;
 
         let result = self.process_message_internal(user_input, cancel_rx).await;
 
-        if result.is_err() {
-            // Restore messages on error so that a huge or corrupted request doesn't poison the conversation history
+        // Roll back a failed turn so a broken request (e.g. an oversized image)
+        // doesn't poison every later one — unless tools already ran, in which
+        // case their effects are real and the model must keep seeing them.
+        if result.is_err() && !self.turn_ran_tools {
             self.messages = backup_messages;
         }
 
         result
     }
 
+    fn done(&self, usage: Option<UsageStats>) {
+        let _ = self.event_tx.send(AgentEvent::Done { usage });
+    }
+
+    fn reply(&self, text: impl Into<String>) {
+        let _ = self.event_tx.send(AgentEvent::Content(text.into()));
+    }
+
+    fn status(&self, text: impl Into<String>) {
+        let _ = self.event_tx.send(AgentEvent::Status(text.into()));
+    }
+
+    /// Handle `/command` input. Returns `true` when the input was a command.
+    async fn handle_slash_command(&mut self, input: &str) -> bool {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        let Some(&command) = parts.first() else {
+            return false;
+        };
+        let arg = parts.get(1).copied();
+
+        match command {
+            "/help" => {
+                self.reply(
+                    [
+                        "📖 **Norvexum commands**",
+                        "  `/help`                 Show this help",
+                        "  `/ask_perms <on/off>`   Toggle tool approval prompts",
+                        "  `/loops <num>`          Set the tool-loop limit for one request",
+                        "  `/clear`                Clear the chat and conversation memory",
+                        "  `/compact`              Summarize older messages to free context",
+                        "  `/copy` / `/copy chat`  Copy the last answer / whole chat",
+                        "  `/undo`                 Restore the files changed by the last edit",
+                        "  `/session resume|list|load <id>|clear`",
+                        "  `/provider [id]`        List providers or switch",
+                        "  `/model [id]`           List models or switch",
+                        "  `/exit`                 Quit",
+                        "",
+                        "💡 *Esc stops a running request. Messages typed while it runs are queued.*",
+                    ]
+                    .join("\n"),
+                );
+            }
+            "/ask_perms" => match arg {
+                Some("off") => {
+                    self.approval_disabled = true;
+                    self.reply(
+                        "🔓 Tool approval prompts disabled — commands will run automatically.",
+                    );
+                }
+                Some("on") => {
+                    self.approval_disabled = false;
+                    self.reply("🔒 Tool approval prompts enabled.");
+                }
+                _ => {
+                    let state = if self.approval_disabled {
+                        "OFF (auto-approve)"
+                    } else {
+                        "ON (interactive)"
+                    };
+                    self.reply(format!(
+                        "Tool approval: {state}\nUsage: `/ask_perms <on/off>`"
+                    ));
+                }
+            },
+            "/loops" => match arg.map(str::parse::<usize>) {
+                Some(Ok(num)) if num > 0 => {
+                    self.max_loops = num;
+                    self.reply(format!("🔄 Tool-loop limit set to {num}."));
+                }
+                Some(_) => {
+                    let _ = self.event_tx.send(AgentEvent::Error(
+                        "Usage: `/loops <num>` (greater than 0)".into(),
+                    ));
+                }
+                None => self.reply(format!(
+                    "Current tool-loop limit: {}\nUsage: `/loops <num>`",
+                    self.max_loops
+                )),
+            },
+            "/clear" => {
+                self.messages.truncate(1); // keep the system prompt
+                self.injected_skills.clear();
+                self.session = None;
+                let _ = self.event_tx.send(AgentEvent::ClearChat);
+            }
+            "/compact" => {
+                let before = compaction::estimate_tokens(&self.messages);
+                self.messages = compaction::compact(&self.messages, 4);
+                compaction::prune_tool_results(&mut self.messages, 2, 600);
+                let after = compaction::estimate_tokens(&self.messages);
+                self.save_session();
+                self.reply(format!(
+                    "🗜️ Compacted context: ~{before} → ~{after} tokens."
+                ));
+            }
+            "/undo" => match checkpoint::undo_last(&self.settings.project_root) {
+                Ok(restored) if restored.is_empty() => self.reply("No files were restored."),
+                Ok(restored) => self.reply(format!(
+                    "✅ Restored {} file(s):\n{}",
+                    restored.len(),
+                    restored
+                        .iter()
+                        .map(|f| format!("  • {f}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )),
+                Err(e) => {
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::Error(format!("Undo failed: {e}")));
+                }
+            },
+            "/session" => self.handle_session_command(arg, parts.get(2).copied()),
+            "/copy" => self.handle_copy(arg == Some("chat")),
+            "/exit" | "/quit" => {
+                self.save_session();
+                let _ = self.event_tx.send(AgentEvent::Quit);
+                return true;
+            }
+            "/stop" => self.reply("⏹️ Nothing is running."),
+            "/model" => self.handle_model_command(arg).await,
+            "/provider" => self.handle_provider_command(arg).await,
+            _ => {
+                let _ = self.event_tx.send(AgentEvent::Error(format!(
+                    "❌ Unknown command **{command}**. Type `/help` for the list."
+                )));
+            }
+        }
+        self.done(None);
+        true
+    }
+
+    fn handle_session_command(&mut self, sub: Option<&str>, id: Option<&str>) {
+        let root = self.settings.project_root.clone();
+        match sub {
+            Some("load") => match id.and_then(|id| session::Session::load_by_id(&root, id)) {
+                Some(sess) => {
+                    self.messages = sess.messages.clone();
+                    self.injected_skills.clear();
+                    let _ = self.event_tx.send(AgentEvent::ModelSwitched {
+                        model: self.settings.active_model.clone(),
+                        provider: self.settings.active_provider.clone(),
+                    });
+                    self.reply(format!(
+                        "✅ Loaded session {} ({} messages)",
+                        crate::util::truncate_chars(&sess.id, 6),
+                        self.messages.len()
+                    ));
+                    self.session = Some(sess);
+                }
+                None => self.reply(match id {
+                    Some(id) => format!("Session {id} not found."),
+                    None => "Usage: `/session load <id>`".into(),
+                }),
+            },
+            Some("resume") => match session::Session::load_latest(&root) {
+                Some(sess) => {
+                    self.messages = sess.messages.clone();
+                    self.injected_skills.clear();
+                    self.reply(format!("✅ Resumed session ({} messages)", self.messages.len()));
+                    self.session = Some(sess);
+                }
+                None => self.reply("No saved sessions found."),
+            },
+            Some("list") => {
+                let sessions = session::Session::list(&root);
+                if sessions.is_empty() {
+                    self.reply("No saved sessions.");
+                } else {
+                    let list: Vec<String> = sessions
+                        .iter()
+                        .take(10)
+                        .map(|s| {
+                            format!(
+                                "  • `{}` — {} msgs — {} — {}",
+                                s.id, s.message_count, s.model, s.updated_at
+                            )
+                        })
+                        .collect();
+                    self.reply(format!("Saved sessions:\n{}", list.join("\n")));
+                }
+            }
+            Some("clear") => {
+                let _ = session::Session::clear_all(&root);
+                self.session = None;
+                self.reply("✅ All sessions cleared.");
+            }
+            _ => self.reply("Usage: `/session resume` | `/session list` | `/session load <id>` | `/session clear`"),
+        }
+    }
+
+    fn handle_copy(&mut self, whole_chat: bool) {
+        let content = if whole_chat {
+            self.messages
+                .iter()
+                .filter_map(|msg| {
+                    let who = match msg.role {
+                        Role::User => "You",
+                        Role::Assistant => "AI",
+                        Role::Tool => "Tool",
+                        Role::System => return None,
+                    };
+                    Some(format!("{who}:\n{}\n", msg.text()))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            self.messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::Assistant && !m.text().trim().is_empty())
+                .map(|m| m.text())
+                .unwrap_or_default()
+        };
+
+        if content.is_empty() {
+            let _ = self
+                .event_tx
+                .send(AgentEvent::Error("Nothing to copy!".into()));
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(content)) {
+            Ok(()) => self.reply(if whole_chat {
+                "📋 Copied the whole chat to the clipboard."
+            } else {
+                "📋 Copied the last answer to the clipboard."
+            }),
+            Err(e) => {
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::Error(format!("Clipboard error: {e}")));
+            }
+        }
+    }
+
+    async fn models_for(&self, provider: &str) -> Vec<crate::config::providers::ModelInfo> {
+        if provider == "ollama" {
+            let url = self
+                .settings
+                .ollama_base_url
+                .as_deref()
+                .unwrap_or(crate::ai::ollama::DEFAULT_OLLAMA_URL);
+            return crate::ai::ollama::discover_models(url)
+                .await
+                .unwrap_or_default();
+        }
+        crate::config::providers::build_registry_with_settings(&self.settings)
+            .into_iter()
+            .find(|p| p.name == provider)
+            .map(|p| p.models)
+            .unwrap_or_default()
+    }
+
+    fn switch_to(&mut self, mut settings: Settings, what: &str) {
+        settings.model_reasoning_type =
+            ai::guess_reasoning_support_by_name(&settings.active_provider, &settings.active_model);
+        match ai::build_client(&settings) {
+            Ok(client) => {
+                self.client = Arc::from(client);
+                self.settings = Arc::new(settings);
+                if let Err(e) = self.settings.save() {
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::Warning(format!("Failed to save config: {e}")));
+                }
+                let _ = self.event_tx.send(AgentEvent::ModelSwitched {
+                    model: self.settings.active_model.clone(),
+                    provider: self.settings.active_provider.clone(),
+                });
+                self.reply(format!(
+                    "Switched {what}. Now using **{}** on **{}**.",
+                    self.settings.active_model, self.settings.active_provider
+                ));
+            }
+            Err(e) => {
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::Error(format!("Failed to switch {what}: {e}")));
+            }
+        }
+    }
+
+    async fn handle_model_command(&mut self, arg: Option<&str>) {
+        let provider = self.settings.active_provider.clone();
+        let Some(model_id) = arg else {
+            let models = self.models_for(&provider).await;
+            let mut list = vec![format!("Models for **{provider}**:")];
+            if models.is_empty() {
+                list.push("  (none found — for Ollama, check that it is running)".into());
+            }
+            for model in &models {
+                let caps = format!(
+                    "{}{}{}",
+                    if matches!(model.vision, crate::config::providers::Vision::Yes) {
+                        " 👁"
+                    } else {
+                        ""
+                    },
+                    if model.tool_calling { " 🔧" } else { "" },
+                    if model.image_gen { " 🎨" } else { "" }
+                );
+                let marker = if model.id == self.settings.active_model {
+                    "▶"
+                } else {
+                    "•"
+                };
+                list.push(format!("  {marker} {} ({}{caps})", model.id, model.family));
+            }
+            list.push("\nSwitch with `/model <id>`.".into());
+            self.reply(list.join("\n"));
+            return;
+        };
+
+        let mut settings = (*self.settings).clone();
+        settings.active_model = model_id.to_string();
+        self.switch_to(settings, "model");
+    }
+
+    async fn handle_provider_command(&mut self, arg: Option<&str>) {
+        let Some(provider_id) = arg else {
+            let mut list = vec!["Providers:".to_string()];
+            for p in crate::config::providers::build_registry() {
+                let marker = if p.name == self.settings.active_provider {
+                    "▶"
+                } else {
+                    "•"
+                };
+                list.push(format!("  {marker} {} — {}", p.name, p.display_name));
+            }
+            list.push("\nSwitch with `/provider <id>`.".into());
+            self.reply(list.join("\n"));
+            return;
+        };
+
+        let mut settings = (*self.settings).clone();
+        settings.active_provider = provider_id.to_string();
+
+        // Keep the current model only if the new provider actually offers it.
+        let models = self.models_for(provider_id).await;
+        if !models.iter().any(|m| m.id == settings.active_model) {
+            let preferred = match provider_id {
+                "google_direct" => Some("gemini-2.5-flash"),
+                "aicredits" => Some("google/gemini-2.5-flash"),
+                "anthropic" => Some("claude-sonnet-5-5"),
+                "openai" => Some("gpt-4o"),
+                _ => None,
+            };
+            if let Some(model) = preferred
+                .filter(|p| models.iter().any(|m| m.id == *p))
+                .map(str::to_string)
+                .or_else(|| models.first().map(|m| m.id.clone()))
+                .or_else(|| preferred.map(str::to_string))
+            {
+                settings.active_model = model;
+            }
+        }
+        self.switch_to(settings, "provider");
+    }
+
+    /// Turn the user's input (and any referenced images) into a message.
+    async fn build_user_message(
+        &mut self,
+        text: &str,
+        explicit_images: Vec<std::path::PathBuf>,
+    ) -> Message {
+        let mut images = detect_images(text, &self.settings.project_root);
+        for img in explicit_images {
+            if !images.contains(&img) {
+                images.push(img);
+            }
+        }
+        images.retain(|img| {
+            let ok = self.settings.is_in_sandbox(img);
+            if !ok {
+                let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                    "Image '{}' is outside the project sandbox and was not attached",
+                    img.display()
+                )));
+            }
+            ok
+        });
+        if images.is_empty() {
+            return Message::user(text);
+        }
+
+        if self.client.supports_vision() {
+            self.status(format!("📸 Loading {} image(s)...", images.len()));
+            let mut encoded = Vec::new();
+            for img in &images {
+                match vision::encode_image_file(img) {
+                    Ok(pair) => encoded.push(pair),
+                    Err(e) => {
+                        let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                            "Failed to load image '{}': {e}",
+                            img.display()
+                        )));
+                    }
+                }
+            }
+            if !encoded.is_empty() {
+                return Message::user_with_images(text, encoded);
+            }
+            return Message::user(text);
+        }
+
+        // The active model is text-only: describe the images first.
+        let descriptions = if let Some(key) = self.settings.google_ai_api_key.clone() {
+            self.status(format!(
+                "📸 Describing {} image(s) via Gemini...",
+                images.len()
+            ));
+            self.describe_images_with_gemini(&key, &images).await
+        } else if let Some(key) = self.settings.ocr_space_api_key.clone() {
+            self.status(format!("📸 Running OCR on {} image(s)...", images.len()));
+            let mut texts = Vec::new();
+            for img in &images {
+                match vision::ocr_image(&key, img).await {
+                    Ok(t) => texts.push(format!(
+                        "--- {} ---\n{t}",
+                        img.file_name().unwrap_or_default().to_string_lossy()
+                    )),
+                    Err(e) => {
+                        let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                            "OCR failed for '{}': {e}",
+                            img.display()
+                        )));
+                    }
+                }
+            }
+            (!texts.is_empty())
+                .then(|| format!("[Images analyzed via OCR]:\n{}", texts.join("\n\n")))
+        } else {
+            let _ = self.event_tx.send(AgentEvent::Warning(
+                "This model can't see images and no GOOGLE_AI_API_KEY / OCR_SPACE_API_KEY is set; sending text only."
+                    .into(),
+            ));
+            None
+        };
+
+        match descriptions {
+            Some(desc) => Message::user(format!("{desc}\n\n{text}")),
+            None => Message::user(text),
+        }
+    }
+
+    async fn describe_images_with_gemini(
+        &self,
+        key: &str,
+        images: &[std::path::PathBuf],
+    ) -> Option<String> {
+        let mut msg = Message::user(format!(
+            "Describe these {} images in detail so a text-only assistant can understand them:",
+            images.len()
+        ));
+        for img in images {
+            match vision::encode_image_file(img) {
+                Ok((data, mime_type)) => {
+                    msg.content.push(ContentPart::Text {
+                        text: format!(
+                            "\n--- Image: {} ---",
+                            img.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                    });
+                    msg.content.push(ContentPart::Image { data, mime_type });
+                }
+                Err(e) => {
+                    let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                        "Failed to load image '{}': {e}",
+                        img.display()
+                    )));
+                }
+            }
+        }
+
+        let client =
+            crate::ai::gemini::GeminiClient::new(key.to_string(), "gemini-2.5-flash".into(), None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = AiRequest::new(vec![msg]).with_temperature(0.5);
+        if let Err(e) = client.chat_stream(request, tx).await {
+            let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                "Gemini image description failed: {e}"
+            )));
+            return None;
+        }
+        let mut description = String::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                AiStreamEvent::ContentDelta(text) => description.push_str(&text),
+                AiStreamEvent::Error(e) => {
+                    let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                        "Gemini image description failed: {e}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        (!description.trim().is_empty())
+            .then(|| format!("[Image content described by Gemini]:\n{description}"))
+    }
+
     async fn process_message_internal(
         &mut self,
         user_input: &str,
-        cancel_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+        cancel_rx: &mut mpsc::UnboundedReceiver<()>,
     ) -> Result<Vec<String>> {
-        let mut actual_user_input = user_input;
+        let mut text = user_input;
         let mut explicit_images = Vec::new();
 
-        if actual_user_input.starts_with("/image_prompt |") {
-            let mut parts = actual_user_input.splitn(3, '|');
-            parts.next(); // skip "/image_prompt "
-            if let Some(img_path) = parts.next() {
-                if let Some(prompt) = parts.next() {
-                    let path = std::path::PathBuf::from(img_path);
-                    if path.exists() {
-                        explicit_images.push(path);
-                    }
-                    actual_user_input = prompt.trim();
+        // GUI attachment protocol: "/image_prompt |<path>| <prompt>"
+        if let Some(rest) = text.strip_prefix("/image_prompt |") {
+            if let Some((img_path, prompt)) = rest.split_once('|') {
+                let path = std::path::PathBuf::from(img_path);
+                if path.exists() {
+                    explicit_images.push(path);
                 }
+                text = prompt.trim();
             }
         }
 
-        if actual_user_input.starts_with('/') {
-            let parts: Vec<&str> = actual_user_input.split_whitespace().collect();
-            if !parts.is_empty() {
-                match parts[0] {
-                    "/help" => {
-                        let msg = vec![
-                            "📖 **Norvexum Interactive Chat Commands:**",
-                            "  `/help`                 - Show this help message",
-                            "  `/ask_perms <on/off>`   - Toggle interactive tool run approval checks on/off",
-                            "  `/loops <num>`          - Set the maximum thinking loop cycle limit",
-                            "  `/clear`                - Clear TUI chat log & conversation memory",
-                            "  `/copy`                 - Copy the last AI response to system clipboard",
-                            "  `/copy chat`            - Copy the entire conversation history to clipboard",
-                            "  `/undo`                 - Undo the last file write/edit (restore from checkpoint)",
-                            "  `/session resume`       - Resume the last saved session",
-                            "  `/session list`         - List saved sessions",
-                            "  `/session clear`        - Delete all saved sessions",
-                            "  `/provider`             - List available AI providers",
-                            "  `/provider <id>`        - Switch to specified AI provider",
-                            "  `/model`                - List models for the active provider",
-                            "  `/model <id>`           - Switch to specified AI model",
-                            "  `/exit` or `/quit`      - Quit the program cleanly",
-                            "\n💡 *Tip: If the agent is executing, press `Esc` to cancel the current run immediately.*",
-                            "💡 *Tip: Drag-select text in the chat to copy it to clipboard.*",
-                        ].join("\n");
-                        let _ = self.event_tx.send(AgentEvent::Content(msg));
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    "/ask_perms" => {
-                        if parts.len() > 1 {
-                            match parts[1] {
-                                "off" => {
-                                    self.approval_disabled = true;
-                                    let msg = "🔓 Dynamic tool approval requirements disabled (warning: commands will execute automatically).".to_string();
-                                    let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
-                                    let _ = self.event_tx.send(AgentEvent::Content(msg));
-                                }
-                                "on" => {
-                                    self.approval_disabled = false;
-                                    let msg = "🔒 Dynamic tool approval requirements enabled."
-                                        .to_string();
-                                    let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
-                                    let _ = self.event_tx.send(AgentEvent::Content(msg));
-                                }
-                                _ => {
-                                    let _ = self.event_tx.send(AgentEvent::Error(
-                                        "Usage: `/ask_perms <on/off>`".into(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            let status = if self.approval_disabled {
-                                "OFF (Auto-approve)"
-                            } else {
-                                "ON (Interactive)"
-                            };
-                            let _ = self.event_tx.send(AgentEvent::Content(format!(
-                                "Current tool approval state: {}\nUsage: `/ask_perms <on/off>`",
-                                status
-                            )));
-                        }
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    "/loops" => {
-                        if parts.len() > 1 {
-                            if let Ok(num) = parts[1].parse::<usize>() {
-                                if num > 0 {
-                                    self.max_loops = num;
-                                    let msg =
-                                        format!("🔄 Maximum thinking loop cycles set to {}.", num);
-                                    let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
-                                    let _ = self.event_tx.send(AgentEvent::Content(msg));
-                                } else {
-                                    let _ = self.event_tx.send(AgentEvent::Error(
-                                        "Loop limit must be greater than 0".into(),
-                                    ));
-                                }
-                            } else {
-                                let _ = self
-                                    .event_tx
-                                    .send(AgentEvent::Error("Usage: `/loops <num>`".into()));
-                            }
-                        } else {
-                            let _ = self.event_tx.send(AgentEvent::Content(format!(
-                                "Current thinking loop cycle limit: {}\nUsage: `/loops <num>`",
-                                self.max_loops
-                            )));
-                        }
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    "/clear" => {
-                        if self.messages.len() > 1 {
-                            self.messages.truncate(1); // Retain only system prompt
-                        }
-                        let _ = self.event_tx.send(AgentEvent::ClearChat);
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    "/undo" => {
-                        match checkpoint::undo_last(&self.settings.project_root) {
-                            Ok(restored) => {
-                                let msg = if restored.is_empty() {
-                                    "No files were restored.".to_string()
-                                } else {
-                                    format!(
-                                        "✅ Restored {} file(s):\n{}",
-                                        restored.len(),
-                                        restored
-                                            .iter()
-                                            .map(|f| format!("  • {}", f))
-                                            .collect::<Vec<_>>()
-                                            .join("\n")
-                                    )
-                                };
-                                let _ = self.event_tx.send(AgentEvent::Content(msg));
-                            }
-                            Err(e) => {
-                                let _ = self
-                                    .event_tx
-                                    .send(AgentEvent::Error(format!("Undo failed: {}", e)));
-                            }
-                        }
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    "/session" => {
-                        if parts.len() < 2 {
-                            let _ = self.event_tx.send(AgentEvent::Content(
-                                "Usage: `/session resume` | `/session load <id>` | `/session list` | `/session clear`"
-                                    .into(),
-                            ));
-                            let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                            return Ok(self.drain_instructions());
-                        }
-                        match parts[1] {
-                            "load" => {
-                                if parts.len() >= 3 {
-                                    let id = parts[2];
-                                    if let Some(sess) = session::Session::load_by_id(
-                                        &self.settings.project_root,
-                                        id,
-                                    ) {
-                                        self.messages = sess.messages.clone();
-                                        self.session = Some(sess);
-                                        let model = self.session.as_ref().unwrap().model.clone();
-                                        let provider =
-                                            self.session.as_ref().unwrap().provider.clone();
-                                        let _ = self
-                                            .event_tx
-                                            .send(AgentEvent::ModelSwitched { model, provider });
-                                        let _ = self.event_tx.send(AgentEvent::Content(format!(
-                                            "✅ Loaded session {} ({} messages)",
-                                            &id[..6.min(id.len())],
-                                            self.messages.len()
-                                        )));
-                                    } else {
-                                        let _ = self.event_tx.send(AgentEvent::Content(format!(
-                                            "Session {} not found.",
-                                            id
-                                        )));
-                                    }
-                                } else {
-                                    let _ = self.event_tx.send(AgentEvent::Content(
-                                        "Usage: `/session load <id>`".into(),
-                                    ));
-                                }
-                                let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                                return Ok(self.drain_instructions());
-                            }
-                            "resume" => {
-                                if let Some(sess) =
-                                    session::Session::load_latest(&self.settings.project_root)
-                                {
-                                    self.messages = sess.messages.clone();
-                                    self.session = Some(sess);
-                                    let _ = self.event_tx.send(AgentEvent::Content(format!(
-                                        "✅ Resumed session ({} messages)",
-                                        self.messages.len()
-                                    )));
-                                } else {
-                                    let _ = self.event_tx.send(AgentEvent::Content(
-                                        "No saved sessions found.".into(),
-                                    ));
-                                }
-                            }
-                            "list" => {
-                                let sessions = session::Session::list(&self.settings.project_root);
-                                if sessions.is_empty() {
-                                    let _ = self
-                                        .event_tx
-                                        .send(AgentEvent::Content("No saved sessions.".into()));
-                                } else {
-                                    let list: Vec<String> = sessions
-                                        .iter()
-                                        .take(10)
-                                        .map(|s| {
-                                            format!(
-                                                "  • {} — {} msgs — {} — {}",
-                                                s.id, s.message_count, s.model, s.updated_at
-                                            )
-                                        })
-                                        .collect();
-                                    let _ = self.event_tx.send(AgentEvent::Content(format!(
-                                        "Saved Sessions:\n{}",
-                                        list.join("\n")
-                                    )));
-                                }
-                            }
-                            "clear" => {
-                                let _ = session::Session::clear_all(&self.settings.project_root);
-                                let _ = self
-                                    .event_tx
-                                    .send(AgentEvent::Content("✅ All sessions cleared.".into()));
-                            }
-                            _ => {
-                                let _ = self.event_tx.send(AgentEvent::Content(
-                                    "Unknown session command. Use: resume, list, clear".into(),
-                                ));
-                            }
-                        }
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    "/copy" => {
-                        let mut content_to_copy = String::new();
-                        if parts.len() > 1 && parts[1] == "chat" {
-                            let mut full_chat = Vec::new();
-                            for msg in &self.messages {
-                                if matches!(msg.role, crate::ai::types::Role::System) {
-                                    continue;
-                                }
-                                let role_prefix = match msg.role {
-                                    crate::ai::types::Role::User => "You",
-                                    crate::ai::types::Role::Assistant => "AI",
-                                    crate::ai::types::Role::Tool => "Tool",
-                                    _ => "Other",
-                                };
-                                full_chat.push(format!("{}:\n{}\n", role_prefix, msg.text()));
-                            }
-                            content_to_copy = full_chat.join("\n");
-                        } else {
-                            if let Some(msg) = self
-                                .messages
-                                .iter()
-                                .rev()
-                                .find(|m| matches!(m.role, crate::ai::types::Role::Assistant))
-                            {
-                                content_to_copy = msg.text();
-                            }
-                        }
-
-                        if content_to_copy.is_empty() {
-                            let _ = self
-                                .event_tx
-                                .send(AgentEvent::Error("Nothing to copy!".into()));
-                        } else {
-                            match arboard::Clipboard::new() {
-                                Ok(mut ctx) => {
-                                    if let Err(e) = ctx.set_text(content_to_copy) {
-                                        let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                            "Failed to copy to clipboard: {}",
-                                            e
-                                        )));
-                                    } else {
-                                        let feedback = if parts.len() > 1 && parts[1] == "chat" {
-                                            "📋 Copied entire chat history to clipboard!"
-                                        } else {
-                                            "📋 Copied last AI response to clipboard!"
-                                        };
-                                        let _ = self
-                                            .event_tx
-                                            .send(AgentEvent::Status(feedback.to_string()));
-                                        let _ = self
-                                            .event_tx
-                                            .send(AgentEvent::Content(feedback.to_string()));
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                        "Failed to initialize clipboard: {}",
-                                        e
-                                    )));
-                                }
-                            }
-                        }
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    "/exit" | "/quit" => {
-                        // Save session before quitting
-                        self.save_session();
-                        let _ = self.event_tx.send(AgentEvent::Quit);
-                        return Ok(self.drain_instructions());
-                    }
-                    "/stop" => {
-                        let msg = "⏹️ Already stopped".to_string();
-                        let _ = self.event_tx.send(AgentEvent::Status(msg.clone()));
-                        let _ = self.event_tx.send(AgentEvent::Content(msg));
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    "/model" => {
-                        if parts.len() < 2 {
-                            let current_provider = &self.settings.active_provider;
-                            let mut list =
-                                vec![format!("Available Models for {}:", current_provider)];
-
-                            if current_provider == "ollama" {
-                                let ollama_url = self
-                                    .settings
-                                    .ollama_base_url
-                                    .as_deref()
-                                    .unwrap_or(crate::ai::ollama::DEFAULT_OLLAMA_URL);
-                                if let Some(models) =
-                                    crate::ai::ollama::discover_models(ollama_url).await
-                                {
-                                    for model in &models {
-                                        let capabilities = format!(
-                                            "{}{}{}",
-                                            if matches!(
-                                                model.vision,
-                                                crate::config::providers::Vision::Yes
-                                            ) {
-                                                " 👁️"
-                                            } else {
-                                                ""
-                                            },
-                                            if model.tool_calling { " 🔧" } else { "" },
-                                            if model.image_gen { " 🎨" } else { "" }
-                                        );
-                                        list.push(format!(
-                                            "  • {} ({}{})",
-                                            model.id, model.family, capabilities
-                                        ));
-                                    }
-                                } else {
-                                    list.push(
-                                        "  (Ollama is unreachable or no local models installed)"
-                                            .to_string(),
-                                    );
-                                }
-                            } else {
-                                let registry =
-                                    crate::config::providers::build_registry_with_settings(
-                                        &self.settings,
-                                    );
-                                if let Some(provider) =
-                                    registry.iter().find(|p| &p.name == current_provider)
-                                {
-                                    for model in &provider.models {
-                                        let capabilities = format!(
-                                            "{}{}{}",
-                                            if matches!(
-                                                model.vision,
-                                                crate::config::providers::Vision::Yes
-                                            ) {
-                                                " 👁️"
-                                            } else {
-                                                ""
-                                            },
-                                            if model.tool_calling { " 🔧" } else { "" },
-                                            if model.image_gen { " 🎨" } else { "" }
-                                        );
-                                        list.push(format!(
-                                            "  • {} ({}{})",
-                                            model.id, model.family, capabilities
-                                        ));
-                                    }
-                                } else {
-                                    list.push("  (No models listed for this provider)".to_string());
-                                }
-                            }
-
-                            list.push(format!("\nActive: {}", self.settings.active_model));
-                            list.push("To switch: /model <model_id>".to_string());
-
-                            let _ = self.event_tx.send(AgentEvent::Content(list.join("\n")));
-                            let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                            return Ok(self.drain_instructions());
-                        }
-                        let model_id = parts[1].to_string();
-
-                        let mut settings = (*self.settings).clone();
-                        settings.active_model = model_id.clone();
-
-                        match ai::build_client(&settings) {
-                            Ok(new_client) => {
-                                self.client = Arc::from(new_client);
-                                self.settings = Arc::new(settings);
-                                if let Err(e) = self.settings.save() {
-                                    let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                        "Failed to save config: {}",
-                                        e
-                                    )));
-                                }
-                                let _ = self.event_tx.send(AgentEvent::ModelSwitched {
-                                    model: model_id.clone(),
-                                    provider: self.settings.active_provider.clone(),
-                                });
-                                let _ = self.event_tx.send(AgentEvent::Content(format!(
-                                    "Switched active model to **{}**.",
-                                    model_id
-                                )));
-                                let _ = self.event_tx.send(AgentEvent::Status(format!(
-                                    "Model switched to: {}",
-                                    model_id
-                                )));
-                            }
-                            Err(e) => {
-                                let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                    "Failed to switch model: {}",
-                                    e
-                                )));
-                            }
-                        }
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    "/provider" => {
-                        if parts.len() < 2 {
-                            let registry = crate::config::providers::build_registry();
-                            let mut list = vec!["Available Providers:".to_string()];
-                            for provider in &registry {
-                                list.push(format!(
-                                    "  • {} - {}",
-                                    provider.name, provider.display_name
-                                ));
-                            }
-                            list.push(format!("\nActive: {}", self.settings.active_provider));
-                            list.push("To switch: /provider <provider_id>".to_string());
-
-                            let _ = self.event_tx.send(AgentEvent::Content(list.join("\n")));
-                            let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                            return Ok(self.drain_instructions());
-                        }
-                        let provider_id = parts[1].to_string();
-                        let mut settings = (*self.settings).clone();
-                        settings.active_provider = provider_id.clone();
-
-                        // Try to auto-select a model for the new provider
-                        if provider_id == "google_direct" {
-                            settings.active_model = "gemini-2.5-flash".into();
-                        } else if provider_id == "aicredits" {
-                            settings.active_model = "google/gemini-2.5-flash".into();
-                        } else if provider_id == "ollama" {
-                            // For Ollama, try to pick the first available model
-                            let ollama_url = settings
-                                .ollama_base_url
-                                .as_deref()
-                                .unwrap_or(crate::ai::ollama::DEFAULT_OLLAMA_URL);
-                            if let Some(models) =
-                                crate::ai::ollama::discover_models(ollama_url).await
-                            {
-                                if let Some(first) = models.first() {
-                                    settings.active_model = first.id.clone();
-                                }
-                            }
-                        }
-
-                        match ai::build_client(&settings) {
-                            Ok(new_client) => {
-                                self.client = Arc::from(new_client);
-                                self.settings = Arc::new(settings.clone());
-                                if let Err(e) = self.settings.save() {
-                                    let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                        "Failed to save config: {}",
-                                        e
-                                    )));
-                                }
-                                let _ = self.event_tx.send(AgentEvent::ModelSwitched {
-                                    model: self.settings.active_model.clone(),
-                                    provider: provider_id.clone(),
-                                });
-                                let _ = self.event_tx.send(AgentEvent::Content(format!(
-                                    "Switched provider to **{}**.\nActive model: **{}**",
-                                    provider_id, settings.active_model
-                                )));
-                                let _ = self.event_tx.send(AgentEvent::Status(format!(
-                                    "Provider switched to: {}",
-                                    provider_id
-                                )));
-                            }
-                            Err(e) => {
-                                let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                    "Failed to switch provider: {}",
-                                    e
-                                )));
-                            }
-                        }
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                    _ => {
-                        let unknown_cmd = parts[0];
-                        let msg = format!(
-                            "❌ Unknown slash command: **{unknown_cmd}**.\nType `/help` to view the list of available commands."
-                        );
-                        let _ = self.event_tx.send(AgentEvent::Error(msg));
-                        let _ = self.event_tx.send(AgentEvent::Done { usage: None });
-                        return Ok(self.drain_instructions());
-                    }
-                }
-            }
+        if text.starts_with('/') && self.handle_slash_command(text).await {
+            return Ok(self.drain_instructions());
         }
 
-        let mut user_msg = None;
+        let mut user_msg = self.build_user_message(text, explicit_images).await;
 
-        let mut detected_images = detect_images(actual_user_input, &self.settings.project_root);
-        for img in explicit_images {
-            if !detected_images.contains(&img) {
-                detected_images.push(img);
-            }
-        }
-        if !detected_images.is_empty() {
-            let mut valid_images = Vec::new();
-            for img_path in detected_images {
-                if self.settings.is_in_sandbox(&img_path) {
-                    valid_images.push(img_path);
-                } else {
-                    let _ = self.event_tx.send(AgentEvent::Error(format!(
-                        "Access denied: image file '{}' is outside the sandbox",
-                        img_path.display()
-                    )));
-                }
-            }
-
-            if !valid_images.is_empty() {
-                if self.client.supports_vision() {
-                    let _ = self.event_tx.send(AgentEvent::Status(format!(
-                        "📸 Loading {} image(s)...",
-                        valid_images.len()
-                    )));
-
-                    let mut encoded_images = Vec::new();
-                    for img_path in &valid_images {
-                        match vision::encode_image_file(img_path) {
-                            Ok((b64, mime)) => {
-                                encoded_images.push((b64, mime));
-                            }
-                            Err(e) => {
-                                let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                    "Failed to load image '{}': {}",
-                                    img_path.display(),
-                                    e
-                                )));
-                            }
-                        }
-                    }
-
-                    if !encoded_images.is_empty() {
-                        user_msg =
-                            Some(Message::user_with_images(actual_user_input, encoded_images));
-                    }
-                } else if let Some(gemini_key) = &self.settings.google_ai_api_key {
-                    let _ = self.event_tx.send(AgentEvent::Status(format!(
-                        "📸 Analyzing {} image(s) via Gemini Fallback...",
-                        valid_images.len()
-                    )));
-
-                    let mut content_parts = vec![crate::ai::types::ContentPart::Text {
-                        text: format!(
-                            "Please describe these {} images in detail so I can understand them:",
-                            valid_images.len()
-                        ),
-                    }];
-
-                    let mut has_errors = false;
-                    for img_path in &valid_images {
-                        match vision::encode_image_file(img_path) {
-                            Ok((b64, mime)) => {
-                                content_parts.push(crate::ai::types::ContentPart::Text {
-                                    text: format!(
-                                        "\n--- Image: {} ---",
-                                        img_path.file_name().unwrap_or_default().to_string_lossy()
-                                    ),
-                                });
-                                content_parts.push(crate::ai::types::ContentPart::Image {
-                                    data: b64,
-                                    mime_type: mime,
-                                });
-                            }
-                            Err(e) => {
-                                let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                    "Failed to load image '{}': {}",
-                                    img_path.display(),
-                                    e
-                                )));
-                                has_errors = true;
-                            }
-                        }
-                    }
-
-                    if !has_errors {
-                        let fallback_client = crate::ai::gemini::GeminiClient::new(
-                            gemini_key.clone(),
-                            "gemini-2.5-flash".to_string(),
-                            None,
-                        );
-                        let msg = crate::ai::types::Message {
-                            role: crate::ai::types::Role::User,
-                            content: content_parts,
-                            tool_calls: vec![],
-                            tool_call_id: None,
-                            tool_name: None,
-                            thought_signature: None,
-                        };
-
-                        let request =
-                            crate::ai::types::AiRequest::new(vec![msg]).with_temperature(0.5);
-                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-                        use crate::ai::AiClient;
-                        if let Err(e) = fallback_client.chat_stream(request, tx).await {
-                            let _ = self
-                                .event_tx
-                                .send(AgentEvent::Error(format!("Gemini fallback failed: {}", e)));
-                        } else {
-                            let mut description = String::new();
-                            while let Some(event) = rx.recv().await {
-                                if let crate::ai::types::AiStreamEvent::ContentDelta(text) = event {
-                                    description.push_str(&text);
-                                }
-                            }
-
-                            if !description.trim().is_empty() {
-                                let enriched_prompt = format!(
-                                    "[Image content described by Gemini Fallback]:\n{}\n\n{}",
-                                    description, actual_user_input
-                                );
-                                user_msg = Some(crate::ai::types::Message::user(enriched_prompt));
-                            }
-                        }
-                    }
-                } else if let Some(ocr_key) = &self.settings.ocr_space_api_key {
-                    let _ = self.event_tx.send(AgentEvent::Status(format!(
-                        "📸 Performing OCR on {} image(s)...",
-                        valid_images.len()
-                    )));
-
-                    let mut all_ocr_texts = Vec::new();
-                    for img_path in &valid_images {
-                        match vision::ocr_image(ocr_key, img_path).await {
-                            Ok(text) => {
-                                all_ocr_texts.push(format!(
-                                    "--- {} ---\n{}",
-                                    img_path.file_name().unwrap_or_default().to_string_lossy(),
-                                    text
-                                ));
-                            }
-                            Err(e) => {
-                                let _ = self.event_tx.send(AgentEvent::Error(format!(
-                                    "OCR failed for '{}': {}",
-                                    img_path.display(),
-                                    e
-                                )));
-                            }
-                        }
-                    }
-
-                    if !all_ocr_texts.is_empty() {
-                        let enriched_prompt = format!(
-                            "[Images analyzed via OCR]:\n{}\n\n{}",
-                            all_ocr_texts.join("\n\n"),
-                            actual_user_input
-                        );
-                        user_msg = Some(crate::ai::types::Message::user(enriched_prompt));
-                    }
-                } else {
-                    let _ = self.event_tx.send(AgentEvent::Status(
-                        "⚠️ Model does not support vision, and no OCR_SPACE_API_KEY is configured. Sending as plain text.".into()
-                    ));
-                }
-            }
-        }
-
-        let final_msg = user_msg.unwrap_or_else(|| Message::user(actual_user_input.to_string()));
-
-        let root_str = self.settings.project_root.to_string_lossy().to_string();
-        let _ = self
-            .event_tx
-            .send(AgentEvent::Status(format!("📂 Agent root: {root_str}")));
-
-        // Check if user input triggers a skill template
-        if let Some(skill) =
-            crate::skills::find_matching_skill(actual_user_input, &self.settings.project_root)
-        {
+        // Skill guidance goes into the user turn, once per conversation. Editing
+        // the system prompt instead would invalidate the provider's prompt cache
+        // on every trigger and grow without bound.
+        if let Some(skill) = crate::skills::find_matching_skill(text, &self.settings.project_root) {
             let _ = self
                 .event_tx
                 .send(AgentEvent::TriggeredSkill(skill.name.clone()));
-            let _ = self.event_tx.send(AgentEvent::Status(format!(
-                "✨ Triggered skill: {}",
-                skill.name
-            )));
-            if let Some(system_msg) = self.messages.first_mut() {
-                if system_msg.role == Role::System {
-                    let mut text = system_msg.text();
-                    text.push_str("\n\n=== TRIGGERED SKILL: ");
-                    text.push_str(&skill.name);
-                    text.push_str(" ===\n");
-                    text.push_str(&skill.system_instructions);
-                    text.push_str("\n====================================\n");
-                    system_msg.content = vec![ContentPart::Text { text }];
-                }
+            if self.injected_skills.insert(skill.name.clone()) {
+                self.status(format!("✨ Triggered skill: {}", skill.name));
+                user_msg.content.push(ContentPart::Text {
+                    text: format!(
+                        "\n\n[Norvexum skill guidance — {}]\n{}",
+                        skill.name, skill.system_instructions
+                    ),
+                });
             }
         }
 
-        // Prevent consecutive User messages (which crash APIs like Anthropic) by merging them
-        if let Some(last) = self.messages.last_mut() {
-            if last.role == Role::User {
-                last.content.extend(final_msg.content);
-            } else {
-                self.messages.push(final_msg);
-            }
-        } else {
-            self.messages.push(final_msg);
+        // Consecutive user turns are rejected by some APIs; merge instead.
+        match self.messages.last_mut() {
+            Some(last) if last.role == Role::User => last.content.extend(user_msg.content),
+            _ => self.messages.push(user_msg),
         }
-        // ── Context compaction check ─────────────────────────────────────
-        let context_window = self.get_context_window();
-        if compaction::should_compact(&self.messages, context_window, 80) {
-            let _ = self
-                .event_tx
-                .send(AgentEvent::Status("🗜️ Compacting context...".into()));
-            self.messages = compaction::compact(&self.messages, 4);
-        }
+
+        self.compact_if_needed(false);
 
         let max_loops = self.max_loops;
-
-        let mut accumulated_usage = UsageStats {
+        let mut usage = UsageStats {
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
@@ -942,428 +801,512 @@ impl Agent {
         };
 
         let mut loop_num = 0;
+        let mut malformed_retries = 0;
         loop {
             if max_loops > 0 && loop_num >= max_loops {
-                let _ = self.event_tx.send(AgentEvent::Error(format!(
-                    "Max thinking loops ({}) reached",
-                    max_loops
+                let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                    "Reached the tool-loop limit ({max_loops}). Type 'continue' to let the agent keep going, or raise it with /loops."
                 )));
-                let _ = self.event_tx.send(AgentEvent::Done {
-                    usage: Some(accumulated_usage.clone()),
-                });
                 self.save_session();
+                self.done(Some(usage));
                 return Ok(self.drain_instructions());
             }
 
-            // Check for new user instructions sent dynamically mid-run
-            if let Some(ref mut rx) = self.instruction_rx {
-                while let Ok(new_prompt) = rx.try_recv() {
-                    let _ = self.event_tx.send(AgentEvent::Status(format!(
-                        "📥 Received instruction: {}",
-                        new_prompt
-                    )));
-                    if let Some(last) = self.messages.last_mut() {
-                        if last.role == Role::User {
-                            last.content.push(ContentPart::Text {
-                                text: format!("\n\n{}", new_prompt),
-                            });
-                            continue;
-                        }
-                    }
-                    self.messages.push(Message::user(new_prompt));
-                }
-            }
+            self.absorb_instructions();
 
             let loop_display = if max_loops > 0 {
                 format!("{}/{}", loop_num + 1, max_loops)
             } else {
                 format!("{}", loop_num + 1)
             };
+            self.status(format!("Thinking (step {loop_display})..."));
 
-            let _ = self.event_tx.send(AgentEvent::Status(format!(
-                "Thinking (loop {})...",
-                loop_display
-            )));
+            if loop_num > 0 {
+                self.compact_if_needed(true);
+            }
 
             let mut active_messages = self.messages.clone();
-            if max_loops > 0 && loop_num >= max_loops.saturating_sub(1) {
+            if max_loops > 1 && loop_num + 1 == max_loops {
                 active_messages.push(Message::system(format!(
-                    "⚠️ SYSTEM WARNING: You are on the final cycle ({} of {}). You are about to reach the loop limit. \
-                     You MUST stop calling tools now, summarize your current progress, and ask the user to type 'continue' to let you proceed in the next turn.",
-                    loop_num + 1, max_loops
+                    "This is the final step ({} of {max_loops}) before the tool-loop limit. Do not call more tools: \
+                     summarize what is done, what remains, and tell the user to type 'continue' to proceed.",
+                    loop_num + 1
                 )));
             }
 
-            // Create AI request with current conversation + tools
-            let mut request = AiRequest::new(active_messages).with_tools(self.tools.tool_defs());
+            let request = self.build_request(active_messages);
+            let turn = self.stream_with_retry(request, cancel_rx, &mut usage).await;
 
-            let mut temp = 0.7;
-            if let Some(effort) = &self.settings.thinking_effort {
-                if effort != "none" {
-                    request = request.with_thinking_effort(Some(effort.clone()));
-                    request = request.with_reasoning_type(self.settings.model_reasoning_type);
-                    if self.settings.model_reasoning_type
-                        == Some(crate::ai::types::ReasoningType::AnthropicThinking)
-                    {
-                        temp = 1.0;
-                    }
+            if turn.cancelled {
+                if !turn.text.is_empty() {
+                    self.messages.push(Message::assistant(&turn.text));
                 }
-            }
-            let request = request.with_temperature(temp);
-
-            // Stream response from AI
-            let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<AiStreamEvent>();
-
-            let client = self.client.clone();
-            let stream_handle = async move { client.chat_stream(request, stream_tx).await };
-
-            // Process stream in background
-            let event_tx = self.event_tx.clone();
-            let mut assistant_text = String::new();
-            let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
-            let mut has_tool_calls = false;
-            let mut final_usage = None;
-            let mut stream_error = None;
-
-            // Run the stream and process events concurrently
-            tokio::pin!(stream_handle);
-            loop {
-                tokio::select! {
-                    _ = cancel_rx.recv() => {
-                        let _ = self.event_tx.send(AgentEvent::Status("⏹️ Run stopped".into()));
-                        stream_error = Some("CANCELLED".to_string());
-                        break;
-                    }
-                    result = &mut stream_handle => {
-                        if let Err(e) = result {
-                            let _ = self.event_tx.send(AgentEvent::Error(format!("AI stream error: {}", e)));
-                            return Err(e);
-                        }
-                        break;
-                    }
-                    Some(event) = stream_rx.recv() => {
-                        match event {
-                            AiStreamEvent::ThinkingDelta(text) => {
-                                let _ = event_tx.send(AgentEvent::Thinking(text));
-                            }
-                            AiStreamEvent::ThinkingDone => {
-                                let _ = event_tx.send(AgentEvent::ThinkingDone);
-                            }
-                            AiStreamEvent::ContentDelta(text) => {
-                                assistant_text.push_str(&text);
-                                let _ = event_tx.send(AgentEvent::Content(text));
-                            }
-                            AiStreamEvent::ToolCallStart(tc) => {
-                                let _ = event_tx.send(AgentEvent::ToolStart {
-                                    name: tc.name.clone(),
-                                    id: tc.id.clone(),
-                                });
-                            }
-                            AiStreamEvent::ToolCallDelta { id, arguments_delta } => {
-                                let _ = event_tx.send(AgentEvent::ToolArgsDelta {
-                                    id, delta: arguments_delta
-                                });
-                            }
-                            AiStreamEvent::ToolCallComplete(tc) => {
-                                has_tool_calls = true;
-                                pending_tool_calls.push(tc.clone());
-                                // Send full args delta to populate GUI current_tool_args for non-streaming providers
-                                let _ = event_tx.send(AgentEvent::ToolArgsDelta {
-                                    id: tc.id.clone(),
-                                    delta: tc.arguments.to_string(),
-                                });
-                            }
-                            AiStreamEvent::Done { finish_reason: _, usage } => {
-                                if let Some(ref u) = usage {
-                                    accumulated_usage.prompt_tokens += u.prompt_tokens;
-                                    accumulated_usage.completion_tokens += u.completion_tokens;
-                                    accumulated_usage.total_tokens += u.total_tokens;
-                                }
-                                final_usage = usage;
-                            }
-                            AiStreamEvent::Error(e) => {
-                                stream_error = Some(e);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Drain any remaining events from the channel
-            while let Ok(event) = stream_rx.try_recv() {
-                match event {
-                    AiStreamEvent::ThinkingDelta(text) => {
-                        let _ = event_tx.send(AgentEvent::Thinking(text));
-                    }
-                    AiStreamEvent::ThinkingDone => {
-                        let _ = event_tx.send(AgentEvent::ThinkingDone);
-                    }
-                    AiStreamEvent::ContentDelta(text) => {
-                        assistant_text.push_str(&text);
-                        let _ = event_tx.send(AgentEvent::Content(text));
-                    }
-                    AiStreamEvent::ToolCallStart(tc) => {
-                        let _ = event_tx.send(AgentEvent::ToolStart {
-                            name: tc.name.clone(),
-                            id: tc.id.clone(),
-                        });
-                    }
-                    AiStreamEvent::ToolCallDelta {
-                        id,
-                        arguments_delta,
-                    } => {
-                        let _ = event_tx.send(AgentEvent::ToolArgsDelta {
-                            id,
-                            delta: arguments_delta,
-                        });
-                    }
-                    AiStreamEvent::ToolCallComplete(tc) => {
-                        has_tool_calls = true;
-                        pending_tool_calls.push(tc.clone());
-                        // Send full args delta to populate GUI current_tool_args for non-streaming providers
-                        let _ = event_tx.send(AgentEvent::ToolArgsDelta {
-                            id: tc.id.clone(),
-                            delta: tc.arguments.to_string(),
-                        });
-                    }
-                    AiStreamEvent::Done {
-                        finish_reason: _,
-                        usage,
-                    } => {
-                        if let Some(ref u) = usage {
-                            accumulated_usage.prompt_tokens += u.prompt_tokens;
-                            accumulated_usage.completion_tokens += u.completion_tokens;
-                            accumulated_usage.total_tokens += u.total_tokens;
-                        }
-                        final_usage = usage;
-                    }
-                    AiStreamEvent::Error(e) => {
-                        stream_error = Some(e);
-                    }
-                }
-            }
-
-            // Handle completion or error
-            if let Some(error) = stream_error.clone() {
-                if error != "CANCELLED" {
-                    eyre::bail!("{}", error);
-                }
-            }
-
-            if stream_error == Some("CANCELLED".to_string()) {
-                if !assistant_text.is_empty() {
-                    self.messages.push(Message::assistant(&assistant_text));
-                }
-                let _ = self.event_tx.send(AgentEvent::Done { usage: None });
+                self.status("⏹️ Run stopped");
                 self.save_session();
+                self.done(Some(usage));
+                return Ok(self.drain_instructions());
+            }
+            if let Some(error) = turn.error {
+                eyre::bail!("{error}");
+            }
+
+            // Gemini sometimes emits a broken function call; ask it to try again.
+            if turn.tool_calls.is_empty()
+                && turn.finish_reason == "MALFORMED_FUNCTION_CALL"
+                && malformed_retries < 2
+            {
+                malformed_retries += 1;
+                self.status("Model produced a malformed tool call — retrying");
+                self.messages.push(Message::system(
+                    "Your previous function call was malformed and was not executed. Call the tool again \
+                     with valid JSON arguments; if the arguments are large, split the work into smaller calls \
+                     (for example one edit_file call per change).",
+                ));
+                continue;
+            }
+
+            if turn.tool_calls.is_empty() {
+                if turn.finish_reason == "MALFORMED_FUNCTION_CALL" {
+                    let _ = self.event_tx.send(AgentEvent::Warning(
+                        "The model kept producing malformed tool calls. Try rephrasing, or switch models with /model."
+                            .into(),
+                    ));
+                }
+                if !turn.text.trim().is_empty() {
+                    let mut msg = Message::assistant(&turn.text);
+                    msg.thinking_blocks = turn.thinking_blocks;
+                    self.messages.push(msg);
+                }
+                if is_truncated(&turn.finish_reason) {
+                    let _ = self.event_tx.send(AgentEvent::Warning(
+                        "The reply hit the output token limit and may be cut off — type 'continue' to get the rest."
+                            .into(),
+                    ));
+                }
+                self.save_session();
+                self.done(Some(usage));
                 return Ok(self.drain_instructions());
             }
 
             // Tool APIs require the assistant call message immediately before results.
-            if has_tool_calls {
-                self.messages.push(Message::assistant_with_tool_calls(
-                    &assistant_text,
-                    pending_tool_calls.clone(),
-                ));
-            } else if !assistant_text.is_empty() {
-                self.messages.push(Message::assistant(&assistant_text));
-            }
+            let calls = turn.tool_calls;
+            let mut assistant = Message::assistant_with_tool_calls(&turn.text, calls.clone());
+            assistant.thinking_blocks = turn.thinking_blocks;
+            self.messages.push(assistant);
 
-            // If no tool calls, I'm done
-            if !has_tool_calls {
-                let _ = self.event_tx.send(AgentEvent::Done {
-                    usage: Some(accumulated_usage.clone()),
-                });
-                self.save_session();
+            let Some(approvals) = self.collect_approvals(&calls, cancel_rx).await else {
+                self.finish_cancelled_tools(&calls, "Cancelled by the user before running.");
+                self.done(Some(usage));
                 return Ok(self.drain_instructions());
-            }
-
-            // ── Check approvals ──────────────────────────────────────────
-            let mut tool_approvals = std::collections::HashMap::new();
-            if let Some(ref mut approval_rx) = self.approval_rx {
-                for tc in &pending_tool_calls {
-                    let name = tc.name.clone();
-                    let id = tc.id.clone();
-                    let args = match &tc.arguments {
-                        serde_json::Value::String(s) => {
-                            serde_json::from_str(s).unwrap_or(json!({}))
-                        }
-                        other => other.clone(),
-                    };
-
-                    if !self.approval_disabled && tool_needs_approval(&self.settings, &name, &args)
-                    {
-                        let _ = self.event_tx.send(AgentEvent::ApprovalRequest {
-                            id: id.clone(),
-                            tool_name: name.clone(),
-                            args_preview: args.to_string(),
-                        });
-
-                        // Wait for user input
-                        if let Some(approved) = approval_rx.recv().await {
-                            tool_approvals.insert(id, approved);
-                        } else {
-                            tool_approvals.insert(id, false);
-                        }
-                    } else {
-                        tool_approvals.insert(id, true);
-                    }
-                }
-            } else {
-                for tc in &pending_tool_calls {
-                    tool_approvals.insert(tc.id.clone(), true);
-                }
-            }
-
-            // ── Execute tool calls in PARALLEL ───────────────────────────
-            let tool_ctx = ToolContext {
-                settings: self.settings.clone(),
-                cwd: self.settings.project_root.clone(),
-                client: Some(self.client.clone()),
-                temp_memory: self.temp_memory.clone(),
             };
 
-            let mut handles = Vec::new();
+            let Some(results) = self.execute_tools(&calls, &approvals, cancel_rx).await else {
+                self.finish_cancelled_tools(&calls, "Cancelled by the user while running.");
+                self.done(Some(usage));
+                return Ok(self.drain_instructions());
+            };
 
-            for tc in &pending_tool_calls {
-                let name = tc.name.clone();
-                let id = tc.id.clone();
-                let args = match &tc.arguments {
-                    serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or(json!({})),
-                    other => other.clone(),
-                };
-                let ctx = tool_ctx.clone();
-                let tools = self.tools.clone();
-                let ev_tx = self.event_tx.clone();
-                let project_root = self.settings.project_root.clone();
-                let is_approved = tool_approvals.get(&id).cloned().unwrap_or(true);
+            self.turn_ran_tools = true;
+            for (call, result) in calls.iter().zip(results) {
+                self.messages.push(self.tool_result_message(call, result));
+            }
 
-                handles.push(tokio::spawn(async move {
-                    if !is_approved {
-                        let res = ToolResult::err("⚠️ User denied execution of this tool call.");
-                        let _ = ev_tx.send(AgentEvent::ToolResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            result: res.to_message_content(),
-                            success: false,
-                        });
-                        return (id, name, res);
+            self.save_session();
+            loop_num += 1;
+        }
+    }
+
+    fn build_request(&self, messages: Vec<Message>) -> AiRequest {
+        let mut request = AiRequest::new(messages).with_tools(self.tools.tool_defs());
+        let mut temperature = 0.7;
+        // Models using `reasoning_effort` (o-series, DeepSeek V4, …) stay silent
+        // unless asked, so with no effort chosen they get the medium default and
+        // still stream their reasoning. Other APIs only think when opted in.
+        let effort = match self.settings.thinking_effort.as_deref() {
+            Some(e) if e != "none" && !e.is_empty() => Some(e),
+            _ if self.settings.model_reasoning_type == Some(ReasoningType::OpenAiEffort) => {
+                Some("medium")
+            }
+            _ => None,
+        };
+        if let Some(effort) = effort {
+            request = request
+                .with_thinking_effort(Some(effort.to_string()))
+                .with_reasoning_type(self.settings.model_reasoning_type);
+            if self.settings.model_reasoning_type == Some(ReasoningType::AnthropicThinking) {
+                temperature = 1.0;
+            }
+        }
+        tracing::info!(
+            model = %self.settings.active_model,
+            effort = ?request.thinking_effort,
+            reasoning = ?request.reasoning_type,
+            "model request"
+        );
+        request.with_temperature(temperature)
+    }
+
+    /// `stream_model_turn`, retrying transient failures (rate limits, overload,
+    /// dropped connections) with backoff before anything was streamed.
+    async fn stream_with_retry(
+        &self,
+        request: AiRequest,
+        cancel_rx: &mut mpsc::UnboundedReceiver<()>,
+        usage: &mut UsageStats,
+    ) -> ModelTurn {
+        const MAX_RETRIES: u32 = 3;
+        let mut attempt = 0;
+        loop {
+            let turn = self
+                .stream_model_turn(request.clone(), cancel_rx, usage)
+                .await;
+            let produced_output = !turn.text.is_empty() || !turn.tool_calls.is_empty();
+            let delay = match &turn.error {
+                Some(err) if !produced_output && attempt < MAX_RETRIES => retry_delay(err, attempt),
+                _ => None,
+            };
+            let Some(delay) = delay else {
+                return turn;
+            };
+            attempt += 1;
+            self.status(format!(
+                "⏳ {} — retrying in {}s (attempt {attempt}/{MAX_RETRIES})",
+                short_error(turn.error.as_deref().unwrap_or_default()),
+                delay.as_secs()
+            ));
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = cancel_rx.recv() => {
+                    return ModelTurn { cancelled: true, ..ModelTurn::default() };
+                }
+            }
+        }
+    }
+
+    /// Stream one model response, forwarding live events to the UI.
+    async fn stream_model_turn(
+        &self,
+        request: AiRequest,
+        cancel_rx: &mut mpsc::UnboundedReceiver<()>,
+        usage: &mut UsageStats,
+    ) -> ModelTurn {
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<AiStreamEvent>();
+        let client = self.client.clone();
+        let stream = async move { client.chat_stream(request, stream_tx).await };
+        tokio::pin!(stream);
+
+        let mut turn = ModelTurn::default();
+        let mut stream_finished = false;
+        loop {
+            tokio::select! {
+                _ = cancel_rx.recv() => {
+                    turn.cancelled = true;
+                    break;
+                }
+                result = &mut stream, if !stream_finished => {
+                    stream_finished = true;
+                    // Connection-level failures (DNS, TLS, timeouts) land here.
+                    if let Err(e) = result {
+                        turn.error.get_or_insert(format!("Request failed: {e}"));
                     }
+                }
+                event = stream_rx.recv() => match event {
+                    Some(event) => self.apply_stream_event(event, &mut turn, usage),
+                    // The sender is dropped once the stream future completes.
+                    None => break,
+                },
+            }
+        }
+        tracing::info!(
+            thinking_chars = turn.thinking_chars,
+            text_chars = turn.text.len(),
+            tool_calls = turn.tool_calls.len(),
+            error = ?turn.error,
+            "model turn finished"
+        );
+        turn
+    }
 
-                    // Snapshot files before write/edit operations
-                    let is_file_write = name == "write_file"
-                        || name == "write_to_file"
-                        || name == "edit_file"
-                        || name == "replace_file_content"
-                        || name == "multi_replace_file_content";
+    fn apply_stream_event(
+        &self,
+        event: AiStreamEvent,
+        turn: &mut ModelTurn,
+        usage: &mut UsageStats,
+    ) {
+        let tx = &self.event_tx;
+        match event {
+            AiStreamEvent::ThinkingDelta(text) => {
+                turn.thinking_chars += text.len();
+                let _ = tx.send(AgentEvent::Thinking(text));
+            }
+            AiStreamEvent::ThinkingDone => {
+                let _ = tx.send(AgentEvent::ThinkingDone);
+            }
+            AiStreamEvent::ThinkingBlock(block) => turn.thinking_blocks.push(block),
+            AiStreamEvent::ContentDelta(text) => {
+                turn.text.push_str(&text);
+                let _ = tx.send(AgentEvent::Content(text));
+            }
+            AiStreamEvent::ToolCallStart(tc) => {
+                let _ = tx.send(AgentEvent::ToolStart {
+                    name: tc.name,
+                    id: tc.id,
+                });
+            }
+            AiStreamEvent::ToolCallDelta {
+                id,
+                arguments_delta,
+            } => {
+                turn.streamed_args.insert(id.clone());
+                let _ = tx.send(AgentEvent::ToolArgsDelta {
+                    id,
+                    delta: arguments_delta,
+                });
+            }
+            AiStreamEvent::ToolCallComplete(tc) => {
+                // Providers that deliver arguments in one piece still need the UI
+                // to see them (live file previews, approval context).
+                if !turn.streamed_args.contains(&tc.id) {
+                    let delta = match &tc.arguments {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    let _ = tx.send(AgentEvent::ToolArgsDelta {
+                        id: tc.id.clone(),
+                        delta,
+                    });
+                }
+                turn.tool_calls.push(tc);
+            }
+            AiStreamEvent::Done {
+                finish_reason,
+                usage: turn_usage,
+            } => {
+                if let Some(u) = turn_usage {
+                    usage.prompt_tokens += u.prompt_tokens;
+                    usage.completion_tokens += u.completion_tokens;
+                    usage.total_tokens += u.total_tokens;
+                    if let Some(r) = u.reasoning_tokens {
+                        *usage.reasoning_tokens.get_or_insert(0) += r;
+                    }
+                }
+                turn.finish_reason = finish_reason;
+            }
+            AiStreamEvent::Error(e) => turn.error = Some(e),
+        }
+    }
 
-                    let path_opt = args["path"]
-                        .as_str()
-                        .or_else(|| args["TargetFile"].as_str());
+    /// Ask the user about every call that needs approval.
+    /// Returns `None` if the run was cancelled while waiting.
+    async fn collect_approvals(
+        &mut self,
+        calls: &[ToolCall],
+        cancel_rx: &mut mpsc::UnboundedReceiver<()>,
+    ) -> Option<Vec<bool>> {
+        // Ignore stray answers left over from an earlier prompt.
+        while self.approval_rx.try_recv().is_ok() {}
 
-                    if is_file_write {
-                        if let Some(path_str) = path_opt {
-                            let full_path = ctx.cwd.join(path_str);
-                            let _ = checkpoint::snapshot_file(&project_root, &full_path);
+        let mut approvals = Vec::with_capacity(calls.len());
+        for tc in calls {
+            if self.approval_disabled || !tool_needs_approval(&self.settings, &tc.name) {
+                approvals.push(true);
+                continue;
+            }
+            let args = parse_tool_args(&tc.arguments).unwrap_or_else(|| json!({}));
+            let _ = self.event_tx.send(AgentEvent::ApprovalRequest {
+                id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                args_preview: serde_json::to_string_pretty(&args).unwrap_or_default(),
+            });
+            tokio::select! {
+                answer = self.approval_rx.recv() => approvals.push(answer.unwrap_or(false)),
+                _ = cancel_rx.recv() => return None,
+            }
+        }
+        Some(approvals)
+    }
+
+    /// Run all calls in parallel. Results come back in the same order as `calls`.
+    /// Returns `None` if the run was cancelled (running tools are aborted).
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        approvals: &[bool],
+        cancel_rx: &mut mpsc::UnboundedReceiver<()>,
+    ) -> Option<Vec<ToolResult>> {
+        let ctx = ToolContext {
+            settings: self.settings.clone(),
+            cwd: self.settings.project_root.clone(),
+            client: Some(self.client.clone()),
+            temp_memory: self.temp_memory.clone(),
+        };
+
+        let mut handles = Vec::with_capacity(calls.len());
+        for (tc, &approved) in calls.iter().zip(approvals) {
+            let tc = tc.clone();
+            let ctx = ctx.clone();
+            let tools = self.tools.clone();
+            let ev_tx = self.event_tx.clone();
+
+            handles.push(tokio::spawn(async move {
+                let result = if !approved {
+                    ToolResult::err("The user denied this tool call. Do not retry it; ask the user how to proceed if needed.")
+                } else if let Some(args) = parse_tool_args(&tc.arguments) {
+                    let name = crate::tools::canonical_tool_name(&tc.name);
+                    let writes_file = FILE_WRITE_TOOLS.contains(&name);
+                    let target = args["path"].as_str().map(|p| ctx.cwd.join(p));
+
+                    if writes_file {
+                        if let Some(path) = &target {
+                            if let Err(e) = checkpoint::snapshot_file(&ctx.cwd, path) {
+                                tracing::warn!("Checkpoint failed for {}: {e}", path.display());
+                            }
                         }
                     }
 
-                    // Execute the tool
-                    let result = tools.execute(&name, args.clone(), &ctx).await;
+                    let result = tools.execute(&tc.name, args, &ctx).await;
 
-                    // Detect file writes for live streaming
-                    if result.success && is_file_write {
-                        if let Some(path_str) = path_opt {
-                            let full_path = ctx.cwd.join(path_str);
-                            let preview = result.output.chars().take(200).collect::<String>();
+                    if result.success && writes_file {
+                        if let Some(path) = target {
                             let _ = ev_tx.send(AgentEvent::FileWrite {
-                                path: full_path.to_string_lossy().to_string(),
-                                content_preview: preview,
+                                path: path.to_string_lossy().to_string(),
+                                content_preview: crate::util::truncate_chars(&result.output, 200),
                             });
                         }
                     }
+                    result
+                } else {
+                    ToolResult::err(
+                        "The tool arguments were not valid JSON (often because the reply hit the output \
+                         token limit). Re-issue the call with complete arguments; for large files, write \
+                         them in smaller parts with write_file + edit_file.",
+                    )
+                };
 
-                    let _ = ev_tx.send(AgentEvent::ToolResult {
-                        id: id.clone(),
-                        name: name.clone(),
-                        result: result.to_message_content(),
-                        success: result.success,
-                    });
-
-                    (id, name, result)
-                }));
-            }
-
-            // Wait for ALL tool calls to complete in parallel
-            let results_opt = tokio::select! {
-                res = futures::future::join_all(&mut handles) => Some(res),
-                _ = cancel_rx.recv() => None,
-            };
-
-            let results = match results_opt {
-                Some(res) => res,
-                None => {
-                    let _ = self.event_tx.send(AgentEvent::Status(
-                        "⏹️ Run stopped during tool execution".into(),
-                    ));
-                    for handle in handles {
-                        handle.abort();
-                    }
-                    self.save_session();
-                    return Ok(self.drain_instructions());
-                }
-            };
-
-            // Assemble tool result messages in the original order
-            for result in results {
-                match result {
-                    Ok((id, name, tool_result)) => {
-                        let thought_signature = pending_tool_calls
-                            .iter()
-                            .find(|tc| tc.id == id)
-                            .and_then(|tc| tc.thought_signature.clone());
-
-                        let base64_img = tool_result.base64_image.clone();
-
-                        let mut content_str = tool_result.to_message_content();
-                        
-                        // Prevent massive payloads from crashing the API by truncating extremely long tool outputs.
-                        // We use the configured max_content_chars, but cap it at 40,000 characters just in case the user set it excessively high.
-                        let max_tool_chars = self.settings.max_content_chars.min(40000);
-                        if content_str.len() > max_tool_chars {
-                            content_str = format!(
-                                "{}...\n\n[OUTPUT TRUNCATED: Exceeded {} characters]",
-                                &content_str[..max_tool_chars], max_tool_chars
-                            );
-                        }
-
-                        let mut msg =
-                            Message::tool_result(&id, &name, content_str);
-
-                        if let Some((data, mime)) = base64_img {
-                            msg = msg.with_image(data, mime);
-                        }
-
-                        msg.thought_signature = thought_signature;
-                        self.messages.push(msg);
-                    }
-                    Err(e) => {
-                        let err_msg = format!("Tool execution panicked: {}", e);
-                        let _ = self.event_tx.send(AgentEvent::Error(err_msg.clone()));
-                        // Still add a result so the model doesn't get confused
-                        self.messages
-                            .push(Message::tool_result("error", "internal", err_msg));
-                    }
-                }
-            }
-
-            // Continue the loop — the model will see tool results and continue
-            self.save_session();
+                let _ = ev_tx.send(AgentEvent::ToolResult {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    result: result.to_message_content(),
+                    success: result.success,
+                });
+                result
+            }));
         }
-        Ok(self.drain_instructions())
+
+        let joined = tokio::select! {
+            res = futures::future::join_all(handles.iter_mut()) => res,
+            _ = cancel_rx.recv() => {
+                for handle in &handles {
+                    handle.abort();
+                }
+                return None;
+            }
+        };
+
+        Some(
+            joined
+                .into_iter()
+                .zip(calls)
+                .map(|(res, tc)| match res {
+                    Ok(result) => result,
+                    Err(e) => {
+                        let msg = format!("Tool `{}` crashed: {e}", tc.name);
+                        let _ = self.event_tx.send(AgentEvent::Warning(msg.clone()));
+                        let _ = self.event_tx.send(AgentEvent::ToolResult {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            result: msg.clone(),
+                            success: false,
+                        });
+                        ToolResult::err(msg)
+                    }
+                })
+                .collect(),
+        )
     }
 
-    fn drain_instructions(&mut self) -> Vec<String> {
+    /// Every tool call must be answered, or the next request is rejected.
+    fn finish_cancelled_tools(&mut self, calls: &[ToolCall], reason: &str) {
+        for tc in calls {
+            self.messages.push(Message::tool_result(
+                &tc.id,
+                &tc.name,
+                format!("ERROR: {reason}"),
+            ));
+        }
+        self.status("⏹️ Run stopped");
+        self.save_session();
+    }
+
+    fn tool_result_message(&self, call: &ToolCall, result: ToolResult) -> Message {
+        // Large outputs are cut in the middle: command errors and summaries live
+        // at the end, file headers at the start.
+        let max_chars = self.settings.max_content_chars.clamp(2_000, 40_000);
+        let content = crate::util::truncate_middle(&result.to_message_content(), max_chars);
+        let mut msg = Message::tool_result(&call.id, &call.name, content);
+        if let Some((data, mime)) = result.base64_image {
+            msg = msg.with_image(data, mime);
+        }
+        msg.thought_signature = call.thought_signature.clone();
+        msg
+    }
+
+    /// Fold instructions typed during a run into the conversation.
+    fn absorb_instructions(&mut self) {
+        let Some(rx) = self.instruction_rx.as_mut() else {
+            return;
+        };
+        let mut incoming = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            incoming.push(text);
+        }
+        for text in incoming {
+            self.status(format!(
+                "📥 Received instruction: {}",
+                crate::util::truncate_chars(&text, 80)
+            ));
+            match self.messages.last_mut() {
+                Some(last) if last.role == Role::User => last.content.push(ContentPart::Text {
+                    text: format!("\n\n{text}"),
+                }),
+                _ => self.messages.push(Message::user(text)),
+            }
+        }
+    }
+
+    /// Shrink the conversation when it nears the model's context window.
+    ///
+    /// Mid-turn edits change the history that already-received thinking blocks
+    /// were signed against, so those blocks are dropped in that case.
+    fn compact_if_needed(&mut self, mid_turn: bool) {
+        let window = self.get_context_window();
+        if !compaction::should_compact(&self.messages, window, 75) {
+            return;
+        }
+        let before = compaction::estimate_tokens(&self.messages);
+        self.status("🗜️ Compacting context...");
+
+        // 1. Cheap: shorten old tool outputs, keeping the conversation structure.
+        compaction::prune_tool_results(&mut self.messages, 6, 1_500);
+        // 2. If that wasn't enough, summarize older exchanges.
+        if compaction::should_compact(&self.messages, window, 75) {
+            self.messages = compaction::compact(&self.messages, 4);
+        }
+        // 3. Still too big (one enormous turn): shorten every tool output.
+        if compaction::should_compact(&self.messages, window, 90) {
+            compaction::prune_tool_results(&mut self.messages, 0, 400);
+        }
+
+        if mid_turn {
+            for msg in &mut self.messages {
+                msg.thinking_blocks.clear();
+            }
+        }
+        let after = compaction::estimate_tokens(&self.messages);
+        self.status(format!("🗜️ Context compacted: ~{before} → ~{after} tokens"));
+    }
+
+    pub fn drain_instructions(&mut self) -> Vec<String> {
         let mut unhandled = Vec::new();
         if let Some(ref mut rx) = self.instruction_rx {
             while let Ok(msg) = rx.try_recv() {
@@ -1380,159 +1323,209 @@ impl Agent {
 
     /// Save current session to disk.
     fn save_session(&mut self) {
-        if let Some(ref mut session) = self.session {
-            session.messages = self.messages.clone();
-            let _ = session.save(&self.settings.project_root);
-        } else {
-            let mut sess = session::Session::new(
-                self.messages.clone(),
+        // Nothing to save until the user has said something.
+        if self.messages.len() <= 1 {
+            return;
+        }
+        let root = self.settings.project_root.clone();
+        let session = self.session.get_or_insert_with(|| {
+            session::Session::new(
+                Vec::new(),
                 &self.settings.active_model,
                 &self.settings.active_provider,
-            );
-            let _ = sess.save(&self.settings.project_root);
-            self.session = Some(sess);
+            )
+        });
+        session.messages = self.messages.clone();
+        session.model = self.settings.active_model.clone();
+        session.provider = self.settings.active_provider.clone();
+        if let Err(e) = session.save(&root) {
+            tracing::warn!("Failed to save session: {e}");
         }
     }
 
     /// Get the context window size for the current model.
     fn get_context_window(&self) -> usize {
-        let registry = crate::config::providers::build_registry_with_settings(&self.settings);
-        for provider in &registry {
-            for model in &provider.models {
-                if model.id == self.settings.active_model {
-                    return model.context_window;
-                }
-            }
+        if self.settings.active_provider == "ollama" {
+            return crate::ai::ollama::cached_model_info(&self.settings.active_model)
+                .map(|m| m.context_window)
+                .unwrap_or(8_192);
         }
-        // Default fallback
-        128_000
+        crate::config::providers::build_registry_with_settings(&self.settings)
+            .iter()
+            .flat_map(|p| p.models.iter())
+            .find(|m| m.id == self.settings.active_model)
+            .map(|m| m.context_window)
+            .unwrap_or(128_000)
     }
 }
 
-fn build_system_prompt(settings: &Settings, tools: &ToolRegistry) -> String {
-    let tool_names = tools.tool_names().join(", ");
+/// How long to wait before retrying `error`, or `None` if it isn't transient.
+fn retry_delay(error: &str, attempt: u32) -> Option<std::time::Duration> {
+    let lower = error.to_lowercase();
+    let transient = [
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "529",
+        "overloaded",
+        "resource_exhausted",
+        "rate limit",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection closed",
+        "error sending request",
+        "stream error",
+        "temporarily unavailable",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if !transient
+        || lower.contains("per day")
+        || (lower.contains("billing") && !lower.contains("retry"))
+    {
+        return None;
+    }
+    // Honour the server's hint ("retry in 37.6s", "retryDelay": "37s").
+    let hinted =
+        regex::Regex::new(r#"retry(?:\s+in|delay"?\s*:\s*"?)\s*([0-9]+(?:\.[0-9]+)?)\s*s"#)
+            .ok()
+            .and_then(|re| re.captures(&lower))
+            .and_then(|c| c[1].parse::<f64>().ok());
+    let secs = match hinted {
+        Some(s) if s > 90.0 => return None,
+        Some(s) => s.ceil() as u64 + 1,
+        None => 2u64 << attempt, // 2s, 4s, 8s
+    };
+    Some(std::time::Duration::from_secs(secs))
+}
 
-    // Load available skills dynamically so the AI knows about its capabilities
+/// First meaningful line of a provider error, for status messages.
+fn short_error(error: &str) -> String {
+    let line = error
+        .lines()
+        .next()
+        .unwrap_or(error)
+        .trim_end_matches(['{', ' ', ':']);
+    crate::util::truncate_chars(line, 80)
+}
+
+fn is_truncated(finish_reason: &str) -> bool {
+    matches!(finish_reason, "length" | "max_tokens" | "MAX_TOKENS")
+}
+
+/// Tool arguments arrive either as a JSON object or as a JSON-encoded string.
+/// `None` means the string was not valid JSON (e.g. cut off mid-stream).
+fn parse_tool_args(arguments: &serde_json::Value) -> Option<serde_json::Value> {
+    match arguments {
+        serde_json::Value::String(raw) if raw.trim().is_empty() => Some(json!({})),
+        serde_json::Value::String(raw) => serde_json::from_str(raw).ok(),
+        serde_json::Value::Null => Some(json!({})),
+        other => Some(other.clone()),
+    }
+}
+
+fn build_system_prompt(settings: &Settings) -> String {
     let skills = crate::skills::load_all_skills(&settings.project_root);
     let mut skills_info = String::new();
     if !skills.is_empty() {
-        skills_info.push_str("\nAvailable Specialized Skills (will automatically append detailed instructions when triggered):\n");
+        skills_info.push_str("\nSPECIALIZED SKILLS (guidance is added automatically when relevant; read_skill shows the full text):\n");
         for skill in &skills {
-            skills_info.push_str(&format!(
-                "- **{}**: {} (Triggers on: {})\n",
-                skill.name,
-                skill.description,
-                skill.trigger_patterns.join(", ")
-            ));
+            skills_info.push_str(&format!("- {}: {}\n", skill.name, skill.description));
         }
     }
 
-    // Try to load project context for richer prompts
     let project_ctx = history::ProjectContext::load(&settings.project_root)
-        .or_else(|_| Ok::<_, eyre::Report>(history::ProjectContext::scan(&settings.project_root)))
         .unwrap_or_else(|_| history::ProjectContext::scan(&settings.project_root));
-
     let project_info = project_ctx.to_prompt_summary();
+    let readme = load_readme_summary(&settings.project_root);
+    let platform = if cfg!(windows) {
+        "Windows (run_command uses cmd.exe for shell syntax; prefer cross-platform commands)"
+    } else if cfg!(target_os = "macos") {
+        "macOS (run_command uses sh)"
+    } else {
+        "Linux (run_command uses sh)"
+    };
 
-    // Try to include README summary
-    let readme_summary = load_readme_summary(&settings.project_root);
-
-    format!(
-        "You are Norvexum, an advanced AI coding assistant running inside a project directory. You were created by Pratik (GitHub: Pratik-3706).\n\n\
-         {project_info}\n\
+    let mut prompt = format!(
+        "You are Norvexum, an AI coding agent working inside the user's project directory. You were created by Pratik (GitHub: Pratik-3706).\n\n\
+         {project_info}\
          Project root: {root}\n\
-         Available tools: {tool_names}\n\
-         {skills}\n\
+         Platform: {platform}\n\
+         {skills_info}\
          {readme}\n\
-         RULES:\n\
-         - BEFORE calling any tool to perform a major action (such as executing shell commands with run_command, writing/editing files, or git operations), you MUST first output a brief status update explaining what you're about to do, ask the user for 'continue' to proceed, and finish your current turn WITHOUT calling the tools. Only execute the tools in the next turn once the user replies with 'continue' (or says go ahead).\n\
-         - You can ONLY access files within the project directory (sandbox)\n\
-         - Think step by step before acting\n\
-         - When writing files, always show what you're writing\n\
-         - Use tools to accomplish tasks — don't just describe what you'd do\n\
-         - For web content, prefer web_fetch. Use browser_open only when blocked\n\
-         - Check packages for safety before installing (check_package tool)\n\
-         - Before installing any Python package or dependency via pip, you MUST 100% of the time create a project-local virtual environment (e.g., running `python -m venv .venv` inside the project root) if one does not already exist, and you MUST activate and use that virtual environment (e.g., by invoking the pip/python executables directly from the virtual environment path, such as `.\\\\.venv\\\\Scripts\\\\pip` or `.\\\\.venv\\\\Scripts\\\\python` on Windows, or `./.venv/bin/pip` or `./.venv/bin/python` on Unix/Linux/macOS) to run commands or install dependencies. You MUST NEVER run `pip install` globally or without using a project-local virtual environment under any circumstances, both for CLI executions and scripts.\n\
-         - Prioritize editing existing files (using the edit_file tool with specific line ranges or search target text) rather than recreating them or writing brand new files from scratch when modifying code. Note that you can edit a bulk/multiple lines of code at once by specifying target content with multiple lines or specifying a start_line and end_line block to replace.\n\
-         - Once you read a file (via read_file or view_file), save its contents in your memory context. Do NOT read the same file again in the same session unless it has been modified on disk, to prevent redundant file reads and token wastage.\n\
-         - At the start of any new coding, design, or implementation task, you MUST first view the available specialized skills using the list_skills tool, and then read the guidelines for any relevant skill(s) (such as Frontend Specialist or Backend Engineer) using the read_skill tool, so that the TUI activity panel logs your inspection of these templates.\n\
-         - When executing skills, you MUST prioritize professional-grade implementations: write robust, production-ready, clean, well-commented code, structure directory layouts logically, and enforce high-end responsive visual design and layout principles.\n\
-         - Media files (such as images, icons, logos, background artwork) SHOULD go in dedicated subdirectories like 'media/', 'static/', etc. (though this is not a strict requirement, it is best practice for professional layouts).\n\
-         - When an image is relevant, check if you can see it (vision) or use OCR\n\
-         - For batch image analysis, use batch_view_images (up to 10 at once)\n\
-         - If the website or web application holds media, you MUST use the view_image or batch_view_images tools to verify that the images look proper, align well, are not cropped due to aspect ratio differences, and perform any necessary image editing or adjustments using the available tools (such as by writing and executing Python scripts using libraries like Pillow/PIL via the run_command tool).\n\
-         - Use git tools (git_status, git_diff, git_commit, git_log) for version control\n\
-         - Be concise but thorough in your responses\n\
-         - If the user asks to generate, create, or make an image, use the generate_image tool.\n\
-         - For finding or searching existing anime and anime games characters only (like gacha games), use zerochan_search. Format the query with comma-separated tags (e.g., 'Genshin Impact, Furina') to target Zerochan's tagging system precisely.\n\
-         - For other standard existing images, real-world photos, and web graphics, use image_search.\n\
-         - You are a developer agent. You must NOT accept or process direct NSFW requests (e.g., generating NSFW content or images), but you MUST fully assist with writing code and developing sites or applications that may be intended for NSFW use. For such requests, you must only output code and nothing else.\n\
-         - Save/download/generate images to the user's desired/requested folder or the current working directory, not a hardcoded 'assets' folder\n\
-         - If you start a background local server (e.g., Python HTTP server on port 8080), you MUST cleanly kill ONLY that specific process when done. Do NOT use blanket commands like `taskkill /IM python.exe`. Instead, find the specific PID holding the port (e.g., `Stop-Process -Id (Get-NetTCPConnection -LocalPort 8080).OwningProcess -Force` in PowerShell) and kill only that process.\n",
+         GUIDELINES:\n\
+         - Work autonomously: use tools to make changes and run commands instead of describing what you would do. Ask the user only when a decision is genuinely theirs.\n\
+         - Think step by step before acting: reason through the problem before calling tools or answering.\n\
+         - You can only access files inside the project directory.\n\
+         - Prefer targeted edits (edit_file / multi_edit) over rewriting whole files. Read only the line ranges you need, and don't re-read a file you already have unless it changed.\n\
+         - Don't repeat file contents in your reply after writing them — the user sees file changes in the UI. Summarize what changed instead.\n\
+         - Keep replies concise.\n\
+         - Web: web_search finds pages, web_fetch reads them; use browser_interact only when fetching is blocked.\n\
+         - Check packages with check_package before installing. Python dependencies always go in a project-local virtual environment: create `.venv` if it's missing and call its executables directly (`.venv\\\\Scripts\\\\pip` on Windows, `.venv/bin/pip` elsewhere). Never run `pip install` globally.\n\
+         - Long-running servers: start them with run_command and background=true, and stop them with stop_process using the PID it returned. Never kill processes by name (e.g. `taskkill /IM python.exe`).\n\
+         - Images: generate_image creates new ones; image_search finds real-world photos and graphics; zerochan_search finds existing anime / gacha-game characters (comma-separated tags, e.g. 'Genshin Impact, Furina'). Save them where the user asks, otherwise in the current directory (media/ or static/ subfolders are good practice).\n\
+         - When a page or app you built shows images, check them with view_image / batch_view_images (alignment, cropping, aspect ratio) and fix problems, e.g. with a Pillow script.\n\
+         - Version control: git_status, git_diff, git_log, git_commit. Commit only when the user asks.\n\
+         - Do not create NSFW content or images yourself, but do fully help build code for sites or apps that may host NSFW material; for such requests, output only code.\n",
         root = settings.project_root.display(),
-        readme = readme_summary,
-        skills = skills_info,
-    )
+    );
+
+    if let Some(custom) = settings
+        .custom_system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        prompt.push_str("\nADDITIONAL INSTRUCTIONS FROM THE USER:\n");
+        prompt.push_str(custom);
+        prompt.push('\n');
+    }
+    prompt
 }
 
 fn load_readme_summary(root: &std::path::Path) -> String {
-    for name in &["README.md", "readme.md", "README.txt", "README"] {
-        let path = root.join(name);
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let summary: String = content.chars().take(500).collect();
-                return format!(
-                    "\nPROJECT README (first 500 chars):\n{}{}\n",
-                    summary,
-                    if content.len() > 500 { "..." } else { "" }
-                );
-            }
+    for name in ["README.md", "readme.md", "README.txt", "README"] {
+        if let Ok(content) = std::fs::read_to_string(root.join(name)) {
+            let summary: String = content.chars().take(500).collect();
+            let more = if content.chars().nth(500).is_some() {
+                "..."
+            } else {
+                ""
+            };
+            return format!("\nPROJECT README (first 500 chars):\n{summary}{more}\n");
         }
     }
     String::new()
 }
 
 fn detect_images(user_input: &str, project_root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut images = Vec::new();
+    const EXTS: &[&str] = &[".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif"];
     let cleaned: String = user_input.replace(['(', ')', '[', ']', '`', '"', '\''], " ");
+    let mut images = Vec::new();
     for word in cleaned.split_whitespace() {
+        let word = word.trim_end_matches([',', '.', ';', ':', '!', '?']);
         let lower = word.to_lowercase();
-        if lower.ends_with(".png")
-            || lower.ends_with(".jpg")
-            || lower.ends_with(".jpeg")
-            || lower.ends_with(".webp")
-            || lower.ends_with(".gif")
-            || lower.ends_with(".bmp")
-            || lower.ends_with(".avif")
-        {
-            let path = std::path::Path::new(word);
-            let resolved = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                project_root.join(path)
-            };
-            if resolved.exists() && resolved.is_file() {
-                images.push(resolved);
-            }
+        if !EXTS.iter().any(|ext| lower.ends_with(ext)) {
+            continue;
+        }
+        let path = std::path::Path::new(word);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.join(path)
+        };
+        if resolved.is_file() && !images.contains(&resolved) {
+            images.push(resolved);
         }
     }
     images
 }
 
-use serde_json::json;
-
-fn tool_needs_approval(settings: &Settings, tool_name: &str, args: &serde_json::Value) -> bool {
-    if !settings.ask_perms {
-        return false;
-    }
-    let mut needs_app = settings.needs_approval(tool_name);
-    if tool_name == "run_command" && needs_app {
-        let command_str = args["command"].as_str().unwrap_or("");
-        if crate::tools::shell::is_unparseable_or_fallback(command_str) {
-            needs_app = true;
-        }
-    }
-    needs_app
+fn tool_needs_approval(settings: &Settings, tool_name: &str) -> bool {
+    settings.ask_perms && settings.needs_approval(crate::tools::canonical_tool_name(tool_name))
 }
 
 #[cfg(test)]
@@ -1540,57 +1533,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tool_needs_approval() {
-        let mut settings = Settings::default();
+    fn approval_follows_settings() {
+        let mut settings = Settings {
+            require_approval: vec!["run_command".to_string()],
+            ..Settings::default()
+        };
+        assert!(tool_needs_approval(&settings, "run_command"));
+        assert!(!tool_needs_approval(&settings, "read_file"));
+
+        settings.require_approval.clear();
+        assert!(!tool_needs_approval(&settings, "run_command"));
+
         settings.require_approval = vec!["run_command".to_string()];
+        settings.ask_perms = false;
+        assert!(!tool_needs_approval(&settings, "run_command"));
+    }
 
-        // Default: run_command requires approval
-        assert!(tool_needs_approval(
-            &settings,
-            "run_command",
-            &json!({"command": "echo hello"})
-        ));
-        assert!(tool_needs_approval(
-            &settings,
-            "run_command",
-            &json!({"command": "echo hello | grep foo"})
-        ));
-        assert!(!tool_needs_approval(
-            &settings,
-            "read_file",
-            &json!({"path": "src/main.rs"})
-        ));
+    #[test]
+    fn retry_policy() {
+        let rate = "Gemini API error 429 Too Many Requests: Please retry in 37.628484036s.";
+        assert_eq!(
+            retry_delay(rate, 0),
+            Some(std::time::Duration::from_secs(39))
+        );
+        assert_eq!(
+            retry_delay("Anthropic API error 529: overloaded_error", 1),
+            Some(std::time::Duration::from_secs(4))
+        );
+        assert_eq!(
+            retry_delay("API error 401 Unauthorized: invalid key", 0),
+            None
+        );
+        assert_eq!(
+            retry_delay("429: quota exceeded for requests per day", 0),
+            None
+        );
+        assert_eq!(retry_delay("429 Please retry in 3600s", 0), None);
+    }
 
-        // Opted-out: run_command not in settings
-        settings.require_approval = vec![];
+    #[test]
+    fn tool_args_parsing_reports_truncated_json() {
+        assert_eq!(parse_tool_args(&json!({"a": 1})), Some(json!({"a": 1})));
+        assert_eq!(parse_tool_args(&json!("{\"a\": 1}")), Some(json!({"a": 1})));
+        assert_eq!(parse_tool_args(&json!("")), Some(json!({})));
+        assert_eq!(
+            parse_tool_args(&json!("{\"path\": \"x.rs\", \"content\": \"fn ma")),
+            None
+        );
+    }
 
-        // Clean command runs without approval
-        assert!(!tool_needs_approval(
-            &settings,
-            "run_command",
-            &json!({"command": "echo hello"})
-        ));
-
-        // Fallback/metacharacter/wildcard commands do not require approval when opted-out
-        assert!(!tool_needs_approval(
-            &settings,
-            "run_command",
-            &json!({"command": "echo hello | grep foo"})
-        ));
-        assert!(!tool_needs_approval(
-            &settings,
-            "run_command",
-            &json!({"command": "echo 'hello"})
-        ));
-        assert!(!tool_needs_approval(
-            &settings,
-            "run_command",
-            &json!({"command": "echo hello; ls"})
-        ));
-        assert!(!tool_needs_approval(
-            &settings,
-            "run_command",
-            &json!({"command": "echo *.txt"})
-        ));
+    #[test]
+    fn detects_images_with_trailing_punctuation() {
+        let root = std::env::temp_dir().join(format!("nvx-img-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("shot.png"), b"x").unwrap();
+        let found = detect_images("look at shot.png, please", &root);
+        assert_eq!(found, vec![root.join("shot.png")]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

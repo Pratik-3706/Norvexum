@@ -12,6 +12,7 @@ pub async fn fetch_anthropic_models(
     client: &Client,
     api_key: &str,
 ) -> eyre::Result<Vec<ModelInfo>> {
+    let api_key = api_key.trim();
     let mut out = Vec::new();
     let mut after_id: Option<String> = None;
 
@@ -38,15 +39,22 @@ pub async fn fetch_anthropic_models(
         for entry in &data {
             let id = entry["id"].as_str().unwrap_or_default().to_string();
 
-            // Fetch detail to get capabilities
-            let detail: Value = client
-                .get(format!("{ANTHROPIC_BASE}/models/{id}"))
-                .header("x-api-key", api_key)
-                .header("anthropic-version", ANTHROPIC_API_VERSION)
-                .send()
-                .await?
-                .json()
-                .await?;
+            // The list response carries capabilities on current API versions;
+            // only fall back to the per-model endpoint when it doesn't.
+            let detail = if entry.get("capabilities").is_some() {
+                entry.clone()
+            } else {
+                match client
+                    .get(format!("{ANTHROPIC_BASE}/models/{id}"))
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", ANTHROPIC_API_VERSION)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp.json::<Value>().await.unwrap_or_else(|_| entry.clone()),
+                    Err(_) => entry.clone(),
+                }
+            };
 
             let caps = &detail["capabilities"];
 
@@ -216,9 +224,14 @@ pub fn spawn_background_fetch(settings: &crate::config::Settings) {
         .unwrap_or_else(|| crate::ai::ollama::DEFAULT_OLLAMA_URL.to_string());
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let Ok(rt) = tokio::runtime::Runtime::new() else {
+            return;
+        };
         rt.block_on(async move {
-            let client = Client::new();
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .unwrap_or_default();
             let mut all_providers = crate::config::providers::build_static_registry();
 
             // AICredits

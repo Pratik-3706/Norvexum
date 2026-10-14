@@ -4,18 +4,13 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Vision {
     Yes,
     No,
+    #[default]
     Unknown,
-}
-
-impl Default for Vision {
-    fn default() -> Self {
-        Vision::Unknown
-    }
 }
 
 /// Describes a single AI model's capabilities.
@@ -327,30 +322,61 @@ pub fn build_static_registry() -> Vec<ProviderInfo> {
             env_key: "ANTHROPIC_API_KEY".into(),
             models: vec![
                 ModelInfo {
-                    id: "claude-sonnet-4-20250514".into(),
+                    id: "claude-opus-5-5".into(),
                     family: "claude".into(),
                     vision: Vision::Yes,
-                    adaptive_thinking: false,
-                    effort_levels: vec![],
+                    adaptive_thinking: true,
+                    effort_levels: vec![
+                        "low".into(),
+                        "medium".into(),
+                        "high".into(),
+                        "xhigh".into(),
+                        "max".into(),
+                    ],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
-                    context_window: 200_000,
-                    cost_per_1k_input: 0.003,
-                    cost_per_1k_output: 0.015,
+                    context_window: 1_000_000,
+                    cost_per_1k_input: 0.004,
+                    cost_per_1k_output: 0.02,
                 },
                 ModelInfo {
-                    id: "claude-3-5-haiku-latest".into(),
+                    id: "claude-sonnet-5-5".into(),
                     family: "claude".into(),
                     vision: Vision::Yes,
-                    adaptive_thinking: false,
-                    effort_levels: vec![],
+                    adaptive_thinking: true,
+                    effort_levels: vec![
+                        "low".into(),
+                        "medium".into(),
+                        "high".into(),
+                        "xhigh".into(),
+                        "max".into(),
+                    ],
                     image_gen: false,
                     tool_calling: true,
                     streaming: true,
-                    context_window: 200_000,
-                    cost_per_1k_input: 0.0008,
-                    cost_per_1k_output: 0.004,
+                    context_window: 1_000_000,
+                    cost_per_1k_input: 0.002,
+                    cost_per_1k_output: 0.01,
+                },
+                ModelInfo {
+                    id: "claude-haiku-5-5".into(),
+                    family: "claude".into(),
+                    vision: Vision::Yes,
+                    adaptive_thinking: true,
+                    effort_levels: vec![
+                        "low".into(),
+                        "medium".into(),
+                        "high".into(),
+                        "xhigh".into(),
+                        "max".into(),
+                    ],
+                    image_gen: false,
+                    tool_calling: true,
+                    streaming: true,
+                    context_window: 1_000_000,
+                    cost_per_1k_input: 0.0001,
+                    cost_per_1k_output: 0.0005,
                 },
             ],
         },
@@ -468,32 +494,4 @@ pub fn build_registry_with_settings(settings: &crate::config::Settings) -> Vec<P
 /// Look up a provider by name.
 pub fn find_provider(name: &str) -> Option<ProviderInfo> {
     build_registry().into_iter().find(|p| p.name == name)
-}
-
-/// Look up a model across all providers. Returns (provider, model).
-pub fn find_model(model_id: &str) -> Option<(ProviderInfo, ModelInfo)> {
-    for provider in build_registry() {
-        if let Some(model) = provider.models.iter().find(|m| m.id == model_id) {
-            return Some((provider.clone(), model.clone()));
-        }
-    }
-    None
-}
-
-/// List all providers that have the given env key set.
-pub fn available_providers() -> Vec<ProviderInfo> {
-    build_registry()
-        .into_iter()
-        .filter(|p| {
-            if p.name == "ollama" {
-                // Ollama is always available locally
-                true
-            } else {
-                std::env::var(&p.env_key)
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .is_some()
-            }
-        })
-        .collect()
 }

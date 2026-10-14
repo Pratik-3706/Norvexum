@@ -7,6 +7,10 @@ description = "Advanced multi-threaded agentic CLI with rich TUI, multi-provider
 license = "MIT"
 rust-version = "1.85"
 
+[lib]
+name = "norvexum"
+path = "src/lib.rs"
+
 [[bin]]
 name = "norvexum"
 path = "src/main.rs"
@@ -14,7 +18,6 @@ path = "src/main.rs"
 [dependencies]
 # ── Async Runtime ──────────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"
 
@@ -25,14 +28,13 @@ clap = { version = "4", features = ["derive", "env", "color"] }
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 arboard = "3"
+unicode-width = "0.2"
 
 # ── HTTP Client (anti-bot: impersonate browser TLS fingerprint) ────────────
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls", "json", "cookies", "gzip", "brotli", "deflate",
     "stream", "multipart",
 ] }
-reqwest-eventsource = "0.6"
-eventsource-stream = "0.2"
 
 # ── Serialization ──────────────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
@@ -80,16 +82,11 @@ eyre = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# ── Terminal styling (for non-TUI output) ─────────────────────────────────
-console = "0.15"
-indicatif = "0.17"               # Progress bars
 
 # ── Directories ───────────────────────────────────────────────────────────
 dirs = "6"                       # Platform-specific dirs (~/.norvexum)
 
-# ── String distance (for Ollama model matching) ───────────────────────
-strsim = "0.11"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 egui = "0.29"
 eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 keyring = "2"

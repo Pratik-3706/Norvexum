@@ -68,7 +68,10 @@ pub struct Settings {
     pub starred_models: Vec<String>,
     // ── Reasoning / Thinking settings ────────────────────────────────────
     pub thinking_effort: Option<String>,
-    #[serde(skip)]
+    /// Detected reasoning API style for the active model. Not stored in
+    /// config.toml, but it must survive the JSON hand-off from the GUI to the
+    /// agent (it used to be `serde(skip)`, so the agent never saw it).
+    #[serde(default)]
     pub model_reasoning_type: Option<crate::ai::types::ReasoningType>,
 }
 
@@ -104,35 +107,23 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Load settings: env vars → config.toml → defaults
+    /// Load settings: env vars (+ .env files, OS keyring) → config.toml → defaults
     pub fn load() -> Result<Self> {
-        let mut settings = Self::default();
-
-        // ── 1. Environment variables ─────────────────────────────────────
-        settings.aicredits_api_key = std::env::var("AICREDITS_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        settings.google_ai_api_key = std::env::var("GOOGLE_AI_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        settings.openai_api_key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        settings.anthropic_api_key = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        settings.tavily_api_key = std::env::var("TAVILY_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        settings.ocr_space_api_key = std::env::var("OCR_SPACE_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        settings.pollinations_api_key = std::env::var("POLLINATIONS_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        settings.ollama_base_url = std::env::var("OLLAMA_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty());
+        load_env_files();
+        // ── 1. Environment variables, then the OS keyring ────────────────
+        let mut settings = Self {
+            aicredits_api_key: secret("AICREDITS_API_KEY"),
+            google_ai_api_key: secret("GOOGLE_AI_API_KEY"),
+            openai_api_key: secret("OPENAI_API_KEY"),
+            anthropic_api_key: secret("ANTHROPIC_API_KEY"),
+            tavily_api_key: secret("TAVILY_API_KEY"),
+            ocr_space_api_key: secret("OCR_SPACE_API_KEY"),
+            pollinations_api_key: secret("POLLINATIONS_API_KEY"),
+            ollama_base_url: std::env::var("OLLAMA_BASE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            ..Self::default()
+        };
 
         // ── 2. Project-local config ──────────────────────────────────────
         let mut target_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -208,7 +199,7 @@ impl Settings {
         if settings.active_provider == "openai" && settings.openai_api_key.is_none() {
             if settings.anthropic_api_key.is_some() {
                 settings.active_provider = "anthropic".into();
-                settings.active_model = "claude-3-5-haiku-latest".into();
+                settings.active_model = "claude-sonnet-5-5".into();
             } else if settings.google_ai_api_key.is_some() {
                 settings.active_provider = "google_direct".into();
                 settings.active_model = "gemini-2.5-flash".into();
@@ -225,62 +216,20 @@ impl Settings {
     /// Use this ONLY at GUI startup to remember the last workspace.
     /// CLI and explicit folder changes should use `load()` which is CWD-based.
     pub fn load_remembered() -> Result<Self> {
-        // Pre-load global .env so Self::load() can pick up stored API keys
-        if let Some(home) = dirs::home_dir() {
-            let env_path = home.join(".norvexum").join(".env");
-            if env_path.exists() {
-                let _ = dotenvy::from_path(&env_path);
-            }
-        }
-
         let mut settings = Self::load()?;
 
-        // Check global config for last-used project root
-        if let Some(home) = dirs::home_dir() {
-            let global_path = home.join(".norvexum_global.json");
-            if global_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&global_path) {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(saved_root) = val["last_project_root"].as_str() {
-                            let saved_path = PathBuf::from(saved_root);
-                            if saved_path.exists() && saved_path.is_dir() {
-                                // Override project root and set CWD
-                                let _ = std::env::set_current_dir(&saved_path);
-                                settings.project_root = saved_path.clone();
+        let saved_root = dirs::home_dir()
+            .map(|home| home.join(".norvexum_global.json"))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|val| val["last_project_root"].as_str().map(PathBuf::from))
+            .filter(|path| path.is_dir());
 
-                                // Also load global config.toml
-                                let global_dir = dirs::home_dir()
-                                    .map(|h| h.join(".norvexum"))
-                                    .unwrap_or_else(|| saved_path.join(NORVEXUM_DIR));
-                                let config_path = global_dir.join(CONFIG_FILE);
-                                if config_path.exists() {
-                                    if let Ok(cfg_content) = std::fs::read_to_string(&config_path) {
-                                        if let Ok(file_settings) =
-                                            toml::from_str::<FileSettings>(&cfg_content)
-                                        {
-                                            if let Some(provider) = file_settings.active_provider {
-                                                settings.active_provider = provider;
-                                            }
-                                            if let Some(model) = file_settings.active_model {
-                                                settings.active_model = model;
-                                            }
-                                            if let Some(url) = file_settings.ollama_base_url {
-                                                settings.ollama_base_url = Some(url);
-                                            }
-                                            if let Some(starred) = file_settings.starred_models {
-                                                settings.starred_models = starred;
-                                            }
-                                            if let Some(effort) = file_settings.thinking_effort {
-                                                settings.thinking_effort = Some(effort);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(saved_path) = saved_root {
+            let _ = std::env::set_current_dir(&saved_path);
+            // A project-local .env in the remembered workspace still applies.
+            let _ = dotenvy::from_path(saved_path.join(".env"));
+            settings.project_root = saved_path;
         }
 
         Ok(settings)
@@ -299,11 +248,9 @@ impl Settings {
             browser_timeout_secs: Some(self.browser_timeout_secs),
             max_thinking_loops: Some(self.max_thinking_loops),
             max_content_chars: Some(self.max_content_chars),
-            require_approval: if self.require_approval.is_empty() {
-                None
-            } else {
-                Some(self.require_approval.clone())
-            },
+            // Always written: an empty list means "approve nothing" and must not
+            // fall back to the default on the next start.
+            require_approval: Some(self.require_approval.clone()),
             ollama_base_url: self.ollama_base_url.clone(),
             custom_models: if self.custom_models.is_empty() {
                 None
@@ -340,27 +287,42 @@ impl Settings {
         Ok(())
     }
 
-    /// Get the .norvexum/ directory path
-    pub fn norvexum_dir(&self) -> PathBuf {
-        self.project_root.join(NORVEXUM_DIR)
-    }
-
-    /// Get the history directory path
-    pub fn history_dir(&self) -> PathBuf {
-        self.norvexum_dir().join(HISTORY_DIR)
-    }
-
-    /// Check if a path is within the project sandbox
+    /// Check if a path is within the project sandbox.
+    ///
+    /// Paths that don't exist yet are resolved through their nearest existing
+    /// ancestor, and `..` components are applied before comparing, so
+    /// `root/../../Windows/x` is rejected even though it starts with `root`.
     pub fn is_in_sandbox(&self, path: &Path) -> bool {
-        match (path.canonicalize(), self.project_root.canonicalize()) {
-            (Ok(abs_path), Ok(abs_root)) => abs_path.starts_with(&abs_root),
-            _ => {
-                // Fallback: string prefix check
-                let path_str = path.to_string_lossy();
-                let root_str = self.project_root.to_string_lossy();
-                path_str.starts_with(root_str.as_ref())
-            }
+        let root = self
+            .project_root
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_lexically(&self.project_root));
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.project_root.join(path)
+        };
+        resolve_existing_prefix(&absolute).is_some_and(|resolved| resolved.starts_with(&root))
+    }
+
+    /// A user-facing explanation when the active provider has no API key.
+    pub fn missing_api_key_message(&self) -> Option<String> {
+        if self.active_provider == "ollama" {
+            return None;
         }
+        if self.active_api_key().is_some_and(|k| !k.trim().is_empty()) {
+            return None;
+        }
+        let env_name = providers::find_provider(&self.active_provider)
+            .map(|p| p.env_key)
+            .unwrap_or_else(|| "the provider's API key".into());
+        Some(format!(
+            "No API key found for provider '{provider}'.\n\n\
+             Set {env_name} in your environment or in ~/.norvexum/.env, e.g.\n  \
+             {env_name}=sk-...\n\n\
+             Or switch provider: norvexum config set active_provider <openai|anthropic|google_direct|aicredits|ollama>",
+            provider = self.active_provider
+        ))
     }
 
     /// Get the API key for the active provider
@@ -398,4 +360,87 @@ struct FileSettings {
     fullscreen: Option<bool>,
     maximized: Option<bool>,
     custom_system_prompt: Option<String>,
+}
+
+/// Load `~/.norvexum/.env` (where the GUI stores keys) and the project `.env`.
+/// Variables already present in the environment always win.
+fn load_env_files() {
+    if let Some(home) = dirs::home_dir() {
+        let _ = dotenvy::from_path(home.join(NORVEXUM_DIR).join(".env"));
+    }
+    let _ = dotenvy::dotenv();
+}
+
+fn secret(env_name: &str) -> Option<String> {
+    std::env::var(env_name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| get_keyring_secret(&env_name.to_lowercase()))
+}
+
+/// Read a key saved by the GUI in the OS keyring (service "norvexum").
+pub fn get_keyring_secret(name: &str) -> Option<String> {
+    keyring::Entry::new("norvexum", name)
+        .ok()?
+        .get_password()
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Apply `.` and `..` components without touching the filesystem.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Canonicalize the longest existing prefix of `path` (resolving symlinks),
+/// then re-append the missing tail.
+fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let normalized = normalize_lexically(path);
+    let mut existing = normalized.as_path();
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        tail.push(existing.file_name()?.to_os_string());
+        existing = existing.parent()?;
+    }
+    let mut resolved = existing.canonicalize().ok()?;
+    for part in tail.into_iter().rev() {
+        resolved.push(part);
+    }
+    Some(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_rejects_traversal_through_missing_paths() {
+        let root = std::env::temp_dir().join(format!("nvx-sandbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = Settings {
+            project_root: root.clone(),
+            ..Settings::default()
+        };
+        assert!(settings.is_in_sandbox(&root.join("new/dir/file.txt")));
+        assert!(settings.is_in_sandbox(Path::new("relative.txt")));
+        assert!(
+            !settings.is_in_sandbox(&root.join("missing").join("..").join("..").join("evil.txt"))
+        );
+        let sibling = PathBuf::from(format!("{}-evil", root.display())).join("x");
+        assert!(!settings.is_in_sandbox(&sibling));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

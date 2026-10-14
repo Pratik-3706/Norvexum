@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Web Search — Tavily (primary) + DuckDuckGo (fallback)
 //
 // Anti-bot:
@@ -45,7 +45,6 @@ pub fn build_stealth_client() -> Client {
 #[derive(Debug, Deserialize)]
 struct TavilyResponse {
     results: Option<Vec<TavilyResult>>,
-    answer: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,15 +68,18 @@ async fn search_tavily(
         "api_key": api_key,
         "query": query,
         "max_results": num_results,
-        "include_answer": true,
         "search_depth": "basic"
     });
 
     let response = client
         .post("https://api.tavily.com/search")
+        .bearer_auth(api_key.trim())
         .json(&body)
         .send()
         .await?;
+    if !response.status().is_success() {
+        eyre::bail!("Tavily returned HTTP {}", response.status());
+    }
 
     let tavily: TavilyResponse = response.json().await?;
     let mut results = Vec::new();
@@ -113,7 +115,6 @@ async fn search_ddg(query: &str, num_results: usize) -> Result<Vec<SearchResult>
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         )
         .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Accept-Encoding", "gzip, deflate, br")
         .header("Origin", "https://duckduckgo.com")
         .form(&[("q", query), ("kp", "-2")]) // kp=-2 = safe-search OFF
         .send()
@@ -185,7 +186,7 @@ struct SearchResult {
     score: f64,
 }
 
-fn score_results(query: &str, results: &mut Vec<SearchResult>) {
+fn score_results(query: &str, results: &mut [SearchResult]) {
     let query_words: std::collections::HashSet<String> = query
         .to_lowercase()
         .split_whitespace()
@@ -234,11 +235,7 @@ fn score_results(query: &str, results: &mut Vec<SearchResult>) {
         }
     }
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_by(|a, b| b.score.total_cmp(&a.score));
 }
 
 // ── Tool Implementation ──────────────────────────────────────────────────
@@ -324,8 +321,11 @@ fn format_results(results: &[SearchResult], source: &str) -> String {
     for (i, r) in results.iter().enumerate() {
         let snippet: String = r.snippet.chars().take(200).collect();
         lines.push(format!(
-            "[{}] **{}**\n    {}\n    {}",
-            i, r.title, r.url, snippet
+            "[{}] {}\n    {}\n    {}",
+            i + 1,
+            r.title,
+            r.url,
+            snippet
         ));
     }
     lines.join("\n\n")

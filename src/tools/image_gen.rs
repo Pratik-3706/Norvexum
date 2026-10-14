@@ -66,7 +66,6 @@ impl Tool for GenerateImageTool {
             prompt: prompt.to_string(),
             width,
             height,
-            num_images: 1,
         };
 
         match crate::ai::image_gen::generate_image(&ctx.settings, req).await {

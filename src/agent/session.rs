@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Session Persistence — Save/load conversation state across restarts
 //
 // Sessions are stored as JSON in .norvexum/sessions/<hash>.json
@@ -30,7 +30,6 @@ pub struct Session {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
-    pub created_at: String,
     pub updated_at: String,
     pub message_count: usize,
     pub model: String,
@@ -59,8 +58,9 @@ impl Session {
         let dir = sessions_dir(root);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.json", self.id));
-        let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        let tmp = dir.join(format!("{}.json.tmp", self.id));
+        std::fs::write(&tmp, serde_json::to_vec(self)?)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -105,6 +105,9 @@ impl Session {
 
     /// Load a specific session by ID.
     pub fn load_by_id(root: &Path, id: &str) -> Option<Self> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
         let path = sessions_dir(root).join(format!("{}.json", id));
         if !path.exists() {
             return None;
@@ -133,7 +136,6 @@ impl Session {
                         if let Ok(session) = serde_json::from_str::<Session>(&content) {
                             summaries.push(SessionSummary {
                                 id: session.id,
-                                created_at: session.created_at,
                                 updated_at: session.updated_at,
                                 message_count: session.messages.len(),
                                 model: session.model,
@@ -146,15 +148,6 @@ impl Session {
 
         summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         summaries
-    }
-
-    /// Delete a session.
-    pub fn delete(root: &Path, id: &str) -> Result<()> {
-        let path = sessions_dir(root).join(format!("{}.json", id));
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        Ok(())
     }
 
     /// Clear all sessions.

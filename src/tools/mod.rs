@@ -18,6 +18,7 @@ pub mod image_search;
 pub mod manage_tasks;
 pub mod memory;
 pub mod package_safety;
+pub mod processes;
 pub mod shell;
 pub mod skills;
 pub mod web_fetch;
@@ -27,7 +28,7 @@ pub mod browser;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::ai::types::ToolDef;
@@ -91,17 +92,12 @@ impl ToolResult {
     }
 
     /// Format for inclusion in the AI conversation as a tool result.
+    ///
+    /// `data` is deliberately left out: it duplicates what `output` already
+    /// says and would cost tokens on every later request.
     pub fn to_message_content(&self) -> String {
         if self.success {
-            if let Some(data) = &self.data {
-                format!(
-                    "{}\n\n[data]: {}",
-                    self.output,
-                    serde_json::to_string(data).unwrap_or_default()
-                )
-            } else {
-                self.output.clone()
-            }
+            self.output.clone()
         } else {
             format!(
                 "ERROR: {}",
@@ -147,23 +143,39 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Map names models commonly guess (from other agents' toolsets) onto ours,
+/// instead of shipping duplicate tool definitions that cost tokens every request.
+pub fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "cat" | "view_file" | "read" => "read_file",
+        "write_to_file" | "create_file" => "write_file",
+        "replace_file_content" | "str_replace" => "edit_file",
+        "multi_replace_file_content" => "multi_edit",
+        "shell" | "bash" | "execute" | "run_shell_command" | "shell_command" => "run_command",
+        "list_dir" | "list_directory" => "ls",
+        other => other,
+    }
+}
+
 /// Registry of all available tools.
-/// Wrapped in Arc-compatible containers for safe sharing across spawned tasks.
+/// A BTreeMap keeps the tool list in a stable order: providers cache prompts
+/// by exact prefix, and a reshuffled tool list would miss the cache.
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
     /// Create a new registry and register all built-in tools.
     pub fn new(_settings: &Settings) -> Self {
         let mut registry = Self {
-            tools: HashMap::new(),
+            tools: BTreeMap::new(),
         };
 
         // ── Filesystem tools ─────────────────────────────────────────────
         registry.register(Arc::new(filesystem::ReadFileTool));
         registry.register(Arc::new(filesystem::WriteFileTool));
         registry.register(Arc::new(filesystem::EditFileTool));
+        registry.register(Arc::new(filesystem::MultiEditTool));
         registry.register(Arc::new(filesystem::ListDirTool));
         registry.register(Arc::new(filesystem::GrepTool));
         registry.register(Arc::new(filesystem::FindTool));
@@ -171,8 +183,6 @@ impl ToolRegistry {
         registry.register(Arc::new(filesystem::RemoveTool));
         registry.register(Arc::new(filesystem::MoveTool));
         registry.register(Arc::new(filesystem::CopyTool));
-        registry.register(Arc::new(filesystem::PwdTool));
-        registry.register(Arc::new(filesystem::CatTool));
 
         // ── Web tools ────────────────────────────────────────────────────
         registry.register(Arc::new(web_search::WebSearchTool));
@@ -202,6 +212,7 @@ impl ToolRegistry {
 
         // ── Shell command execution ──────────────────────────────────────
         registry.register(Arc::new(shell::ShellCommandTool));
+        registry.register(Arc::new(processes::ManageProcessesTool));
 
         // ── Git tools ────────────────────────────────────────────────────
         registry.register(Arc::new(git::GitStatusTool));
@@ -216,9 +227,9 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
-    /// Get a tool by name.
+    /// Get a tool by name (aliases included).
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        self.tools.get(canonical_tool_name(name)).cloned()
     }
 
     /// Execute a tool by name with the given arguments.
@@ -230,7 +241,10 @@ impl ToolRegistry {
     ) -> ToolResult {
         match self.get(name) {
             Some(tool) => tool.execute(args, ctx).await,
-            None => ToolResult::err(format!("Unknown tool: {}", name)),
+            None => ToolResult::err(format!(
+                "Unknown tool: {name}. Available tools: {}",
+                self.tool_names().join(", ")
+            )),
         }
     }
 
@@ -524,11 +538,21 @@ mod tests {
         assert!(!names.contains(&"browser_click"));
         assert!(!names.contains(&"browser_screenshot"));
         assert!(!names.contains(&"cd"));
+        // Aliases resolve without duplicate definitions.
+        assert!(!names.contains(&"cat"));
+        assert!(registry.get("cat").is_some());
+        assert!(registry.get("write_to_file").is_some());
+        assert!(names.contains(&"multi_edit"));
+        assert!(names.contains(&"manage_processes"));
         // Verify new tools are registered
         assert!(names.contains(&"git_status"));
         assert!(names.contains(&"git_diff"));
         assert!(names.contains(&"git_commit"));
         assert!(names.contains(&"git_log"));
         assert!(names.contains(&"batch_view_images"));
+        // Stable order for prompt caching.
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
     }
 }

@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Package Safety — Check packages before install
 // ===========================================================================
 
@@ -193,22 +193,19 @@ async fn check_osv(ecosystem: &str, name: &str, version: &str) -> Vec<String> {
         .send()
         .await;
 
-    match response {
-        Ok(r) => {
-            if let Ok(data) = r.json::<serde_json::Value>().await {
-                if let Some(vulns) = data["vulns"].as_array() {
-                    return vulns
-                        .iter()
-                        .filter_map(|v| {
-                            let id = v["id"].as_str()?;
-                            let summary = v["summary"].as_str().unwrap_or("No summary");
-                            Some(format!("{}: {}", id, summary))
-                        })
-                        .collect();
-                }
+    if let Ok(r) = response {
+        if let Ok(data) = r.json::<serde_json::Value>().await {
+            if let Some(vulns) = data["vulns"].as_array() {
+                return vulns
+                    .iter()
+                    .filter_map(|v| {
+                        let id = v["id"].as_str()?;
+                        let summary = v["summary"].as_str().unwrap_or("No summary");
+                        Some(format!("{}: {}", id, summary))
+                    })
+                    .collect();
             }
         }
-        Err(_) => {}
     }
 
     Vec::new()
@@ -245,26 +242,19 @@ fn check_typosquatting(name: &str) -> String {
     String::new()
 }
 
+/// Edit distance in characters (the old version sized its table in bytes,
+/// which gave wrong distances for non-ASCII names).
 fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a_len = a.len();
-    let b_len = b.len();
-    let mut matrix = vec![vec![0usize; b_len + 1]; a_len + 1];
-
-    for i in 0..=a_len {
-        matrix[i][0] = i;
-    }
-    for j in 0..=b_len {
-        matrix[0][j] = j;
-    }
-
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0; b_chars.len() + 1];
     for (i, ca) in a.chars().enumerate() {
-        for (j, cb) in b.chars().enumerate() {
-            let cost = if ca == cb { 0 } else { 1 };
-            matrix[i + 1][j + 1] = (matrix[i][j + 1] + 1)
-                .min(matrix[i + 1][j] + 1)
-                .min(matrix[i][j] + cost);
+        curr[0] = i + 1;
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
         }
+        std::mem::swap(&mut prev, &mut curr);
     }
-
-    matrix[a_len][b_len]
+    prev[b_chars.len()]
 }

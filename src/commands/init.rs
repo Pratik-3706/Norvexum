@@ -3,7 +3,7 @@
 // ===========================================================================
 
 use crate::agent::history::ProjectContext;
-use crate::config::{CONFIG_FILE, HISTORY_DIR, NORVEXUM_DIR, Settings, VENVS_DIR};
+use crate::config::{HISTORY_DIR, NORVEXUM_DIR, Settings, VENVS_DIR};
 use eyre::{Result, WrapErr};
 use std::fs;
 
@@ -12,14 +12,14 @@ pub async fn run(settings: &Settings) -> Result<()> {
     let norvexum_path = project_dir.join(NORVEXUM_DIR);
 
     if norvexum_path.exists() {
-        println!(
+        eprintln!(
             "Norvexum is already initialized in {}",
             project_dir.display()
         );
         return Ok(());
     }
 
-    println!("Initializing Norvexum in {}...", project_dir.display());
+    eprintln!("Initializing Norvexum in {}...", project_dir.display());
 
     // Create .norvexum/ directory structure
     fs::create_dir_all(&norvexum_path).wrap_err("Failed to create .norvexum directory")?;
@@ -40,7 +40,7 @@ pub async fn run(settings: &Settings) -> Result<()> {
     context
         .save(project_dir)
         .wrap_err("Failed to save initial project context")?;
-    println!("Created project context index.");
+    eprintln!("Created project context index.");
 
     // I no longer create a local .env file because API keys are stored globally.
 
@@ -52,10 +52,10 @@ pub async fn run(settings: &Settings) -> Result<()> {
             let mut file = fs::OpenOptions::new().append(true).open(&gitignore_path)?;
             use std::io::Write;
             writeln!(file, "\n# Norvexum local data\n.norvexum/")?;
-            println!("Added .norvexum/ to .gitignore.");
+            eprintln!("Added .norvexum/ to .gitignore.");
         }
     }
 
-    println!("✅ Norvexum initialized successfully!");
+    eprintln!("✅ Norvexum initialized successfully!");
     Ok(())
 }

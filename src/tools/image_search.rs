@@ -148,6 +148,9 @@ async fn fetch_image_json(
                 height: item["height"].as_u64().unwrap_or(0) as u32,
                 score: 0.0,
             });
+            if results.len() >= count {
+                break;
+            }
         }
     }
     Ok(results)
@@ -173,7 +176,7 @@ fn score_images(query: &str, images: Vec<ImageResult>) -> Vec<ImageResult> {
         img.score = score;
     }
 
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
     scored
 }
 
@@ -308,7 +311,7 @@ async fn fetch_zerochan_images(
         .filter(|w| {
             !w.is_empty() && w.len() > 1 && !stop_words.contains(&w.to_lowercase().as_str())
         })
-        .map(|w| capitalize_tag(w))
+        .map(capitalize_tag)
         .collect();
 
     if tags.is_empty() {
@@ -320,7 +323,7 @@ async fn fetch_zerochan_images(
     let mut items = query_zerochan_raw(client, &search_path, limit).await;
 
     // Fallback: if multi-tag search returns nothing, try querying the first tag alone
-    if items.as_ref().map_or(true, |it| it.is_empty()) && tags.len() > 1 {
+    if items.as_ref().is_none_or(|it| it.is_empty()) && tags.len() > 1 {
         items = query_zerochan_raw(client, &tags[0], limit).await;
     }
 

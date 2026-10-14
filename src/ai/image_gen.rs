@@ -68,10 +68,12 @@ async fn generate_via_gemini(
         .as_ref()
         .ok_or_else(|| eyre::eyre!("No Google AI API key"))?;
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent?key={}",
-        api_key
+        "{}/models/gemini-3.1-flash-image:generateContent",
+        super::gemini::GEMINI_BASE
     );
 
     let body = json!({
@@ -87,6 +89,7 @@ async fn generate_via_gemini(
 
     let response = client
         .post(&url)
+        .header("x-goog-api-key", api_key.trim())
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -187,12 +190,22 @@ async fn generate_via_openai(
         .as_ref()
         .ok_or_else(|| eyre::eyre!("No OpenAI API key"))?;
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    // DALL-E 3 only accepts these three sizes; pick the closest aspect ratio.
+    let size = if request.width > request.height * 5 / 4 {
+        "1792x1024"
+    } else if request.height > request.width * 5 / 4 {
+        "1024x1792"
+    } else {
+        "1024x1024"
+    };
     let body = json!({
         "model": "dall-e-3",
         "prompt": request.prompt,
         "n": 1,
-        "size": format!("{}x{}", request.width, request.height),
+        "size": size,
         "response_format": "b64_json",
     });
 
