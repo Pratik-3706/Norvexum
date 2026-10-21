@@ -657,6 +657,25 @@ mod tests {
     }
 
     #[test]
+    fn think_splitter_survives_any_chunk_boundary() {
+        // A reply with an em dash crashed old builds mid-stream; split it at
+        // every character position, inside and outside a think block.
+        for text in [
+            "Here's what I can do for you — build, fix, test.",
+            "<think>weigh A — B</think>Answer — done",
+        ] {
+            let chars: Vec<(usize, char)> = text.char_indices().collect();
+            for &(cut, _) in &chars {
+                let (a, b) = text.split_at(cut);
+                let (thinking, content) = collect(&[a, b]);
+                let joined = format!("{thinking}{content}");
+                let expected = text.replace("<think>", "").replace("</think>", "");
+                assert_eq!(joined, expected, "split at byte {cut}");
+            }
+        }
+    }
+
+    #[test]
     fn official_openai_gets_no_gateway_params() {
         let c = OpenAiCompatClient::new(
             "https://api.openai.com/v1".into(),

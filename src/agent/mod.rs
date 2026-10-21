@@ -607,11 +607,10 @@ impl Agent {
         explicit_images: Vec<std::path::PathBuf>,
     ) -> Message {
         let mut images = detect_images(text, &self.settings.project_root);
-        for img in explicit_images {
-            if !images.contains(&img) {
-                images.push(img);
-            }
-        }
+        images.extend(explicit_images);
+        // The same file can be found both ways (typed path and attachment).
+        let mut seen = std::collections::HashSet::new();
+        images.retain(|img| seen.insert(img.canonicalize().unwrap_or_else(|_| img.clone())));
         images.retain(|img| {
             let ok = self.settings.is_in_sandbox(img);
             if !ok {
@@ -748,13 +747,21 @@ impl Agent {
     ) -> Result<Vec<String>> {
         let mut text = user_input;
         let mut explicit_images = Vec::new();
+        let mut attachment = None;
 
-        // GUI attachment protocol: "/image_prompt |<path>| <prompt>"
+        // GUI attachment protocol: "/image_prompt |<path>| <prompt>". The GUI
+        // has already placed the file inside the project (in place, or copied
+        // to .norvexum/attachments/).
         if let Some(rest) = text.strip_prefix("/image_prompt |") {
-            if let Some((img_path, prompt)) = rest.split_once('|') {
-                let path = std::path::PathBuf::from(img_path);
-                if path.exists() {
-                    explicit_images.push(path);
+            if let Some((file_path, prompt)) = rest.split_once('|') {
+                let path = std::path::PathBuf::from(file_path);
+                if path.is_file() {
+                    // Only real images are sent as pictures; anything else would
+                    // be rejected by the provider as a broken image.
+                    if is_image_path(&path) {
+                        explicit_images.push(path.clone());
+                    }
+                    attachment = Some(path);
                 }
                 text = prompt.trim();
             }
@@ -762,6 +769,16 @@ impl Agent {
 
         if text.starts_with('/') && self.handle_slash_command(text).await {
             return Ok(self.drain_instructions());
+        }
+
+        // Tell the model where the file is so its tools can use it.
+        let with_note;
+        if let Some(path) = &attachment {
+            with_note = format!(
+                "{text}\n\n{}",
+                attachment_note(path, &self.settings.project_root)
+            );
+            text = &with_note;
         }
 
         let mut user_msg = self.build_user_message(text, explicit_images).await;
@@ -886,6 +903,22 @@ impl Agent {
                 self.save_session();
                 self.done(Some(usage));
                 return Ok(self.drain_instructions());
+            }
+
+            if let Some(cut) = turn
+                .tool_calls
+                .iter()
+                .find(|tc| parse_tool_args(&tc.arguments).is_none())
+            {
+                let why = if is_truncated(&turn.finish_reason) {
+                    "the reply hit the output token limit"
+                } else {
+                    "its arguments were not valid JSON"
+                };
+                let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                    "The `{}` call was cut off ({why}); asking the model to redo it in smaller parts.",
+                    crate::tools::canonical_tool_name(&cut.name)
+                )));
             }
 
             // Tool APIs require the assistant call message immediately before results.
@@ -1112,7 +1145,12 @@ impl Agent {
                 approvals.push(true);
                 continue;
             }
-            let args = parse_tool_args(&tc.arguments).unwrap_or_else(|| json!({}));
+            // Unparseable arguments never execute (the model gets an error back),
+            // so there is nothing meaningful to approve.
+            let Some(args) = parse_tool_args(&tc.arguments) else {
+                approvals.push(true);
+                continue;
+            };
             let _ = self.event_tx.send(AgentEvent::ApprovalRequest {
                 id: tc.id.clone(),
                 tool_name: tc.name.clone(),
@@ -1501,8 +1539,44 @@ fn load_readme_summary(root: &std::path::Path) -> String {
     String::new()
 }
 
+const IMAGE_EXTS: &[&str] = &[".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif"];
+
+fn is_image_path(path: &std::path::Path) -> bool {
+    let lower = path.to_string_lossy().to_lowercase();
+    IMAGE_EXTS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// The note added to a prompt for a GUI attachment: where the file is (relative
+/// to the project), how big it is, and how the agent can use it.
+fn attachment_note(path: &std::path::Path, project_root: &std::path::Path) -> String {
+    let root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let full = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let shown = full
+        .strip_prefix(&root)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let size = if size >= 1024 * 1024 {
+        format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} KB", size as f64 / 1024.0)
+    };
+    let how = if is_image_path(path) {
+        "The image is attached to this message; view_image shows it again"
+    } else {
+        "Open it with read_file"
+    };
+    format!(
+        "[Attached file: `{shown}` ({size}). {how}. If it belongs in the project \
+         (e.g. an asset the code should use), copy it to the right place with cp \
+         and reference the new path.]"
+    )
+}
+
 fn detect_images(user_input: &str, project_root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    const EXTS: &[&str] = &[".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif"];
+    const EXTS: &[&str] = IMAGE_EXTS;
     let cleaned: String = user_input.replace(['(', ')', '[', ']', '`', '"', '\''], " ");
     let mut images = Vec::new();
     for word in cleaned.split_whitespace() {
@@ -1531,6 +1605,31 @@ fn tool_needs_approval(settings: &Settings, tool_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_note_gives_a_project_relative_path() {
+        let root = std::env::temp_dir().join(format!("norvexum_attach_{}", std::process::id()));
+        let dir = root.join(".norvexum").join("attachments");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("spec.pdf");
+        std::fs::write(&pdf, vec![0u8; 2048]).unwrap();
+        let png = root.join("logo.png");
+        std::fs::write(&png, b"x").unwrap();
+
+        let note = attachment_note(&pdf, &root);
+        assert!(note.contains("`.norvexum/attachments/spec.pdf`"), "{note}");
+        assert!(note.contains("2.0 KB"), "{note}");
+        assert!(note.contains("read_file") && note.contains("cp"), "{note}");
+        assert!(!is_image_path(&pdf));
+
+        let note = attachment_note(&png, &root);
+        assert!(
+            note.contains("`logo.png`") && note.contains("view_image"),
+            "{note}"
+        );
+        assert!(is_image_path(std::path::Path::new("A.JPG")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn approval_follows_settings() {

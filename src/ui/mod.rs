@@ -24,10 +24,13 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Wrap,
+    },
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -40,6 +43,9 @@ const FRAME: Duration = Duration::from_millis(33);
 const SPINNER_TICK: Duration = Duration::from_millis(90);
 const MAX_INPUT_ROWS: u16 = 6;
 const NOTICE_DURATION: Duration = Duration::from_secs(3);
+/// Keys arriving closer together than this are a paste, not typing. Terminals
+/// without bracketed paste (Windows) deliver pasted text as plain key events.
+const PASTE_GAP: Duration = Duration::from_millis(12);
 
 /// Slash commands offered as completions (see `/help`).
 const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -56,6 +62,31 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/loops", "set the tool-loop limit"),
     ("/ask_perms", "toggle tool approval prompts"),
     ("/exit", "quit"),
+];
+
+/// Every key binding, shown by the F1 help overlay.
+const KEY_HELP: &[(&str, &str)] = &[
+    ("Enter", "send (queues while a run is active)"),
+    ("Alt+Enter / Ctrl+J", "new line"),
+    ("Up / Down", "move between lines, then browse history"),
+    ("Tab", "complete a / command, or switch to Activity"),
+    ("PgUp / PgDn", "scroll the chat"),
+    ("Shift+Up / Shift+Down", "scroll one line"),
+    ("Ctrl+Home / Ctrl+End", "jump to top / latest"),
+    ("Alt+Up / Alt+Down", "jump to the previous / next message"),
+    ("Mouse drag", "select text (copied on release)"),
+    ("Click in the box", "move the cursor"),
+    ("Right click", "paste"),
+    ("Esc", "stop the run, clear selection or input"),
+    ("Ctrl+T", "expand or collapse reasoning"),
+    ("Ctrl+A", "copy the whole chat"),
+    ("c (Activity)", "copy the selected tool's output"),
+    ("Ctrl+V", "paste"),
+    ("Ctrl+W / Ctrl+U", "delete word / to line start"),
+    ("Ctrl+L", "clear the input"),
+    ("Ctrl+C", "copy selection, clear, stop, or quit"),
+    ("Ctrl+D", "quit (empty input)"),
+    ("F1 or ?", "toggle this help"),
 ];
 
 pub struct App {
@@ -95,6 +126,8 @@ pub struct App {
     pub user_backlog: VecDeque<String>,
     /// Show full reasoning text instead of a two-line preview.
     pub show_reasoning: bool,
+    /// Key binding overlay (F1).
+    pub show_help: bool,
     run_started: Option<Instant>,
     spinner_frame: usize,
     notice: Option<(String, Instant)>,
@@ -106,8 +139,17 @@ pub struct App {
     // Geometry from the last draw, used for mouse hit-testing and copy.
     chat_area: Cell<Rect>,
     tools_area: Cell<Rect>,
+    /// Input box (with border) and its text area, plus the first visible row.
+    input_box: Cell<Rect>,
+    input_area: Cell<Rect>,
+    input_scroll: Cell<usize>,
     max_scroll: Cell<usize>,
+    total_lines: Cell<usize>,
+    view_height: Cell<usize>,
+    /// First line of every user/assistant message, for Alt+Up/Down.
+    message_starts: RefCell<Vec<usize>>,
     visible_plain: RefCell<Vec<String>>,
+    visible_meta: RefCell<Vec<RowMeta>>,
 }
 
 struct CachedRender {
@@ -115,6 +157,71 @@ struct CachedRender {
     width: usize,
     expanded: bool,
     lines: Vec<Line<'static>>,
+    meta: Vec<RowMeta>,
+}
+
+/// How a rendered row joins the row above it when copied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Join {
+    /// A real line break in the source.
+    #[default]
+    NewLine,
+    /// A soft wrap that replaced a space.
+    Space,
+    /// A soft wrap inside a word or code line.
+    Glued,
+}
+
+/// Copy metadata for one rendered row, so copied text matches the source
+/// instead of the screen (no wrap breaks, gutters or indentation).
+#[derive(Debug, Clone, Default)]
+struct RowMeta {
+    /// Display column where the text starts.
+    content_col: usize,
+    join: Join,
+    /// Text copied in place of the rendered row (code fences, rules).
+    copy_as: Option<String>,
+}
+
+impl RowMeta {
+    fn text(content_col: usize, join: Join) -> Self {
+        Self {
+            content_col,
+            join,
+            copy_as: None,
+        }
+    }
+
+    fn copy_as(text: impl Into<String>) -> Self {
+        Self {
+            copy_as: Some(text.into()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Rendered lines with their copy metadata.
+#[derive(Default)]
+struct Rows {
+    lines: Vec<Line<'static>>,
+    meta: Vec<RowMeta>,
+}
+
+impl Rows {
+    fn push(&mut self, line: Line<'static>, meta: RowMeta) {
+        self.lines.push(line);
+        self.meta.push(meta);
+    }
+
+    fn append(&mut self, mut other: Rows) {
+        self.lines.append(&mut other.lines);
+        self.meta.append(&mut other.meta);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.lines.truncate(len);
+        self.meta.truncate(len);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +314,7 @@ impl App {
             project_root,
             user_backlog: VecDeque::new(),
             show_reasoning: false,
+            show_help: false,
             run_started: None,
             spinner_frame: 0,
             notice: None,
@@ -217,8 +325,15 @@ impl App {
             render_cache: RefCell::new(Vec::new()),
             chat_area: Cell::new(Rect::default()),
             tools_area: Cell::new(Rect::default()),
+            input_box: Cell::new(Rect::default()),
+            input_area: Cell::new(Rect::default()),
+            input_scroll: Cell::new(0),
             max_scroll: Cell::new(0),
+            total_lines: Cell::new(0),
+            view_height: Cell::new(0),
+            message_starts: RefCell::new(Vec::new()),
             visible_plain: RefCell::new(Vec::new()),
+            visible_meta: RefCell::new(Vec::new()),
         };
         app.push_line(
             format!(
@@ -266,6 +381,9 @@ impl App {
     }
 
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
+        if !self.is_selecting && self.selection_start.is_some() {
+            self.clear_selection();
+        }
         match event {
             AgentEvent::Thinking(text) => {
                 self.status = "Thinking".into();
@@ -468,10 +586,11 @@ impl App {
         self.is_selecting = false;
     }
 
-    /// Copy the selected chat text to the clipboard. Returns true if something was copied.
-    pub fn copy_selection(&mut self) -> bool {
+    /// The selected chat text as it appears in the source message: soft
+    /// wraps are rejoined and gutters/indentation are left out.
+    fn selection_text(&self) -> String {
         let (Some(start), Some(end)) = (self.selection_start, self.selection_end) else {
-            return false;
+            return String::new();
         };
         let area = self.chat_area.get();
         let (p1, p2) = if (start.1, start.0) <= (end.1, end.0) {
@@ -479,32 +598,53 @@ impl App {
         } else {
             (end, start)
         };
-
-        let text = {
-            let visible = self.visible_plain.borrow();
-            if visible.is_empty() {
-                String::new()
-            } else {
-                let row = |y: u16| (y.saturating_sub(area.y) as usize).min(visible.len() - 1);
-                let col = |x: u16| x.saturating_sub(area.x) as usize;
-                let (r1, r2) = (row(p1.1), row(p2.1));
-                let mut out = Vec::new();
-                for (idx, line) in visible.iter().enumerate().take(r2 + 1).skip(r1) {
-                    let from = if idx == r1 { col(p1.0) } else { 0 };
-                    let to = if idx == r2 { col(p2.0) + 1 } else { usize::MAX };
-                    out.push(slice_columns(line, from, to));
+        let visible = self.visible_plain.borrow();
+        let meta = self.visible_meta.borrow();
+        if visible.is_empty() {
+            return String::new();
+        }
+        let row = |y: u16| (y.saturating_sub(area.y) as usize).min(visible.len() - 1);
+        let col = |x: u16| x.saturating_sub(area.x) as usize;
+        let (r1, r2) = (row(p1.1), row(p2.1));
+        let mut out = String::new();
+        for idx in r1..=r2 {
+            let m = meta.get(idx).cloned().unwrap_or_default();
+            if idx > r1 {
+                match m.join {
+                    Join::NewLine => out.push('\n'),
+                    Join::Space => out.push(' '),
+                    Join::Glued => {}
                 }
-                out.join("\n").trim().to_string()
             }
-        };
+            match m.copy_as {
+                Some(text) => out.push_str(&text),
+                None => {
+                    let from = if idx == r1 {
+                        col(p1.0).max(m.content_col)
+                    } else {
+                        m.content_col
+                    };
+                    let to = if idx == r2 { col(p2.0) + 1 } else { usize::MAX };
+                    out.push_str(slice_columns(&visible[idx], from, to).trim_end());
+                }
+            }
+        }
+        out.trim_matches('\n').trim_end().to_string()
+    }
 
-        self.clear_selection();
+    /// Copy the selected chat text to the clipboard. Returns true if something
+    /// was copied. With `clear`, the highlight is removed afterwards.
+    pub fn copy_selection(&mut self, clear: bool) -> bool {
+        let text = self.selection_text();
+        if clear {
+            self.clear_selection();
+        }
         if text.is_empty() {
             return false;
         }
         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
             Ok(()) => {
-                self.notify("Copied selection");
+                self.notify("Copied — Esc clears the highlight");
                 true
             }
             Err(_) => {
@@ -512,6 +652,76 @@ impl App {
                 false
             }
         }
+    }
+
+    fn copy_tool_output(&mut self) {
+        let Some(entry) = self.tool_log.iter().rev().nth(self.selected_tool_index) else {
+            return;
+        };
+        let text = clean_paths(&entry.output, &self.project_root);
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+            Ok(()) => self.notify(format!("Copied {} output", entry.name)),
+            Err(_) => self.notify("Clipboard unavailable"),
+        }
+    }
+
+    /// A key that arrived as part of a paste burst. Returns false for keys
+    /// that should keep their normal meaning.
+    fn paste_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
+        if modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) {
+            return false;
+        }
+        match key {
+            KeyCode::Enter => self.insert_text("\n"),
+            KeyCode::Tab => self.insert_text("    "),
+            KeyCode::Char(c) => self.insert_text(&c.to_string()),
+            _ => return false,
+        }
+        self.active_panel = ActivePanel::Chat;
+        self.history_pos = None;
+        self.clear_selection();
+        true
+    }
+
+    /// Place the input cursor under a mouse click.
+    fn click_input(&mut self, column: u16, row: u16) {
+        let area = self.input_area.get();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let row = row.clamp(area.y, area.y + area.height - 1);
+        let column = column.clamp(area.x, area.x + area.width - 1);
+        let target_row = (row - area.y) as usize + self.input_scroll.get();
+        let target_col = (column - area.x) as usize;
+        self.cursor_pos = cursor_at(&self.input, area.width as usize, target_row, target_col);
+        self.active_panel = ActivePanel::Chat;
+        self.clear_selection();
+    }
+
+    /// Scroll so the previous (dir < 0) or next message starts at the top.
+    fn jump_message(&mut self, dir: isize) {
+        let starts = self.message_starts.borrow().clone();
+        let total = self.total_lines.get();
+        let view = self.view_height.get();
+        let max = self.max_scroll.get();
+        let top = total.saturating_sub(view + self.chat_scroll.min(max));
+        let target = if dir < 0 {
+            starts
+                .iter()
+                .rev()
+                .find(|&&s| s < top)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            match starts.iter().find(|&&s| s > top) {
+                Some(&s) => s,
+                None => {
+                    self.chat_scroll = 0;
+                    return;
+                }
+            }
+        };
+        self.chat_scroll = total.saturating_sub(view + target).min(max);
     }
 
     fn copy_transcript(&mut self) {
@@ -549,6 +759,28 @@ impl App {
         if key != KeyCode::Char('c') || !ctrl {
             self.quit_armed_at = None;
         }
+        // Any key other than copy/Esc drops a finished selection highlight.
+        if self.selection_start.is_some()
+            && !self.is_selecting
+            && !(ctrl && key == KeyCode::Char('c'))
+            && key != KeyCode::Esc
+        {
+            self.clear_selection();
+        }
+
+        if self.show_help {
+            if matches!(
+                key,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) | KeyCode::Char('q' | '?')
+            ) {
+                self.show_help = false;
+            }
+            return None;
+        }
+        if key == KeyCode::F(1) || (key == KeyCode::Char('?') && self.input.is_empty()) {
+            self.show_help = true;
+            return None;
+        }
 
         // Tool details overlay
         if self.show_tool_details {
@@ -556,6 +788,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.show_tool_details = false
                 }
+                KeyCode::Char('c') => self.copy_tool_output(),
                 KeyCode::Up => {
                     self.tool_details_scroll = self.tool_details_scroll.saturating_sub(1)
                 }
@@ -600,6 +833,7 @@ impl App {
                 }
                 KeyCode::Home => self.selected_tool_index = 0,
                 KeyCode::End => self.selected_tool_index = last,
+                KeyCode::Char('c') => self.copy_tool_output(),
                 KeyCode::Enter if !self.tool_log.is_empty() => {
                     self.show_tool_details = true;
                     self.tool_details_scroll = 0;
@@ -612,7 +846,7 @@ impl App {
         match key {
             KeyCode::Char('c') if ctrl => {
                 if self.selection_start.is_some() {
-                    self.copy_selection();
+                    self.copy_selection(true);
                 } else if !self.input.is_empty() {
                     self.set_input(String::new());
                 } else if self.is_processing {
@@ -727,6 +961,8 @@ impl App {
             KeyCode::End if ctrl => self.chat_scroll = 0,
             KeyCode::Home => self.cursor_pos = 0,
             KeyCode::End => self.cursor_pos = char_count(&self.input),
+            KeyCode::Up if alt => self.jump_message(-1),
+            KeyCode::Down if alt => self.jump_message(1),
             KeyCode::Up if shift => self.scroll_chat(1),
             KeyCode::Down if shift => self.scroll_chat(-1),
             KeyCode::Up => {
@@ -845,6 +1081,11 @@ impl App {
 
     /// Wrapped, styled lines for one message (cached by revision and width).
     fn message_lines(&self, idx: usize, width: usize) -> Vec<Line<'static>> {
+        self.message_rows(idx, width).0
+    }
+
+    /// Lines plus per-row copy metadata for one message.
+    fn message_rows(&self, idx: usize, width: usize) -> (Vec<Line<'static>>, Vec<RowMeta>) {
         let line = &self.chat_lines[idx];
         let expanded = self.show_reasoning;
         {
@@ -855,7 +1096,7 @@ impl App {
                     && c.expanded == expanded
                     && !(self.is_thinking && idx + 1 == self.chat_lines.len())
                 {
-                    return c.lines.clone();
+                    return (c.lines.clone(), c.meta.clone());
                 }
             }
         }
@@ -870,10 +1111,14 @@ impl App {
         } else {
             label.to_string()
         };
-        let mut lines = vec![Line::from(Span::styled(
-            label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ))];
+        let mut rows = Rows::default();
+        rows.push(
+            Line::from(Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )),
+            RowMeta::default(),
+        );
         let body_color = match line.style {
             LineStyle::User => self.theme.fg,
             LineStyle::Assistant => self.theme.assistant_color,
@@ -881,16 +1126,19 @@ impl App {
             _ => color,
         };
         let mut body = render_markdown(&line.content, width, body_color, line.style, &self.theme);
-        if line.style == LineStyle::Thinking && !expanded && !live && body.len() > 2 {
-            let hidden = body.len() - 2;
+        if line.style == LineStyle::Thinking && !expanded && !live && body.lines.len() > 2 {
+            let hidden = body.lines.len() - 2;
             body.truncate(2);
-            body.push(Line::from(Span::styled(
-                format!("  … {hidden} more lines (Ctrl+T to expand)"),
-                Style::default().fg(self.theme.dim_color),
-            )));
+            body.push(
+                Line::from(Span::styled(
+                    format!("  … {hidden} more lines (Ctrl+T to expand)"),
+                    Style::default().fg(self.theme.dim_color),
+                )),
+                RowMeta::copy_as(""),
+            );
         }
-        lines.extend(body);
-        lines.push(Line::default());
+        rows.append(body);
+        rows.push(Line::default(), RowMeta::default());
 
         let mut cache = self.render_cache.borrow_mut();
         if cache.len() < self.chat_lines.len() {
@@ -900,9 +1148,10 @@ impl App {
             rev: line.rev,
             width,
             expanded,
-            lines: lines.clone(),
+            lines: rows.lines.clone(),
+            meta: rows.meta.clone(),
         });
-        lines
+        (rows.lines, rows.meta)
     }
 }
 
@@ -959,7 +1208,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Min(4),
             Constraint::Length(input_rows + 2),
             Constraint::Length(1),
@@ -990,9 +1239,74 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.show_tool_details {
         draw_tool_details(frame, area, app);
     }
+    if app.show_help {
+        draw_help(frame, area, app);
+    }
     if let (Some(start), Some(end)) = (app.selection_start, app.selection_end) {
         highlight_selection(frame, start, end, app.chat_area.get());
     }
+}
+
+fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let height = (KEY_HELP.len() as u16 + 4).min(area.height);
+    let width = 66.min(area.width);
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let lines: Vec<Line> = KEY_HELP
+        .iter()
+        .map(|(keys, action)| {
+            Line::from(vec![
+                Span::styled(format!("{keys:<24}"), Style::default().fg(theme.fg)),
+                Span::styled(*action, Style::default().fg(theme.dim_color)),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        " Keys ",
+                        Style::default()
+                            .fg(theme.accent_color)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .title_bottom(Span::styled(
+                        " Esc to close ",
+                        Style::default().fg(theme.dim_color),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border_color))
+                    .padding(Padding::new(2, 2, 1, 0)),
+            )
+            .style(Style::default().fg(theme.fg).bg(theme.bg)),
+        modal,
+    );
+}
+
+/// "Enter send · Esc stop" with the keys brighter than their actions.
+fn hint_line(pairs: &[(&str, &str)], theme: &Theme) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, action)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(
+                "  ·  ",
+                Style::default().fg(theme.border_color),
+            ));
+        }
+        spans.push(Span::styled(key.to_string(), Style::default().fg(theme.fg)));
+        spans.push(Span::styled(
+            format!(" {action}"),
+            Style::default().fg(theme.dim_color),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn highlight_selection(frame: &mut Frame, start: (u16, u16), end: (u16, u16), bounds: Rect) {
@@ -1002,8 +1316,8 @@ fn highlight_selection(frame: &mut Frame, start: (u16, u16), end: (u16, u16), bo
         (end, start)
     };
     let style = Style::default()
-        .bg(Color::Rgb(40, 60, 110))
-        .fg(Color::Rgb(240, 244, 255));
+        .bg(Color::Rgb(46, 56, 92))
+        .fg(Color::Rgb(240, 242, 248));
     let buffer = frame.buffer_mut();
     let right = bounds.x + bounds.width.saturating_sub(1);
     for row in p1.1.max(bounds.y)..=p2.1.min(bounds.y + bounds.height.saturating_sub(1)) {
@@ -1077,8 +1391,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ("●", theme.success_color)
     };
     let mut status = vec![
-        Span::styled(format!(" {indicator} "), Style::default().fg(color)),
-        Span::styled(app.status.clone(), Style::default().fg(color)),
+        Span::styled(format!("{indicator} "), Style::default().fg(color)),
+        Span::styled(app.status.clone(), Style::default().fg(theme.fg)),
     ];
     if let Some(started) = app.run_started.filter(|_| app.is_processing) {
         status.push(Span::styled(
@@ -1087,12 +1401,19 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    let header = Paragraph::new(Text::from(vec![Line::from(title), Line::from(status)])).block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(theme.border_color)),
-    );
-    frame.render_widget(header, area);
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(theme.border_color));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let status = Line::from(status);
+    let status_w = (status.width() as u16 + 1).min(inner.width / 2);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(status_w)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(Line::from(title)), cols[0]);
+    frame.render_widget(Paragraph::new(status).alignment(Alignment::Right), cols[1]);
 }
 
 fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
@@ -1110,6 +1431,7 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
 
     // Heights of every message (cached), then only the visible slice is cloned.
     let mut all: Vec<Line<'static>> = Vec::new();
+    let mut all_meta: Vec<RowMeta> = Vec::new();
     let mut extra: Vec<Line<'static>> = Vec::new();
     let heights: Vec<usize> = (0..app.chat_lines.len())
         .map(|i| app.message_lines(i, width).len())
@@ -1131,6 +1453,19 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
     let total: usize = heights.iter().sum::<usize>() + extra.len();
     let max_scroll = total.saturating_sub(view_height);
     app.max_scroll.set(max_scroll);
+    app.total_lines.set(total);
+    app.view_height.set(view_height);
+    {
+        let mut starts = app.message_starts.borrow_mut();
+        starts.clear();
+        let mut offset = 0;
+        for (line, h) in app.chat_lines.iter().zip(&heights) {
+            if matches!(line.style, LineStyle::User | LineStyle::Assistant) {
+                starts.push(offset);
+            }
+            offset += h;
+        }
+    }
     let scroll = app.chat_scroll.min(max_scroll);
     let start = total.saturating_sub(view_height + scroll);
     let end = (start + view_height).min(total);
@@ -1138,10 +1473,11 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
     let mut offset = 0;
     for (i, h) in heights.iter().enumerate() {
         if offset + h > start && offset < end {
-            let lines = app.message_lines(i, width);
+            let (lines, meta) = app.message_rows(i, width);
             let from = start.saturating_sub(offset);
             let to = (end - offset).min(*h);
             all.extend(lines[from..to].iter().cloned());
+            all_meta.extend(meta[from..to].iter().cloned());
         }
         offset += h;
         if offset >= end {
@@ -1157,8 +1493,33 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
+    all_meta.resize_with(all.len(), RowMeta::default);
+    *app.visible_meta.borrow_mut() = all_meta;
 
     frame.render_widget(Paragraph::new(Text::from(all)), inner);
+
+    if max_scroll > 0 {
+        let bar = Rect::new(
+            area.x + area.width.saturating_sub(1),
+            inner.y,
+            1,
+            inner.height,
+        );
+        let mut state = ScrollbarState::new(max_scroll)
+            .viewport_content_length(view_height)
+            .position(max_scroll - scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .track_style(Style::default().fg(theme.border_color))
+                .thumb_symbol("┃")
+                .thumb_style(Style::default().fg(theme.dim_color)),
+            bar,
+            &mut state,
+        );
+    }
 
     if scroll > 0 {
         let hint = format!(" ↓ {scroll} more ");
@@ -1217,7 +1578,7 @@ fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::styled(
             if focused {
-                "  ↑↓ select · Enter details · Esc back"
+                "  ↑↓ select · Enter details · c copy · Esc back"
             } else {
                 "  Tab to browse"
             },
@@ -1331,6 +1692,9 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    app.input_box.set(area);
+    app.input_area.set(inner);
+    app.input_scroll.set(0);
 
     if app.input.is_empty() {
         let placeholder = if app.is_processing {
@@ -1350,6 +1714,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let (rows, cursor_row, cursor_col) = layout_input(&app.input, app.cursor_pos, width);
     let height = inner.height as usize;
     let first = (cursor_row + 1).saturating_sub(height);
+    app.input_scroll.set(first);
     let lines: Vec<Line> = rows
         .iter()
         .skip(first)
@@ -1423,24 +1788,44 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             return;
         }
     }
-    let narrow = area.width < 90;
-    let help = if app.selection_start.is_some() {
-        " Ctrl+C copy · Esc clear selection"
+    let narrow = area.width < 100;
+    let pairs: &[(&str, &str)] = if app.selection_start.is_some() {
+        &[("Ctrl+C", "copy again"), ("Esc", "clear highlight")]
     } else if app.is_processing {
         if narrow {
-            " Esc stop · Enter queue · PgUp/PgDn scroll"
+            &[
+                ("Esc", "stop"),
+                ("Enter", "queue"),
+                ("PgUp/PgDn", "scroll"),
+                ("F1", "keys"),
+            ]
         } else {
-            " Esc stop · Enter queue a follow-up · PgUp/PgDn scroll · Ctrl+T reasoning · Ctrl+C stop"
+            &[
+                ("Esc", "stop"),
+                ("Enter", "queue a follow-up"),
+                ("PgUp/PgDn", "scroll"),
+                ("Ctrl+T", "reasoning"),
+                ("F1", "all keys"),
+            ]
         }
     } else if narrow {
-        " Enter send · ↑↓ history · PgUp/PgDn scroll · Ctrl+C quit"
+        &[
+            ("Enter", "send"),
+            ("↑↓", "history"),
+            ("PgUp/PgDn", "scroll"),
+            ("F1", "keys"),
+        ]
     } else {
-        " Enter send · Alt+Enter newline · ↑↓ history · PgUp/PgDn scroll · Tab activity · Ctrl+A copy chat · Ctrl+C quit"
+        &[
+            ("Enter", "send"),
+            ("Alt+Enter", "new line"),
+            ("↑↓", "history"),
+            ("/", "commands"),
+            ("Tab", "activity"),
+            ("F1", "all keys"),
+        ]
     };
-    frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(theme.dim_color)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(hint_line(pairs, theme)), area);
 }
 
 fn draw_approval(frame: &mut Frame, area: Rect, app: &App, info: &ApprovalInfo) {
@@ -1600,7 +1985,7 @@ fn draw_tool_details(frame: &mut Frame, area: Rect, app: &App) {
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     ))
                     .title_bottom(Span::styled(
-                        " ↑↓ PgUp/PgDn scroll · Esc close ",
+                        " ↑↓ PgUp/PgDn scroll · c copy output · Esc close ",
                         Style::default().fg(theme.dim_color),
                     ))
                     .borders(Borders::ALL)
@@ -1664,10 +2049,11 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<(Event, Instant)>();
     std::thread::spawn(move || {
         while let Ok(event) = event::read() {
-            if event_tx.send(event).is_err() {
+            // Timestamped at read time so paste bursts can be told from typing.
+            if event_tx.send((event, Instant::now())).is_err() {
                 break;
             }
         }
@@ -1675,6 +2061,7 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
 
     let mut dirty = true;
     let mut last_draw = Instant::now() - FRAME;
+    let mut last_key_at: Option<Instant> = None;
 
     let result: io::Result<()> = async {
         loop {
@@ -1700,10 +2087,13 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
                     }
                     dirty = true;
                 }
-                Some(event) = event_rx.recv() => {
+                Some((event, at)) = event_rx.recv() => {
                     dirty = true;
                     match event {
                         Event::Key(key) if key.kind != KeyEventKind::Release => {
+                            let burst = last_key_at
+                                .is_some_and(|t| at.saturating_duration_since(t) < PASTE_GAP);
+                            last_key_at = Some(at);
                             if app.approval_pending.is_some() {
                                 let answer = match key.code {
                                     KeyCode::Char('y' | 'Y') | KeyCode::Enter => Some(true),
@@ -1717,24 +2107,46 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
                                 }
                                 continue;
                             }
+                            // Newlines inside a pasted block stay in the input.
+                            if burst && app.paste_key(key.code, key.modifiers) {
+                                continue;
+                            }
                             if let Some(message) = app.handle_key(key.code, key.modifiers) {
                                 let _ = user_tx.send(message);
                             }
                         }
                         Event::Paste(text) => app.insert_text(&text.replace("\r\n", "\n")),
                         Event::Mouse(mouse) => {
-                            let tools = app.tools_area.get();
-                            let over_tools = tools.width > 0 && mouse.column >= tools.x;
+                            let inside = |r: Rect| {
+                                r.width > 0
+                                    && mouse.column >= r.x
+                                    && mouse.column < r.x + r.width
+                                    && mouse.row >= r.y
+                                    && mouse.row < r.y + r.height
+                            };
+                            let over_tools = inside(app.tools_area.get());
+                            let chat = app.chat_area.get();
+                            // Include the chat's left padding so a drag can start at the margin.
+                            let chat_hit = Rect::new(
+                                chat.x.saturating_sub(2),
+                                chat.y,
+                                chat.width + 2,
+                                chat.height,
+                            );
                             match mouse.kind {
                                 MouseEventKind::Down(MouseButton::Left) => {
                                     if over_tools {
                                         app.active_panel = ActivePanel::Activity;
                                         app.clear_selection();
-                                    } else {
+                                    } else if inside(app.input_box.get()) {
+                                        app.click_input(mouse.column, mouse.row);
+                                    } else if inside(chat_hit) {
                                         app.active_panel = ActivePanel::Chat;
                                         app.selection_start = Some((mouse.column, mouse.row));
                                         app.selection_end = Some((mouse.column, mouse.row));
                                         app.is_selecting = true;
+                                    } else {
+                                        app.clear_selection();
                                     }
                                 }
                                 MouseEventKind::Down(MouseButton::Right) => {
@@ -1749,7 +2161,8 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
                                     app.selection_end = Some((mouse.column, mouse.row));
                                     app.is_selecting = false;
                                     if app.selection_start != app.selection_end {
-                                        app.copy_selection();
+                                        // Copy right away but keep the highlight visible.
+                                        app.copy_selection(false);
                                     } else {
                                         app.clear_selection();
                                     }
@@ -1814,17 +2227,11 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
 
 // ── Markdown-aware message rendering ──────────────────────────────────────
 
-fn render_markdown(
-    text: &str,
-    width: usize,
-    color: Color,
-    kind: LineStyle,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let mut result = Vec::new();
+fn render_markdown(text: &str, width: usize, color: Color, kind: LineStyle, theme: &Theme) -> Rows {
+    let mut rows = Rows::default();
     let mut in_code = false;
-    let code_bg = Color::Rgb(25, 28, 40);
-    let rule = Color::Rgb(70, 76, 96);
+    let code_bg = Color::Rgb(24, 25, 29);
+    let rule = theme.border_color;
     let width = width.max(8);
     let base = if kind == LineStyle::Thinking {
         Style::default().fg(color).add_modifier(Modifier::ITALIC)
@@ -1844,24 +2251,38 @@ fn render_markdown(
             } else {
                 "  ╰─".to_string()
             };
-            result.push(Line::from(Span::styled(label, Style::default().fg(rule))));
+            let fence = if in_code {
+                format!("```{lang}")
+            } else {
+                "```".to_string()
+            };
+            rows.push(
+                Line::from(Span::styled(label, Style::default().fg(rule))),
+                RowMeta::copy_as(fence),
+            );
             continue;
         }
 
         if in_code {
-            let code_style = Style::default().fg(Color::Rgb(190, 200, 220)).bg(code_bg);
+            let code_style = Style::default().fg(Color::Rgb(214, 216, 220)).bg(code_bg);
             let expanded = raw.replace('\t', "    ");
-            for chunk in hard_wrap(&expanded, width.saturating_sub(4)) {
-                result.push(Line::from(vec![
-                    Span::styled("  │ ", Style::default().fg(rule)),
-                    Span::styled(chunk, code_style),
-                ]));
+            for (i, chunk) in hard_wrap(&expanded, width.saturating_sub(4))
+                .into_iter()
+                .enumerate()
+            {
+                rows.push(
+                    Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(rule)),
+                        Span::styled(chunk, code_style),
+                    ]),
+                    RowMeta::text(4, if i == 0 { Join::NewLine } else { Join::Glued }),
+                );
             }
             continue;
         }
 
         if trimmed.is_empty() {
-            result.push(Line::default());
+            rows.push(Line::default(), RowMeta::default());
             continue;
         }
 
@@ -1871,33 +2292,45 @@ fn render_markdown(
                 || trimmed.chars().all(|c| c == '*')
                 || trimmed.chars().all(|c| c == '_'))
         {
-            result.push(Line::from(Span::styled(
-                format!("  {}", "─".repeat(width.saturating_sub(2).min(60))),
-                Style::default().fg(rule),
-            )));
+            rows.push(
+                Line::from(Span::styled(
+                    format!("  {}", "─".repeat(width.saturating_sub(2).min(60))),
+                    Style::default().fg(rule),
+                )),
+                RowMeta::copy_as("---"),
+            );
             continue;
         }
 
         // Tables are shown verbatim (wrapping would break the columns).
         if trimmed.starts_with('|') {
-            for chunk in hard_wrap(trimmed, width.saturating_sub(2)) {
-                result.push(Line::from(Span::styled(
-                    format!("  {chunk}"),
-                    Style::default().fg(color),
-                )));
+            for (i, chunk) in hard_wrap(trimmed, width.saturating_sub(2))
+                .into_iter()
+                .enumerate()
+            {
+                rows.push(
+                    Line::from(Span::styled(
+                        format!("  {chunk}"),
+                        Style::default().fg(color),
+                    )),
+                    RowMeta::text(2, if i == 0 { Join::NewLine } else { Join::Glued }),
+                );
             }
             continue;
         }
 
         let indent = raw.len() - trimmed.len();
         let pad = " ".repeat(2 + indent.min(12));
-        let (prefix, content, style) = if let Some(h) = trimmed.strip_prefix("### ") {
-            ("  ".to_string(), h, base.add_modifier(Modifier::BOLD))
+        // `lead`: where copied text starts on the first row (bullets and
+        // numbers are kept, indentation and quote bars are not).
+        let (prefix, content, style, lead) = if let Some(h) = trimmed.strip_prefix("### ") {
+            ("  ".to_string(), h, base.add_modifier(Modifier::BOLD), 2)
         } else if let Some(h) = trimmed.strip_prefix("## ") {
             (
                 "  ".to_string(),
                 h,
                 base.fg(theme.accent_color).add_modifier(Modifier::BOLD),
+                2,
             )
         } else if let Some(h) = trimmed.strip_prefix("# ") {
             (
@@ -1905,31 +2338,43 @@ fn render_markdown(
                 h,
                 base.fg(theme.accent_color)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                2,
             )
         } else if let Some(q) = trimmed.strip_prefix("> ") {
+            let prefix = format!("{pad}▏ ");
+            let lead = prefix.width();
             (
-                format!("{pad}▏ "),
+                prefix,
                 q,
-                base.fg(Color::Rgb(140, 150, 170))
-                    .add_modifier(Modifier::ITALIC),
+                base.fg(theme.dim_color).add_modifier(Modifier::ITALIC),
+                lead,
             )
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
             let bullet = if indent >= 2 { "◦" } else { "•" };
-            (format!("{pad}{bullet} "), item, base)
+            (format!("{pad}{bullet} "), item, base, pad.width())
         } else if let Some((num, rest)) = split_numbered(trimmed) {
-            (format!("{pad}{num}. "), rest, base)
+            (format!("{pad}{num}. "), rest, base, pad.width())
         } else {
-            (pad.clone(), trimmed, base)
+            (pad.clone(), trimmed, base, pad.width())
         };
 
         let cont = " ".repeat(prefix.width());
+        let cont_w = cont.width();
         let spans = parse_inline_markdown(content, style, kind);
-        result.extend(wrap_spans(spans, width, prefix, cont));
+        for (i, (line, join)) in wrap_spans(spans, width, prefix, cont)
+            .into_iter()
+            .enumerate()
+        {
+            rows.push(
+                line,
+                RowMeta::text(if i == 0 { lead } else { cont_w }, join),
+            );
+        }
     }
-    result
+    rows
 }
 
 /// "12. item" → ("12", "item")
@@ -1954,8 +2399,8 @@ fn parse_inline_markdown(text: &str, base_style: Style, _kind: LineStyle) -> Vec
     let len = chars.len();
     let mut i = 0;
     let code_style = Style::default()
-        .fg(Color::Rgb(230, 180, 80))
-        .bg(Color::Rgb(35, 38, 55));
+        .fg(Color::Rgb(214, 186, 150))
+        .bg(Color::Rgb(30, 31, 36));
 
     let flush = |current: &mut String, spans: &mut Vec<Span<'static>>| {
         if !current.is_empty() {
@@ -2019,23 +2464,29 @@ fn parse_inline_markdown(text: &str, base_style: Style, _kind: LineStyle) -> Vec
 }
 
 /// Greedy word wrap that keeps span styles and measures display width
-/// (CJK and emoji take two columns).
+/// (CJK and emoji take two columns). Each row says how it joins the row
+/// above, so copying can undo the wrapping.
 fn wrap_spans(
     spans: Vec<Span<'static>>,
     width: usize,
     first_prefix: String,
     cont_prefix: String,
-) -> Vec<Line<'static>> {
+) -> Vec<(Line<'static>, Join)> {
     let width = width.max(first_prefix.width() + 4);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut lines: Vec<(Line<'static>, Join)> = Vec::new();
     let mut current: Vec<Span<'static>> = vec![Span::raw(first_prefix.clone())];
+    let mut current_join = Join::NewLine;
     let mut cur_w = first_prefix.width();
     let mut line_has_text = false;
     let mut pending_space: Option<Style> = None;
 
-    let new_line = |lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>| {
-        lines.push(Line::from(std::mem::take(current)));
+    let new_line = |lines: &mut Vec<(Line<'static>, Join)>,
+                    current: &mut Vec<Span<'static>>,
+                    join: &mut Join,
+                    next: Join| {
+        lines.push((Line::from(std::mem::take(current)), *join));
         current.push(Span::raw(cont_prefix.clone()));
+        *join = next;
     };
 
     for span in spans {
@@ -2057,7 +2508,13 @@ fn wrap_spans(
                 current.push(Span::styled(piece.to_string(), style));
                 cur_w += w;
             } else if w <= width.saturating_sub(cont_prefix.width()) {
-                new_line(&mut lines, &mut current);
+                // The break replaced a space, unless the word continued a styled run.
+                let next = if pending_space.is_some() {
+                    Join::Space
+                } else {
+                    Join::Glued
+                };
+                new_line(&mut lines, &mut current, &mut current_join, next);
                 cur_w = cont_prefix.width();
                 current.push(Span::styled(piece.to_string(), style));
                 cur_w += w;
@@ -2073,7 +2530,7 @@ fn wrap_spans(
                     let cw = ch.width().unwrap_or(0);
                     if cur_w + cw > width {
                         current.push(Span::styled(std::mem::take(&mut buf), style));
-                        new_line(&mut lines, &mut current);
+                        new_line(&mut lines, &mut current, &mut current_join, Join::Glued);
                         cur_w = cont_prefix.width();
                     }
                     buf.push(ch);
@@ -2085,9 +2542,36 @@ fn wrap_spans(
         }
     }
     if line_has_text || lines.is_empty() {
-        lines.push(Line::from(current));
+        lines.push((Line::from(current), current_join));
     }
     lines
+}
+
+/// Cursor index for a click at (`row`, `col`) of the wrapped input,
+/// mirroring `layout_input`.
+fn cursor_at(input: &str, width: usize, row: usize, col: usize) -> usize {
+    let width = width.max(1);
+    let (mut r, mut c) = (0usize, 0usize);
+    for (i, ch) in input.chars().enumerate() {
+        if ch == '\n' {
+            if r == row {
+                return i;
+            }
+            r += 1;
+            c = 0;
+            continue;
+        }
+        let cw = ch.width().unwrap_or(0);
+        if c + cw > width {
+            r += 1;
+            c = 0;
+        }
+        if r > row || (r == row && c + cw > col) {
+            return i;
+        }
+        c += cw;
+    }
+    input.chars().count()
 }
 
 /// Split into alternating runs of whitespace and non-whitespace.
@@ -2336,7 +2820,10 @@ mod tests {
             Style::default(),
             LineStyle::Assistant,
         );
-        let lines = wrap_spans(spans, 12, "  ".into(), "  ".into());
+        let lines: Vec<Line> = wrap_spans(spans, 12, "  ".into(), "  ".into())
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
         for line in &lines {
             assert!(line.width() <= 12, "line too wide: {line:?}");
         }
@@ -2385,6 +2872,92 @@ mod tests {
         assert_eq!(app.user_backlog.len(), 1);
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.cancel_requested);
+    }
+
+    #[test]
+    fn copied_selection_matches_the_source_text() {
+        let mut app = App::new("m", std::path::PathBuf::new());
+        app.add_user_message("hi".into());
+        app.handle_agent_event(AgentEvent::Content(
+            "This first paragraph is long enough that it has to wrap onto more than one row.\n\n```rust\nfn main() {\n    println!(\"x\");\n}\n```\n- a bullet".into(),
+        ));
+        app.handle_agent_event(AgentEvent::Done { usage: None });
+        render(&app, 60, 40);
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((59, 39));
+        let text = app.selection_text();
+        assert!(
+            text.contains(
+                "This first paragraph is long enough that it has to wrap onto more than one row."
+            ),
+            "wrapped paragraph was not rejoined:\n{text}"
+        );
+        assert!(
+            text.contains("```rust\nfn main() {\n    println!(\"x\");\n}\n```"),
+            "code block lost its shape:\n{text}"
+        );
+        assert!(text.contains("\n• a bullet"), "bullet missing:\n{text}");
+        assert!(!text.contains("│"), "gutter leaked into the copy:\n{text}");
+    }
+
+    #[test]
+    fn pasted_newlines_stay_in_the_input() {
+        let mut app = App::new("m", std::path::PathBuf::new());
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(app.paste_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.paste_key(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(app.paste_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "a\nb    ");
+        assert!(!app.paste_key(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert!(!app.is_processing);
+    }
+
+    #[test]
+    fn clicking_the_input_moves_the_cursor() {
+        assert_eq!(cursor_at("hello world", 20, 0, 3), 3);
+        assert_eq!(cursor_at("hello world", 20, 0, 50), 11);
+        assert_eq!(cursor_at("ab\ncd", 20, 1, 1), 4);
+        assert_eq!(cursor_at("ab\ncd", 20, 0, 9), 2);
+        // Wrapped at width 4: "abcd" / "ef"
+        assert_eq!(cursor_at("abcdef", 4, 1, 1), 5);
+    }
+
+    #[test]
+    fn alt_arrows_jump_between_messages() {
+        let mut app = App::new("m", std::path::PathBuf::new());
+        for i in 0..6 {
+            app.add_user_message(format!("question {i}"));
+            app.handle_agent_event(AgentEvent::Content(format!("answer {i}\n").repeat(6)));
+            app.handle_agent_event(AgentEvent::Done { usage: None });
+        }
+        render(&app, 70, 20);
+        assert_eq!(app.chat_scroll, 0);
+        app.handle_key(KeyCode::Up, KeyModifiers::ALT);
+        let after_one = app.chat_scroll;
+        assert!(after_one > 0);
+        render(&app, 70, 20);
+        app.handle_key(KeyCode::Up, KeyModifiers::ALT);
+        assert!(app.chat_scroll > after_one);
+        render(&app, 70, 20);
+        app.handle_key(KeyCode::Down, KeyModifiers::ALT);
+        assert_eq!(app.chat_scroll, after_one);
+    }
+
+    #[test]
+    fn help_overlay_toggles_and_swallows_keys() {
+        let mut app = App::new("m", std::path::PathBuf::new());
+        app.handle_key(KeyCode::F(1), KeyModifiers::NONE);
+        assert!(app.show_help);
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.input.is_empty());
+        assert!(render(&app, 120, 30).contains("toggle this help"));
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.show_help);
+        // `?` opens help only when it isn't part of a message.
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(app.input, "a?");
+        assert!(!app.show_help);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Theme — Color system for the TUI
 // ===========================================================================
 
@@ -23,20 +23,21 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
+        // Neutral greys with one blue accent (matches the desktop app).
         Self {
-            bg: Color::Rgb(15, 17, 26),                 // Deep navy
-            fg: Color::Rgb(220, 225, 235),              // Light gray
-            accent_color: Color::Rgb(0, 210, 190),      // Teal/cyan
-            border_color: Color::Rgb(60, 65, 80),       // Subtle border
-            user_color: Color::Rgb(100, 180, 255),      // Blue
-            assistant_color: Color::Rgb(200, 220, 240), // Light blue-white
-            thinking_color: Color::Rgb(160, 130, 210),  // Purple
-            tool_color: Color::Rgb(255, 190, 60),       // Amber
-            success_color: Color::Rgb(80, 220, 120),    // Green
-            error_color: Color::Rgb(255, 90, 90),       // Red
-            file_color: Color::Rgb(120, 210, 160),      // Mint green
-            input_color: Color::Rgb(230, 235, 245),     // Bright white
-            dim_color: Color::Rgb(90, 95, 110),         // Dimmed text
+            bg: Color::Rgb(17, 18, 20),
+            fg: Color::Rgb(228, 229, 231),
+            accent_color: Color::Rgb(122, 146, 240),
+            border_color: Color::Rgb(48, 50, 56),
+            user_color: Color::Rgb(184, 188, 196),
+            assistant_color: Color::Rgb(214, 216, 220),
+            thinking_color: Color::Rgb(140, 144, 152),
+            tool_color: Color::Rgb(224, 175, 84),
+            success_color: Color::Rgb(94, 194, 135),
+            error_color: Color::Rgb(232, 98, 98),
+            file_color: Color::Rgb(110, 190, 150),
+            input_color: Color::Rgb(236, 237, 239),
+            dim_color: Color::Rgb(107, 110, 118),
         }
     }
 }

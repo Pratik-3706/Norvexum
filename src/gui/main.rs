@@ -9,6 +9,7 @@
 // ===========================================================================
 
 mod app;
+mod style;
 
 // Re-export the shared library modules so `crate::agent`, `crate::config`, …
 // keep resolving inside `app.rs`.

@@ -1,6 +1,7 @@
 use crate::agent::AgentEvent;
 use crate::config::Settings;
 use crate::config::providers::build_registry;
+use crate::style::{self, Palette};
 use notify::{RecursiveMode, Result as NotifyResult, Watcher};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
@@ -144,6 +145,21 @@ pub struct GuiApp {
     probing_in_progress: bool,
     capabilities_rx: Option<std_mpsc::Receiver<CapabilitiesUpdate>>,
     capabilities_tx: Option<std_mpsc::Sender<CapabilitiesUpdate>>,
+
+    // Presentation-only state
+    applied_theme: Option<bool>,
+    right_tab: RightTab,
+    file_filter: String,
+    show_shortcuts: bool,
+    focus_composer: bool,
+    scroll_to_bottom: bool,
+    chat_max_offset: f32,
+    settings_section: SettingsSection,
+    pending_delete_session: Option<String>,
+    expanded_dirs: std::collections::HashSet<String>,
+    file_tree: FileTree,
+    file_tree_filter: String,
+    file_tree_dirty: bool,
 }
 
 struct CapabilitiesUpdate {
@@ -260,23 +276,12 @@ fn draw_layered_logo_loader(
     }
 }
 
-fn attachment_button(ui: &mut egui::Ui, dark_mode: bool) -> egui::Response {
+fn attachment_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
-    let icon_alpha = if response.hovered() { 1.0 } else { 0.55 };
-    let icon_color = if dark_mode {
-        egui::Color32::from_rgb(167, 139, 250).linear_multiply(icon_alpha)
-    } else {
-        egui::Color32::from_rgb(91, 33, 182).linear_multiply(icon_alpha)
-    };
-
-    // Subtle hover glow circle
     if response.hovered() {
-        ui.painter().circle_filled(
-            rect.center(),
-            14.0,
-            egui::Color32::from_rgba_premultiplied(109, 40, 217, 25),
-        );
+        ui.painter().rect_filled(rect, 6.0, p.hover);
     }
+    let icon_color = if response.hovered() { p.text } else { p.dim };
 
     let center = rect.center();
     let angle = -0.65_f32;
@@ -308,10 +313,10 @@ fn attachment_button(ui: &mut egui::Ui, dark_mode: bool) -> egui::Response {
     .collect();
     ui.painter().add(egui::Shape::line(
         points,
-        egui::Stroke::new(1.8, icon_color),
+        egui::Stroke::new(1.5, icon_color),
     ));
 
-    response.on_hover_text("Attach a file")
+    response.on_hover_text("Attach a file (or drop one on the window)")
 }
 
 fn get_secure_key(name: &str) -> Option<String> {
@@ -372,40 +377,50 @@ fn delete_secure_key(name: &str) {
 }
 
 fn list_workspace_files(root: &std::path::Path) -> Vec<String> {
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        ".norvexum",
+        "target",
+        "node_modules",
+        "build",
+        "dist",
+        "deps",
+        ".agents",
+        ".gemini",
+        "__pycache__",
+        ".venv",
+        "venv",
+    ];
+    const MAX_DEPTH: usize = 8;
+    const MAX_FILES: usize = 5000;
     let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root) {
+    let mut stack = vec![(root.to_path_buf(), String::new(), 0usize)];
+    while let Some((dir, prefix, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if !name.starts_with('.') && name != "norvexum.log" {
-                        files.push(name.to_string());
-                    }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if file_type.is_dir() {
+                if depth + 1 < MAX_DEPTH && !SKIP_DIRS.contains(&name.as_str()) {
+                    stack.push((entry.path(), rel, depth + 1));
                 }
-            } else if path.is_dir() {
-                let dir_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if dir_name != ".git"
-                    && dir_name != ".norvexum"
-                    && dir_name != "target"
-                    && dir_name != "node_modules"
-                    && dir_name != "build"
-                    && dir_name != "dist"
-                    && dir_name != "deps"
-                    && dir_name != ".agents"
-                    && dir_name != ".gemini"
-                {
-                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                        for sub_entry in sub_entries.flatten() {
-                            let sub_path = sub_entry.path();
-                            if sub_path.is_file() {
-                                if let Some(sub_name) =
-                                    sub_path.file_name().and_then(|s| s.to_str())
-                                {
-                                    files.push(format!("{}/{}", dir_name, sub_name));
-                                }
-                            }
-                        }
-                    }
+            } else if file_type.is_file() {
+                if depth == 0 && (name.starts_with('.') || name == "norvexum.log") {
+                    continue;
+                }
+                files.push(rel);
+                if files.len() >= MAX_FILES {
+                    files.sort();
+                    return files;
                 }
             }
         }
@@ -464,6 +479,7 @@ impl GuiApp {
         let middle_layer_tex = bytes_to_texture(&cc.egui_ctx, "middle_layer", MIDDLE_LAYER_BYTES);
         let top_layer_tex = bytes_to_texture(&cc.egui_ctx, "top_layer", TOP_LAYER_BYTES);
         let logo_tex = bytes_to_texture(&cc.egui_ctx, "logo", LOGO_BYTES);
+        style::install_fonts(&cc.egui_ctx);
 
         // Sync process CWD with project_root on startup
         let _ = std::env::set_current_dir(&config.settings.project_root);
@@ -555,6 +571,19 @@ impl GuiApp {
             probing_in_progress: false,
             capabilities_rx: Some(capabilities_rx),
             capabilities_tx: Some(capabilities_tx),
+            applied_theme: None,
+            right_tab: RightTab::Changed,
+            file_filter: String::new(),
+            show_shortcuts: false,
+            focus_composer: true,
+            scroll_to_bottom: false,
+            chat_max_offset: 0.0,
+            settings_section: SettingsSection::General,
+            pending_delete_session: None,
+            expanded_dirs: std::collections::HashSet::new(),
+            file_tree: FileTree::default(),
+            file_tree_filter: String::new(),
+            file_tree_dirty: true,
         };
 
         app.load_capabilities_cache();
@@ -647,13 +676,8 @@ impl GuiApp {
     }
 
     fn draw_key_field(&mut self, ui: &mut egui::Ui, field_name: &str, label: &str) {
-        let label_color = if self.dark_mode {
-            egui::Color32::from_rgb(220, 225, 255)
-        } else {
-            egui::Color32::from_rgb(30, 41, 59)
-        };
-
-        ui.label(egui::RichText::new(label).color(label_color).strong());
+        let p = self.pal();
+        ui.label(egui::RichText::new(label).size(12.5).color(p.dim));
 
         let is_set = match field_name {
             "google_ai_api_key" => self.settings.google_ai_api_key.is_some(),
@@ -668,25 +692,27 @@ impl GuiApp {
 
         if is_set {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("••••••••")
-                        .color(egui::Color32::from_rgb(16, 185, 129))
-                        .strong(),
-                );
-                if ui.button("Clear").clicked() {
-                    delete_secure_key(field_name);
-                    match field_name {
-                        "google_ai_api_key" => self.settings.google_ai_api_key = None,
-                        "openai_api_key" => self.settings.openai_api_key = None,
-                        "anthropic_api_key" => self.settings.anthropic_api_key = None,
-                        "tavily_api_key" => self.settings.tavily_api_key = None,
-                        "aicredits_api_key" => self.settings.aicredits_api_key = None,
-                        "ocr_space_api_key" => self.settings.ocr_space_api_key = None,
-                        "pollinations_api_key" => self.settings.pollinations_api_key = None,
-                        _ => {}
+                style::dot(ui, p.success);
+                ui.label(egui::RichText::new("Saved").size(12.5).color(p.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if style::link_button(ui, "Remove", &p)
+                        .on_hover_text("Delete this key from the keyring")
+                        .clicked()
+                    {
+                        delete_secure_key(field_name);
+                        match field_name {
+                            "google_ai_api_key" => self.settings.google_ai_api_key = None,
+                            "openai_api_key" => self.settings.openai_api_key = None,
+                            "anthropic_api_key" => self.settings.anthropic_api_key = None,
+                            "tavily_api_key" => self.settings.tavily_api_key = None,
+                            "aicredits_api_key" => self.settings.aicredits_api_key = None,
+                            "ocr_space_api_key" => self.settings.ocr_space_api_key = None,
+                            "pollinations_api_key" => self.settings.pollinations_api_key = None,
+                            _ => {}
+                        }
+                        self.sync_settings();
                     }
-                    self.sync_settings();
-                }
+                });
             });
         } else {
             let mut val = match field_name {
@@ -702,17 +728,16 @@ impl GuiApp {
 
             let mut saved = false;
             ui.horizontal(|ui| {
-                let text_edit = egui::TextEdit::singleline(&mut val)
-                    .password(true)
-                    .text_color(if self.dark_mode {
-                        egui::Color32::WHITE
-                    } else {
-                        egui::Color32::BLACK
-                    })
-                    .desired_width(120.0);
-
-                ui.add(text_edit);
-                if ui.button("Save").clicked() {
+                let field_w = (ui.available_width() - 58.0).max(80.0);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut val)
+                        .password(true)
+                        .hint_text("Paste key")
+                        .desired_width(field_w),
+                );
+                let submitted =
+                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if style::secondary_button(ui, "Save", &p).clicked() || submitted {
                     let trimmed_val = val.trim().to_string();
                     if !trimmed_val.is_empty() {
                         set_secure_key(field_name, &trimmed_val);
@@ -748,7 +773,7 @@ impl GuiApp {
                 }
             }
         }
-        ui.add_space(6.0);
+        ui.add_space(8.0);
     }
 
     fn sync_settings(&mut self) {
@@ -1240,7 +1265,7 @@ impl GuiApp {
                             msg.content.push_str(&c);
                         }
                         AgentEvent::ToolStart { name, id } => {
-                            self.status_text = format!("🔧 Tool: {name}...");
+                            self.status_text = format!("Running {name}");
                             self.current_tool_name = Some(name.clone());
                             self.current_tool_id = Some(id.clone());
                             self.current_tool_args.clear();
@@ -1372,7 +1397,8 @@ impl GuiApp {
                             }
 
                             let status = if success { "✅ Success" } else { "❌ Failed" };
-                            self.status_text = format!("🔧 Tool {name}: {status}");
+                            self.status_text =
+                                format!("{name} {}", if success { "finished" } else { "failed" });
                             let msg = self.get_or_create_assistant_message();
                             msg.tool_logs.push(format!(
                                 "TOOL_RESULT|{}|{}|{}|{}",
@@ -1551,6 +1577,7 @@ impl GuiApp {
         if let Some(ref rx) = self.workspace_files_rx {
             if let Ok(files) = rx.try_recv() {
                 self.workspace_files = files;
+                self.file_tree_dirty = true;
                 self.workspace_files_rx = None;
                 self.is_loading_files = false;
             }
@@ -1658,310 +1685,2988 @@ impl GuiApp {
     }
 
     fn draw_settings_modal(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_settings_modal;
-        let mut save_clicked = false;
-        egui::Window::new("⚙️ Norvexum Settings & Custom Models")
-            .open(&mut open)
-            .default_size([460.0, 520.0])
+        let p = self.pal();
+        let screen = ctx.screen_rect();
+        let size = egui::vec2(
+            (screen.width() - 80.0).clamp(360.0, 760.0),
+            (screen.height() - 140.0).clamp(280.0, 540.0),
+        );
+        let mut close = false;
+        egui::Window::new("Settings")
+            .id(egui::Id::new("settings_window"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size(size)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(420.0)
-                    .show(ui, |ui| {
-                        let _text_color = if self.dark_mode {
-                            egui::Color32::WHITE
-                        } else {
-                            egui::Color32::BLACK
-                        };
-
-                        let label_color = if self.dark_mode {
-                            egui::Color32::from_rgb(200, 205, 235)
-                        } else {
-                            egui::Color32::from_rgb(60, 65, 80)
-                        };
-
-                        let mut changed = false;
-
-                        // ── Approval Check section ──
-                        ui.label(
-                            egui::RichText::new("SECURITY & PERMISSIONS")
-                                .size(11.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(167, 139, 250)),
-                        );
-                        ui.add_space(4.0);
-
-                        let mut ask_perms = self.settings.ask_perms;
-                        ui.horizontal(|ui| {
-                            if ui.checkbox(&mut ask_perms, "").changed() {
-                                self.settings.ask_perms = ask_perms;
-                                changed = true;
-                            }
-                            ui.label(
-                                egui::RichText::new("🔒 Ask permission before executing tools")
-                                    .color(label_color)
-                                    .strong(),
-                            );
-                        });
-                        ui.add_space(8.0);
-
-                        let mut changed_tools = false;
-                        ui.add_enabled_ui(ask_perms, |ui| {
-                            let critical_tools = [
-                                (
-                                    vec!["run_command", "shell"],
-                                    "🐚 Execute Shell Command (run_command)",
-                                ),
-                                (
-                                    vec!["write_file", "write_to_file"],
-                                    "📝 Write/Create Files (write_to_file)",
-                                ),
-                                (
-                                    vec![
-                                        "edit_file",
-                                        "replace_file_content",
-                                        "multi_replace_file_content",
-                                    ],
-                                    "✏️ Edit Files (replace_file_content)",
-                                ),
-                                (vec!["remove", "delete_file"], "🗑️ Delete Files (remove)"),
-                            ];
-
-                            for (tool_names, tool_label) in critical_tools {
-                                let mut requires = tool_names.iter().any(|name| {
-                                    self.settings.require_approval.iter().any(|t| t == name)
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.add_space(14.0);
-                                    if ui.checkbox(&mut requires, "").changed() {
-                                        for name in &tool_names {
-                                            if requires {
-                                                if !self
-                                                    .settings
-                                                    .require_approval
-                                                    .contains(&name.to_string())
-                                                {
-                                                    self.settings
-                                                        .require_approval
-                                                        .push(name.to_string());
-                                                }
-                                            } else {
-                                                self.settings
-                                                    .require_approval
-                                                    .retain(|t| t != *name);
-                                            }
-                                        }
-                                        changed_tools = true;
-                                    }
-                                    ui.label(egui::RichText::new(tool_label).color(label_color));
-                                });
-                            }
-                        });
-
-                        if changed_tools {
-                            changed = true;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Settings")
+                            .font(style::strong(16.0))
+                            .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if style::link_button(ui, "Close", &p)
+                            .on_hover_text("Close  (Esc)")
+                            .clicked()
+                        {
+                            close = true;
                         }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
 
-                        ui.add_space(12.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-
-                        // ── Custom Upcoming Models section ──
-                        ui.label(
-                            egui::RichText::new("REGISTER UPCOMING CUSTOM MODELS")
-                                .size(11.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(167, 139, 250)),
-                        );
-                        ui.add_space(6.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label("Provider:");
-                            egui::ComboBox::from_id_salt("custom_model_provider_select")
-                                .selected_text(&self.new_model_provider)
-                                .show_ui(ui, |ui| {
-                                    for prov in &[
-                                        "openai",
-                                        "google_direct",
-                                        "anthropic",
-                                        "aicredits",
-                                        "ollama",
-                                    ] {
-                                        ui.selectable_value(
-                                            &mut self.new_model_provider,
-                                            prov.to_string(),
-                                            *prov,
-                                        );
-                                    }
-                                });
-                        });
-                        ui.add_space(4.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label("Model ID:  ");
-                            ui.text_edit_singleline(&mut self.new_model_id);
-                            if ui.button("➕ Add Model").clicked()
-                                && !self.new_model_id.trim().is_empty()
+                let body_h = (ui.available_height() - 44.0).max(120.0);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(150.0);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for section in SettingsSection::ALL {
+                            if menu_row(ui, section.label(), self.settings_section == section, &p)
+                                .clicked()
                             {
-                                let full_model_entry = format!(
-                                    "{}:{}",
-                                    self.new_model_provider,
-                                    self.new_model_id.trim()
-                                );
-                                if !self.settings.custom_models.contains(&full_model_entry) {
-                                    self.settings.custom_models.push(full_model_entry);
-                                    self.new_model_id.clear();
-                                    changed = true;
-                                }
-                            }
-                        });
-
-                        if !self.settings.custom_models.is_empty() {
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new("Registered Custom Models:")
-                                    .small()
-                                    .color(label_color),
-                            );
-                            let mut to_remove = None;
-                            for (idx, m) in self.settings.custom_models.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(14.0);
-                                    ui.label(egui::RichText::new(m).monospace());
-                                    if ui.button("❌").clicked() {
-                                        to_remove = Some(idx);
-                                    }
-                                });
-                            }
-                            if let Some(idx) = to_remove {
-                                self.settings.custom_models.remove(idx);
-                                changed = true;
+                                self.settings_section = section;
                             }
                         }
-
-                        ui.add_space(12.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-
-                        // ── Parameters section ──
-                        ui.label(
-                            egui::RichText::new("CORE PARAMETERS")
-                                .size(11.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(167, 139, 250)),
-                        );
-                        ui.add_space(6.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Max thinking loops per cycle:")
-                                    .color(label_color),
-                            );
-
-                            let mut is_infinite = self.settings.max_thinking_loops == 0;
-                            if ui.checkbox(&mut is_infinite, "Infinite").changed() {
-                                if is_infinite {
-                                    self.settings.max_thinking_loops = 0;
-                                } else {
-                                    self.settings.max_thinking_loops = 25; // default back to 25
+                    });
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("settings_body", self.settings_section))
+                            .max_height(body_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width((ui.available_width() - 10.0).max(120.0));
+                                let changed = match self.settings_section {
+                                    SettingsSection::General => self.settings_general(ui, ctx, &p),
+                                    SettingsSection::Permissions => {
+                                        self.settings_permissions(ui, &p)
+                                    }
+                                    SettingsSection::Models => self.settings_models(ui, &p),
+                                    SettingsSection::ApiKeys => {
+                                        self.settings_api_keys(ui, &p);
+                                        false
+                                    }
+                                    SettingsSection::Skills => {
+                                        self.settings_skills(ui, &p);
+                                        false
+                                    }
+                                    SettingsSection::Advanced => self.settings_advanced(ui, &p),
+                                };
+                                if changed {
+                                    self.sync_settings();
                                 }
-                                changed = true;
-                            }
-                        });
+                            });
+                    });
+                });
 
-                        ui.add_enabled_ui(self.settings.max_thinking_loops != 0, |ui| {
-                            let mut temp_loops = if self.settings.max_thinking_loops == 0 {
-                                25
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Changes apply immediately.")
+                            .size(11.5)
+                            .color(p.faint),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if style::primary_button(ui, "Done", &p).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        if close {
+            self.sync_settings();
+            self.show_settings_modal = false;
+        }
+    }
+
+    fn settings_heading(ui: &mut egui::Ui, title: &str, subtitle: &str, p: &Palette) {
+        ui.label(
+            egui::RichText::new(title)
+                .font(style::strong(14.5))
+                .color(p.text),
+        );
+        if !subtitle.is_empty() {
+            ui.label(egui::RichText::new(subtitle).size(12.0).color(p.dim));
+        }
+        ui.add_space(8.0);
+    }
+
+    fn settings_general(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Palette) -> bool {
+        Self::settings_heading(ui, "General", "", p);
+        style::section_label(ui, "Appearance", p);
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.dark_mode, "Dark").clicked() {
+                self.dark_mode = true;
+            }
+            if ui.selectable_label(!self.dark_mode, "Light").clicked() {
+                self.dark_mode = false;
+            }
+        });
+        ui.add_space(14.0);
+        style::section_label(ui, "Workspace folder", p);
+        self.draw_workspace_picker(ui, ctx, p);
+        ui.add_space(14.0);
+        style::section_label(ui, "Keyboard", p);
+        if style::secondary_button(ui, "Show keyboard shortcuts", p).clicked() {
+            self.show_shortcuts = true;
+        }
+        ui.add_space(14.0);
+        style::section_label(ui, "About", p);
+        ui.label(
+            egui::RichText::new(concat!("Norvexum v", env!("CARGO_PKG_VERSION")))
+                .size(12.5)
+                .color(p.dim),
+        );
+        false
+    }
+
+    fn settings_permissions(&mut self, ui: &mut egui::Ui, p: &Palette) -> bool {
+        Self::settings_heading(
+            ui,
+            "Permissions",
+            "Choose which tools need your approval before they run.",
+            p,
+        );
+        let mut changed = false;
+        let mut ask_perms = self.settings.ask_perms;
+        if ui
+            .checkbox(&mut ask_perms, "Ask before running sensitive tools")
+            .changed()
+        {
+            self.settings.ask_perms = ask_perms;
+            changed = true;
+        }
+        ui.add_space(4.0);
+
+        ui.add_enabled_ui(ask_perms, |ui| {
+            let critical_tools = [
+                (vec!["run_command", "shell"], "Shell commands"),
+                (
+                    vec!["write_file", "write_to_file"],
+                    "Create or overwrite files",
+                ),
+                (
+                    vec![
+                        "edit_file",
+                        "replace_file_content",
+                        "multi_replace_file_content",
+                    ],
+                    "Edit files",
+                ),
+                (vec!["remove", "delete_file"], "Delete files"),
+            ];
+
+            for (tool_names, tool_label) in critical_tools {
+                let mut requires = tool_names
+                    .iter()
+                    .any(|name| self.settings.require_approval.iter().any(|t| t == name));
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    if ui.checkbox(&mut requires, tool_label).changed() {
+                        for name in &tool_names {
+                            if requires {
+                                if !self.settings.require_approval.contains(&name.to_string()) {
+                                    self.settings.require_approval.push(name.to_string());
+                                }
                             } else {
-                                self.settings.max_thinking_loops
-                            };
-                            if ui
-                                .add(egui::Slider::new(&mut temp_loops, 1..=100))
-                                .changed()
-                            {
-                                self.settings.max_thinking_loops = temp_loops;
-                                changed = true;
+                                self.settings.require_approval.retain(|t| t != *name);
                             }
+                        }
+                        changed = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(tool_names[0])
+                            .font(egui::FontId::monospace(11.0))
+                            .color(p.faint),
+                    );
+                });
+            }
+        });
+        changed
+    }
+
+    fn settings_models(&mut self, ui: &mut egui::Ui, p: &Palette) -> bool {
+        Self::settings_heading(
+            ui,
+            "Models",
+            "Pick the active model from the message box. Add model IDs that aren't in the built-in list here.",
+            p,
+        );
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("custom_model_provider_select")
+                .selected_text(&self.new_model_provider)
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for prov in &[
+                        "openai",
+                        "google_direct",
+                        "anthropic",
+                        "aicredits",
+                        "ollama",
+                    ] {
+                        ui.selectable_value(&mut self.new_model_provider, prov.to_string(), *prov);
+                    }
+                });
+            let field_w = (ui.available_width() - 56.0).max(80.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_model_id)
+                    .hint_text("model-id")
+                    .desired_width(field_w),
+            );
+            if style::secondary_button(ui, "Add", p).clicked()
+                && !self.new_model_id.trim().is_empty()
+            {
+                let full_model_entry =
+                    format!("{}:{}", self.new_model_provider, self.new_model_id.trim());
+                if !self.settings.custom_models.contains(&full_model_entry) {
+                    self.settings.custom_models.push(full_model_entry);
+                    self.new_model_id.clear();
+                    changed = true;
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+        if self.settings.custom_models.is_empty() {
+            ui.label(
+                egui::RichText::new("No custom models yet.")
+                    .size(12.0)
+                    .color(p.faint),
+            );
+        } else {
+            let mut to_remove = None;
+            for (idx, m) in self.settings.custom_models.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(m)
+                            .font(egui::FontId::monospace(12.0))
+                            .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if style::link_button(ui, "Remove", p).clicked() {
+                            to_remove = Some(idx);
+                        }
+                    });
+                });
+            }
+            if let Some(idx) = to_remove {
+                self.settings.custom_models.remove(idx);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn settings_api_keys(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        Self::settings_heading(
+            ui,
+            "API keys",
+            "Stored in the system keyring, with a fallback in ~/.norvexum/.env.",
+            p,
+        );
+        self.draw_key_field(ui, "openai_api_key", "OpenAI");
+        self.draw_key_field(ui, "anthropic_api_key", "Anthropic");
+        self.draw_key_field(ui, "google_ai_api_key", "Google AI");
+        self.draw_key_field(ui, "aicredits_api_key", "AICredits");
+        self.draw_key_field(ui, "tavily_api_key", "Tavily (web search)");
+        self.draw_key_field(ui, "ocr_space_api_key", "OCR.space");
+        self.draw_key_field(ui, "pollinations_api_key", "Pollinations (images)");
+    }
+
+    fn settings_skills(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        Self::settings_heading(
+            ui,
+            "Skills",
+            "Reusable instructions the agent loads when a trigger phrase matches.",
+            p,
+        );
+        if style::secondary_button(ui, "Import skill file…", p)
+            .on_hover_text("Add a skill from a Markdown file")
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Markdown", &["md"])
+                .pick_file()
+            {
+                let skill_dir = crate::skills::get_global_skills_dir();
+                let _ = std::fs::create_dir_all(&skill_dir);
+                if let Some(filename) = path.file_name() {
+                    let dest = skill_dir.join(filename);
+                    if std::fs::copy(&path, &dest).is_ok() {
+                        self.status_text =
+                            format!("Skill file {} uploaded!", filename.to_string_lossy());
+                        self.skills_list =
+                            crate::skills::load_all_skills(&self.settings.project_root);
+                    }
+                }
+            }
+        }
+
+        ui.add_space(14.0);
+        style::section_label(ui, "New skill", p);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.custom_skill_name)
+                .hint_text("Name")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut self.custom_skill_desc)
+                .hint_text("Description")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut self.custom_skill_triggers)
+                .hint_text("Trigger phrases, comma separated")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add(
+            egui::TextEdit::multiline(&mut self.custom_skill_instructions)
+                .hint_text("Instructions")
+                .desired_rows(4)
+                .desired_width(f32::INFINITY),
+        );
+
+        if style::secondary_button(ui, "Add skill", p).clicked() {
+            let name = self.custom_skill_name.trim().to_string();
+            let inst = self.custom_skill_instructions.trim().to_string();
+            if !name.is_empty() && !inst.is_empty() {
+                let desc = self.custom_skill_desc.trim().to_string();
+                let triggers: Vec<String> = self
+                    .custom_skill_triggers
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                let triggers_str = if triggers.is_empty() {
+                    format!("  - {}", name.to_lowercase())
+                } else {
+                    triggers
+                        .iter()
+                        .map(|t| format!("  - {}", t))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+
+                let content = format!(
+                    "---\nname: {}\ndescription: {}\ntrigger_patterns:\n{}\n---\n{}",
+                    name, desc, triggers_str, inst
+                );
+
+                let skill_dir = crate::skills::get_global_skills_dir();
+                let _ = std::fs::create_dir_all(&skill_dir);
+                let file_path = skill_dir.join(format!("{}.md", name.to_lowercase()));
+                if std::fs::write(&file_path, content).is_ok() {
+                    self.status_text = format!("Skill {} saved!", name);
+                    self.skills_list = crate::skills::load_all_skills(&self.settings.project_root);
+
+                    self.custom_skill_name.clear();
+                    self.custom_skill_desc.clear();
+                    self.custom_skill_triggers.clear();
+                    self.custom_skill_instructions.clear();
+                }
+            }
+        }
+
+        ui.add_space(14.0);
+        style::section_label(ui, &format!("Loaded · {}", self.skills_list.len()), p);
+        if self.skills_list.is_empty() {
+            ui.label(
+                egui::RichText::new("No skills loaded.")
+                    .size(12.0)
+                    .color(p.faint),
+            );
+        }
+        for skill in &self.skills_list {
+            ui.label(egui::RichText::new(&skill.name).size(13.0).color(p.text));
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&skill.description)
+                        .size(12.0)
+                        .color(p.faint),
+                )
+                .wrap(),
+            );
+            ui.add_space(4.0);
+        }
+    }
+
+    fn settings_advanced(&mut self, ui: &mut egui::Ui, p: &Palette) -> bool {
+        Self::settings_heading(ui, "Advanced", "", p);
+        let mut changed = false;
+
+        style::section_label(ui, "Limits", p);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Tool loops per turn").color(p.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut is_infinite = self.settings.max_thinking_loops == 0;
+                if ui.checkbox(&mut is_infinite, "Unlimited").changed() {
+                    if is_infinite {
+                        self.settings.max_thinking_loops = 0;
+                    } else {
+                        self.settings.max_thinking_loops = 25; // default back to 25
+                    }
+                    changed = true;
+                }
+            });
+        });
+        ui.add_enabled_ui(self.settings.max_thinking_loops != 0, |ui| {
+            let mut temp_loops = if self.settings.max_thinking_loops == 0 {
+                25
+            } else {
+                self.settings.max_thinking_loops
+            };
+            if ui
+                .add(egui::Slider::new(&mut temp_loops, 1..=100))
+                .changed()
+            {
+                self.settings.max_thinking_loops = temp_loops;
+                changed = true;
+            }
+        });
+        ui.add_space(6.0);
+
+        ui.label(egui::RichText::new("Browser timeout").color(p.text));
+        if ui
+            .add(egui::Slider::new(&mut self.settings.browser_timeout_secs, 5..=300).suffix(" s"))
+            .changed()
+        {
+            changed = true;
+        }
+        ui.add_space(6.0);
+
+        ui.label(egui::RichText::new("Max content characters").color(p.text));
+        if ui
+            .add(
+                egui::Slider::new(&mut self.settings.max_content_chars, 1000..=5000000)
+                    .logarithmic(true),
+            )
+            .changed()
+        {
+            changed = true;
+        }
+
+        ui.add_space(16.0);
+        style::section_label(ui, "Custom instructions", p);
+        let mut val = self
+            .settings
+            .custom_system_prompt
+            .clone()
+            .unwrap_or_default();
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut val)
+                    .hint_text("Optional instructions added to every conversation")
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            self.settings.custom_system_prompt = if val.trim().is_empty() {
+                None
+            } else {
+                Some(val)
+            };
+            changed = true;
+        }
+        changed
+    }
+
+    /// Folder field with Browse/Open, shared by the sidebar and Settings.
+    fn draw_workspace_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Palette) {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut self.folder_input)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY),
+        );
+        let mut open_typed = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.horizontal(|ui| {
+            if style::secondary_button(ui, "Browse…", p)
+                .on_hover_text("Choose a workspace folder")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.folder_input = path.to_string_lossy().to_string();
+                    self.load_project_folder(&path, ctx.clone());
+                }
+            }
+            if style::secondary_button(ui, "Open", p)
+                .on_hover_text("Open the folder typed above")
+                .clicked()
+            {
+                open_typed = true;
+            }
+        });
+        if open_typed {
+            let path = std::path::PathBuf::from(&self.folder_input);
+            if path.exists() && path.is_dir() {
+                self.load_project_folder(&path, ctx.clone());
+            } else {
+                self.folder_error = Some("Directory path not found!".to_string());
+            }
+        }
+        if let Some(ref err) = self.folder_error {
+            ui.label(egui::RichText::new(err).size(12.0).color(p.danger));
+        }
+    }
+}
+
+/// System messages and empty assistant bubbles (no text, reasoning or tool
+/// activity) are not drawn.
+fn is_message_shown(msg: &GuiMessage) -> bool {
+    msg.role != "system"
+        && !(msg.role == "assistant"
+            && msg.content.trim().is_empty()
+            && msg.thinking.as_ref().is_none_or(|t| t.trim().is_empty())
+            && msg.tool_logs.is_empty())
+}
+
+/// The text of the whole reply ending at `last`: the consecutive assistant
+/// bubbles a tool-using answer is split into.
+fn reply_text(messages: &[GuiMessage], shown: &[usize], last: usize) -> String {
+    let end = shown.iter().position(|&i| i == last).unwrap_or(0);
+    let mut parts: Vec<&str> = shown[..=end]
+        .iter()
+        .rev()
+        .take_while(|&&i| messages[i].role == "assistant")
+        .map(|&i| messages[i].content.trim())
+        .filter(|text| !text.is_empty())
+        .collect();
+    parts.reverse();
+    parts.join("\n\n")
+}
+
+/// "Today, 14:05" / "Yesterday, 09:12" / "Oct 3, 18:40" for a saved chat.
+fn format_session_time(rfc3339: &str) -> Option<String> {
+    let t = chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .ok()?
+        .with_timezone(&chrono::Local);
+    let today = chrono::Local::now().date_naive();
+    Some(if t.date_naive() == today {
+        format!("Today, {}", t.format("%H:%M"))
+    } else if Some(t.date_naive()) == today.pred_opt() {
+        format!("Yesterday, {}", t.format("%H:%M"))
+    } else {
+        t.format("%b %-d, %H:%M").to_string()
+    })
+}
+
+struct SessionRow {
+    response: egui::Response,
+    delete_clicked: bool,
+    hovered: bool,
+}
+
+/// Two-line chat entry in the sidebar. When `armed`, the delete control
+/// reads "Delete?" and the next click on it confirms.
+fn session_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    meta: &str,
+    selected: bool,
+    deletable: bool,
+    armed: bool,
+    p: &Palette,
+) -> SessionRow {
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 40.0), egui::Sense::click());
+    let del_w = if armed { 58.0 } else { 22.0 };
+    let del_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 6.0 - del_w / 2.0, rect.center().y),
+        egui::vec2(del_w, 22.0),
+    );
+    let del =
+        deletable.then(|| ui.interact(del_rect, resp.id.with("delete"), egui::Sense::click()));
+    let del_hovered = del.as_ref().is_some_and(|d| d.hovered());
+    let hovered = resp.hovered() || del_hovered;
+
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 6.0, p.hover);
+    } else if hovered {
+        painter.rect_filled(rect, 6.0, p.surface);
+    }
+    let text_w = rect.width() - 20.0 - if deletable { del_w + 4.0 } else { 0.0 };
+    let title_g = style::one_line(ui, title, egui::FontId::proportional(13.0), p.text, text_w);
+    painter.galley(rect.left_top() + egui::vec2(10.0, 5.0), title_g, p.text);
+    let meta_g = style::one_line(ui, meta, egui::FontId::proportional(11.0), p.faint, text_w);
+    painter.galley(rect.left_top() + egui::vec2(10.0, 23.0), meta_g, p.faint);
+    if deletable && armed {
+        painter.rect_filled(del_rect, 5.0, p.danger.gamma_multiply(0.16));
+        painter.text(
+            del_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Delete?",
+            egui::FontId::proportional(11.5),
+            p.danger,
+        );
+    } else if deletable && hovered {
+        painter.text(
+            del_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(16.0),
+            if del_hovered { p.danger } else { p.faint },
+        );
+    }
+    let hint = if armed {
+        "Click again to delete"
+    } else {
+        "Delete chat"
+    };
+    let delete_clicked = del.is_some_and(|d| d.on_hover_text(hint).clicked());
+    SessionRow {
+        response: resp,
+        delete_clicked,
+        hovered,
+    }
+}
+
+/// Folder tree built from relative paths ("src/ui/mod.rs").
+#[derive(Default)]
+struct FileTree {
+    dirs: std::collections::BTreeMap<String, FileTree>,
+    /// (file name, full relative path)
+    files: Vec<(String, String)>,
+}
+
+impl FileTree {
+    fn build<'a>(paths: impl IntoIterator<Item = &'a String>) -> Self {
+        let mut root = FileTree::default();
+        for path in paths {
+            let parts: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+            let Some((name, dirs)) = parts.split_last() else {
+                continue;
+            };
+            let mut node = &mut root;
+            for dir in dirs {
+                node = node.dirs.entry(dir.to_string()).or_default();
+            }
+            node.files.push((name.to_string(), path.clone()));
+        }
+        root.sort();
+        root
+    }
+
+    fn sort(&mut self) {
+        self.files.sort_by_key(|(name, _)| name.to_lowercase());
+        for dir in self.dirs.values_mut() {
+            dir.sort();
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.dirs.is_empty()
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct FileDecor {
+    writing: bool,
+    added: usize,
+    deleted: usize,
+}
+
+struct TreeView<'a> {
+    expanded: &'a mut std::collections::HashSet<String>,
+    /// Show every folder open (filtered results, the "Changed" list).
+    force_open: bool,
+    selected: Option<&'a str>,
+    decor: &'a dyn Fn(&str) -> FileDecor,
+    clicked: Option<String>,
+    p: &'a Palette,
+    time: f32,
+}
+
+fn draw_tree(ui: &mut egui::Ui, node: &FileTree, prefix: &str, depth: usize, view: &mut TreeView) {
+    for (name, child) in &node.dirs {
+        let key = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let open = view.force_open || view.expanded.contains(&key);
+        let resp = tree_row(
+            ui,
+            depth,
+            Some(open),
+            name,
+            false,
+            FileDecor::default(),
+            view.p,
+            view.time,
+        );
+        if resp.clicked() && !view.force_open {
+            if open {
+                view.expanded.remove(&key);
+            } else {
+                view.expanded.insert(key.clone());
+            }
+        }
+        if open {
+            draw_tree(ui, child, &key, depth + 1, view);
+        }
+    }
+    for (name, path) in &node.files {
+        let decor = (view.decor)(path);
+        let selected = view.selected == Some(path.as_str());
+        if tree_row(ui, depth, None, name, selected, decor, view.p, view.time)
+            .on_hover_text(path.as_str())
+            .clicked()
+        {
+            view.clicked = Some(path.clone());
+        }
+    }
+}
+
+/// One tree line: indent guides, a chevron for folders (or a pulsing dot
+/// for a file being written), the name, and diff counts on the right.
+#[allow(clippy::too_many_arguments)]
+fn tree_row(
+    ui: &mut egui::Ui,
+    depth: usize,
+    dir_open: Option<bool>,
+    name: &str,
+    selected: bool,
+    decor: FileDecor,
+    p: &Palette,
+    time: f32,
+) -> egui::Response {
+    const INDENT: f32 = 14.0;
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
+    let painter = ui.painter();
+    if decor.writing {
+        painter.rect_filled(rect, 5.0, p.accent_soft);
+    } else if selected {
+        painter.rect_filled(rect, 5.0, p.hover);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 5.0, p.surface);
+    }
+    for level in 0..depth {
+        let x = rect.left() + 11.0 + level as f32 * INDENT;
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0, p.border),
+        );
+    }
+
+    let cy = rect.center().y;
+    let x0 = rect.left() + 6.0 + depth as f32 * INDENT;
+    let mark_x = x0 + 5.0;
+    let chevron =
+        |points: Vec<egui::Pos2>| egui::Shape::convex_polygon(points, p.faint, egui::Stroke::NONE);
+    match dir_open {
+        Some(true) => {
+            painter.add(chevron(vec![
+                egui::pos2(mark_x - 3.5, cy - 1.5),
+                egui::pos2(mark_x + 3.5, cy - 1.5),
+                egui::pos2(mark_x, cy + 2.5),
+            ]));
+        }
+        Some(false) => {
+            painter.add(chevron(vec![
+                egui::pos2(mark_x - 1.5, cy - 3.5),
+                egui::pos2(mark_x + 2.5, cy),
+                egui::pos2(mark_x - 1.5, cy + 3.5),
+            ]));
+        }
+        None if decor.writing => {
+            let pulse = 0.55 + 0.45 * (time * std::f32::consts::TAU / 1.4).sin();
+            painter.circle_filled(egui::pos2(mark_x, cy), 3.5, p.accent.gamma_multiply(pulse));
+        }
+        None => {}
+    }
+
+    let mut right = rect.right() - 8.0;
+    if decor.writing {
+        let g =
+            painter.layout_no_wrap("writing".into(), egui::FontId::proportional(11.0), p.accent);
+        right -= g.size().x;
+        painter.galley(egui::pos2(right, cy - g.size().y / 2.0), g, p.accent);
+        right -= 8.0;
+    }
+    for (n, color, sign) in [
+        (decor.deleted, p.danger, '-'),
+        (decor.added, p.success, '+'),
+    ] {
+        if n > 0 {
+            let g =
+                painter.layout_no_wrap(format!("{sign}{n}"), egui::FontId::monospace(11.0), color);
+            right -= g.size().x;
+            painter.galley(egui::pos2(right, cy - g.size().y / 2.0), g, color);
+            right -= 6.0;
+        }
+    }
+
+    let text_x = x0 + 14.0;
+    let color = if dir_open.is_some() { p.dim } else { p.text };
+    let name_g = style::one_line(
+        ui,
+        name,
+        egui::FontId::proportional(12.5),
+        color,
+        right - text_x - 4.0,
+    );
+    painter.galley(
+        egui::pos2(text_x, cy - name_g.size().y / 2.0),
+        name_g,
+        color,
+    );
+    resp
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SettingsSection {
+    General,
+    Permissions,
+    Models,
+    ApiKeys,
+    Skills,
+    Advanced,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 6] = [
+        Self::General,
+        Self::Permissions,
+        Self::Models,
+        Self::ApiKeys,
+        Self::Skills,
+        Self::Advanced,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Permissions => "Permissions",
+            Self::Models => "Models",
+            Self::ApiKeys => "API keys",
+            Self::Skills => "Skills",
+            Self::Advanced => "Advanced",
+        }
+    }
+}
+
+/// Full-width navigation entry (settings section list).
+fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool, p: &Palette) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
+    if selected {
+        ui.painter().rect_filled(rect, 6.0, p.hover);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, p.surface);
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        if selected { p.text } else { p.dim },
+    );
+    resp
+}
+
+fn send_button(ui: &mut egui::Ui, enabled: bool, p: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+    let (fill, fg) = if enabled {
+        let fill = if resp.hovered() {
+            p.accent.gamma_multiply(0.85)
+        } else {
+            p.accent
+        };
+        (fill, p.on_accent)
+    } else {
+        (p.hover, p.faint)
+    };
+    let c = rect.center();
+    ui.painter().circle_filled(c, 14.0, fill);
+    let stroke = egui::Stroke::new(1.8, fg);
+    ui.painter().line_segment(
+        [c + egui::vec2(0.0, 5.0), c + egui::vec2(0.0, -5.0)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [c + egui::vec2(-4.0, -1.0), c + egui::vec2(0.0, -5.5)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [c + egui::vec2(4.0, -1.0), c + egui::vec2(0.0, -5.5)],
+        stroke,
+    );
+    resp
+}
+
+fn stop_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+    let c = rect.center();
+    let hovered = resp.hovered();
+    ui.painter().circle_filled(c, 14.0, p.hover);
+    ui.painter().rect_filled(
+        egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0)),
+        2.0,
+        if hovered { p.danger } else { p.text },
+    );
+    resp.on_hover_text("Stop the current response  (Esc)")
+}
+
+const SUGGESTIONS: &[&str] = &[
+    "Explain how this project is organized",
+    "Find and fix a bug in the code",
+    "Write tests for the core module",
+    "Review my uncommitted changes",
+];
+
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("Enter", "Send message"),
+    ("Shift+Enter", "New line"),
+    ("Up (empty box)", "Recall last prompt"),
+    ("Esc", "Stop response, deny approval, close dialog"),
+    ("Ctrl+N", "New chat"),
+    ("Ctrl+L", "Focus the message box"),
+    ("Ctrl+B", "Show or hide chats"),
+    ("Ctrl+E", "Show or hide files"),
+    ("Ctrl+J", "Show or hide terminal"),
+    ("Ctrl+,", "Settings"),
+    ("Ctrl+/", "Keyboard shortcuts"),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightTab {
+    Changed,
+    All,
+}
+
+impl GuiApp {
+    fn pal(&self) -> Palette {
+        Palette::new(self.dark_mode)
+    }
+
+    fn project_name(&self) -> String {
+        self.settings
+            .project_root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.settings.project_root.display().to_string())
+    }
+
+    fn new_chat(&mut self) {
+        let _ = self.user_tx.send("/clear".to_string());
+        self.messages.clear();
+        self.session_written_files.clear();
+        self.file_diff_stats.clear();
+        self.terminal_entries.clear();
+        self.current_session_id = None;
+        self.active_messages_backup = None;
+        self.selected_file = None;
+        self.status_text = "Chat cleared".to_string();
+        self.focus_composer = true;
+    }
+
+    fn stop_run(&mut self) {
+        let _ = self.cancel_tx.send(());
+        self.is_processing = false;
+        self.status_text = "Stopped".to_string();
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        let shortcut = |key: Key| {
+            ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, key)))
+        };
+        if shortcut(Key::N) && !self.is_processing {
+            self.new_chat();
+        }
+        if shortcut(Key::B) {
+            self.left_sidebar_open = !self.left_sidebar_open;
+        }
+        if shortcut(Key::E) {
+            self.right_sidebar_open = !self.right_sidebar_open;
+        }
+        if shortcut(Key::J) {
+            self.show_terminal_panel = !self.show_terminal_panel;
+        }
+        if shortcut(Key::Comma) {
+            self.show_settings_modal = !self.show_settings_modal;
+        }
+        if shortcut(Key::Slash) {
+            self.show_shortcuts = !self.show_shortcuts;
+        }
+        if shortcut(Key::L) {
+            self.focus_composer = true;
+        }
+
+        // A pending approval takes Enter (when the box is empty) and Esc.
+        if self.approval_pending.is_some() {
+            let composer_empty = self.input_text.trim().is_empty();
+            let answer = ctx.input_mut(|i| {
+                if composer_empty && i.consume_key(Modifiers::NONE, Key::Enter) {
+                    Some(true)
+                } else if i.consume_key(Modifiers::NONE, Key::Escape) {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            if let Some(approved) = answer {
+                if self.approval_pending.take().is_some() {
+                    let _ = self.approval_tx.send(approved);
+                }
+            }
+            return;
+        }
+
+        let wants_escape = self.show_shortcuts || self.show_settings_modal || self.is_processing;
+        if wants_escape
+            && !ctx.memory(|m| m.any_popup_open())
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            if self.show_shortcuts {
+                self.show_shortcuts = false;
+            } else if self.show_settings_modal {
+                self.show_settings_modal = false;
+            } else if self.is_processing {
+                self.stop_run();
+            }
+        }
+    }
+
+    fn draw_top_bar(&mut self, ctx: &egui::Context, p: &Palette) {
+        egui::TopBottomPanel::top("top_bar")
+            .exact_height(42.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(10.0, 0.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if style::nav_button(ui, "Chats", self.left_sidebar_open, p)
+                        .on_hover_text("Show or hide chats and workspace  (Ctrl+B)")
+                        .clicked()
+                    {
+                        self.left_sidebar_open = !self.left_sidebar_open;
+                    }
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::Image::new(&self.logo_tex).fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("Norvexum")
+                            .font(style::strong(13.5))
+                            .color(p.text),
+                    );
+                    if ui.ctx().screen_rect().width() >= 760.0 {
+                        ui.label(egui::RichText::new("/").color(p.faint));
+                        ui.label(
+                            egui::RichText::new(self.project_name())
+                                .size(13.0)
+                                .color(p.dim),
+                        )
+                        .on_hover_text(self.settings.project_root.display().to_string());
+                        if self.current_session_id.is_some() {
+                            ui.label(egui::RichText::new("/").color(p.faint));
+                            ui.label(egui::RichText::new("Saved chat").size(13.0).color(p.dim));
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if style::nav_button(ui, "Settings", self.show_settings_modal, p)
+                            .on_hover_text("Settings  (Ctrl+,)")
+                            .clicked()
+                        {
+                            self.show_settings_modal = !self.show_settings_modal;
+                        }
+                        let theme_label = if self.dark_mode { "Light" } else { "Dark" };
+                        if style::nav_button(ui, theme_label, false, p)
+                            .on_hover_text("Switch theme")
+                            .clicked()
+                        {
+                            self.dark_mode = !self.dark_mode;
+                        }
+                        if style::nav_button(ui, "Terminal", self.show_terminal_panel, p)
+                            .on_hover_text("Commands the agent ran  (Ctrl+J)")
+                            .clicked()
+                        {
+                            self.show_terminal_panel = !self.show_terminal_panel;
+                        }
+                        if style::nav_button(ui, "Files", self.right_sidebar_open, p)
+                            .on_hover_text("Changed and workspace files  (Ctrl+E)")
+                            .clicked()
+                        {
+                            self.right_sidebar_open = !self.right_sidebar_open;
+                        }
+                    });
+                });
+            });
+    }
+
+    fn draw_status_bar(&mut self, ctx: &egui::Context, p: &Palette) {
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(24.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(12.0, 0.0)),
+            )
+            .show(ctx, |ui| {
+                let label = style::clean_label(&self.status_text);
+                let (color, text) = if self.agent_crashed {
+                    (
+                        p.danger,
+                        "Agent stopped responding. Restart Norvexum.".to_string(),
+                    )
+                } else if self.approval_pending.is_some() {
+                    (p.warn, "Waiting for your approval".to_string())
+                } else if self.is_processing {
+                    let text = if label.is_empty() || label == "Idle" {
+                        "Working".to_string()
+                    } else {
+                        label
+                    };
+                    (p.accent, text)
+                } else if self.status_text == "Error" {
+                    (p.danger, "The last run ended with an error".to_string())
+                } else {
+                    let text = if label.is_empty() || label == "Idle" {
+                        "Ready".to_string()
+                    } else {
+                        label
+                    };
+                    (p.success, text)
+                };
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if style::link_button(ui, "Shortcuts", p)
+                        .on_hover_text("Keyboard shortcuts  (Ctrl+/)")
+                        .clicked()
+                    {
+                        self.show_shortcuts = !self.show_shortcuts;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · {}",
+                            self.settings.active_provider, self.settings.active_model
+                        ))
+                        .size(11.5)
+                        .color(p.faint),
+                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        style::dot(ui, color);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).size(11.5).color(p.dim))
+                                .truncate(),
+                        );
+                    });
+                });
+            });
+    }
+
+    fn draw_left_sidebar(&mut self, ctx: &egui::Context, p: &Palette) {
+        // Animated open/close + generously wide resize range so the user can
+        // pull/push the panel freely.
+        let target_left_t = if self.left_sidebar_open { 1.0 } else { 0.0 };
+        let left_t_raw =
+            ctx.animate_value_with_time(egui::Id::new("left_sidebar_anim"), target_left_t, 0.18);
+        // ease-out-cubic
+        let left_t = 1.0 - (1.0 - left_t_raw.clamp(0.0, 1.0)).powi(3);
+        let left_animating = (left_t_raw - target_left_t).abs() > 0.005;
+        if left_t <= 0.005 {
+            return;
+        }
+
+        let mut left_panel = egui::SidePanel::left("left_sidebar")
+            .frame(
+                egui::Frame::none()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::same(12.0)),
+            )
+            // Disable resize only while the open/close tween is running;
+            // once settled egui remembers & controls the user width.
+            .resizable(!left_animating && self.left_sidebar_open)
+            .width_range(60.0..=1200.0);
+        if left_animating {
+            left_panel = left_panel.exact_width(self.left_sidebar_width * left_t);
+        } else {
+            left_panel = left_panel.default_width(self.left_sidebar_width);
+        }
+
+        let panel_response = left_panel.show(ctx, |ui| {
+            let new_chat = ui
+                .add_enabled(
+                    !self.is_processing,
+                    egui::Button::new(egui::RichText::new("New chat").size(13.0).color(p.text))
+                        .fill(p.surface)
+                        .stroke(egui::Stroke::new(1.0, p.border))
+                        .rounding(8.0)
+                        .min_size(egui::vec2(ui.available_width(), 32.0)),
+                )
+                .on_hover_text("Start a fresh conversation  (Ctrl+N)");
+            if new_chat.clicked() {
+                self.new_chat();
+            }
+            ui.add_space(12.0);
+
+            let scroll_height = ui.available_height().max(80.0);
+
+            egui::ScrollArea::vertical()
+                .id_salt("left_sidebar_scroll")
+                .max_height(scroll_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    style::section_label(ui, "Chats", p);
+                    ui.add_space(2.0);
+
+                    // Active session
+                    let active_selected = self.current_session_id.is_none();
+                    let active_count = self
+                        .active_messages_backup
+                        .as_ref()
+                        .map_or(self.messages.len(), |m| m.len());
+                    let active_row = session_row(
+                        ui,
+                        "Current chat",
+                        &format!("{active_count} messages"),
+                        active_selected,
+                        false,
+                        false,
+                        p,
+                    );
+                    if active_row.response.clicked() {
+                        if let Some(active_messages) = self.active_messages_backup.take() {
+                            self.messages = active_messages;
+                        }
+                        self.current_session_id = None;
+                        self.status_text = "Returned to current active chat session.".to_string();
+                    }
+
+                    // Previous sessions
+                    let mut session_to_delete = None;
+                    let mut session_to_load = None;
+                    // Deleting takes two clicks: × arms the row, "Delete?" confirms.
+                    let mut armed_next = self.pending_delete_session.clone();
+                    for summary in &self.history_sessions {
+                        let is_selected = self.current_session_id.as_deref() == Some(&summary.id);
+                        let title = format_session_time(&summary.updated_at).unwrap_or_else(|| {
+                            format!("Chat {}", &summary.id[..6.min(summary.id.len())])
                         });
-
-                        ui.label(
-                            egui::RichText::new("Browser timeout (seconds):").color(label_color),
-                        );
-                        if ui
-                            .add(egui::Slider::new(
-                                &mut self.settings.browser_timeout_secs,
-                                5..=300,
-                            ))
-                            .changed()
-                        {
-                            changed = true;
+                        let meta =
+                            format!("{} · {} messages", summary.model, summary.message_count);
+                        let armed =
+                            self.pending_delete_session.as_deref() == Some(summary.id.as_str());
+                        let row = session_row(ui, &title, &meta, is_selected, true, armed, p);
+                        if row.delete_clicked {
+                            if armed {
+                                session_to_delete = Some(summary.id.clone());
+                                armed_next = None;
+                            } else {
+                                armed_next = Some(summary.id.clone());
+                            }
+                        } else if row.response.clicked() {
+                            session_to_load = Some(summary.id.clone());
+                            armed_next = None;
+                        } else if armed && !row.hovered {
+                            armed_next = None;
                         }
-
+                    }
+                    self.pending_delete_session = armed_next;
+                    if self.history_sessions.is_empty() {
+                        ui.add_space(2.0);
                         ui.label(
-                            egui::RichText::new("Max content characters limit:").color(label_color),
+                            egui::RichText::new("Saved chats for this folder appear here.")
+                                .size(12.0)
+                                .color(p.faint),
                         );
-                        if ui
-                            .add(egui::Slider::new(
-                                &mut self.settings.max_content_chars,
-                                1000..=5000000,
-                            ))
-                            .changed()
-                        {
-                            changed = true;
+                    }
+
+                    if let Some(id) = session_to_load {
+                        if let Some(loaded_sess) = crate::agent::session::Session::load_by_id(
+                            &self.settings.project_root,
+                            &id,
+                        ) {
+                            if let Some(ref saved_root) = loaded_sess.project_root {
+                                let saved_path = std::path::PathBuf::from(saved_root);
+                                if saved_path.exists()
+                                    && saved_path.is_dir()
+                                    && saved_path != self.settings.project_root
+                                {
+                                    let ctx = ui.ctx().clone();
+                                    self.load_project_folder(&saved_path, ctx);
+                                }
+                            }
+                            if self.current_session_id.is_none() {
+                                self.active_messages_backup = Some(self.messages.clone());
+                            }
+                            self.current_session_id = Some(id.clone());
+                            self.messages = loaded_sess
+                                .messages
+                                .iter()
+                                .filter_map(|m| {
+                                    let role = match m.role {
+                                        crate::ai::types::Role::User => "user",
+                                        crate::ai::types::Role::Assistant => "assistant",
+                                        crate::ai::types::Role::System
+                                        | crate::ai::types::Role::Tool => return None,
+                                    };
+                                    let mut content = m.text();
+                                    // The agent appends a path note to attachments; the bubble shows the prompt only.
+                                    if let Some(cut) = content.find("\n\n[Attached file: `") {
+                                        content.truncate(cut);
+                                    }
+                                    if content.trim().is_empty() {
+                                        return None;
+                                    }
+                                    Some(GuiMessage {
+                                        role: role.to_string(),
+                                        content,
+                                        thinking: None,
+                                        is_thinking_done: true,
+                                        tool_logs: Vec::new(),
+                                        attached_image: None,
+                                    })
+                                })
+                                .collect();
+                            self.session_written_files.clear();
+                            self.file_diff_stats.clear();
+                            self.terminal_entries.clear();
+                            let title = format!("Chat ({})", &id[..6.min(id.len())]);
+                            self.status_text = format!("Loaded conversation: {}", title);
                         }
+                    }
 
-                        ui.add_space(12.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-
-                        // ── System Prompt section ──
-                        ui.label(
-                            egui::RichText::new("CUSTOM SYSTEM INSTRUCTIONS")
-                                .size(11.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(167, 139, 250)),
-                        );
-                        ui.add_space(4.0);
-
-                        let mut val = self
+                    if let Some(id) = session_to_delete {
+                        let session_dir = self
                             .settings
-                            .custom_system_prompt
-                            .clone()
-                            .unwrap_or_default();
+                            .project_root
+                            .join(".norvexum")
+                            .join("sessions");
+                        let file_path = session_dir.join(format!("{}.json", id));
+                        if std::fs::remove_file(&file_path).is_ok() {
+                            if self.current_session_id.as_deref() == Some(&id) {
+                                if let Some(active_messages) = self.active_messages_backup.take() {
+                                    self.messages = active_messages;
+                                }
+                                self.current_session_id = None;
+                                self.session_written_files.clear();
+                                self.file_diff_stats.clear();
+                                self.terminal_entries.clear();
+                            }
+                            self.history_sessions =
+                                crate::agent::session::Session::list(&self.settings.project_root);
+                            self.status_text = "Session deleted.".to_string();
+                        }
+                    }
+
+                    ui.add_space(16.0);
+
+                    // ── Workspace folder ──
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new("Workspace").size(13.0).color(p.text),
+                    )
+                    .id_salt("sidebar_workspace")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        self.draw_workspace_picker(ui, ctx, p);
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for (label, section) in [
+                            ("API keys", SettingsSection::ApiKeys),
+                            ("Skills", SettingsSection::Skills),
+                            ("Permissions", SettingsSection::Permissions),
+                        ] {
+                            if style::link_button(ui, label, p).clicked() {
+                                self.settings_section = section;
+                                self.show_settings_modal = true;
+                            }
+                        }
+                    });
+                });
+        });
+        if !left_animating && self.left_sidebar_open {
+            self.left_sidebar_width = panel_response.response.rect.width();
+        }
+    }
+
+    fn draw_right_sidebar(&mut self, ctx: &egui::Context, p: &Palette) {
+        let target_right_t = if self.right_sidebar_open { 1.0 } else { 0.0 };
+        let right_t_raw =
+            ctx.animate_value_with_time(egui::Id::new("right_sidebar_anim"), target_right_t, 0.18);
+        let right_t = 1.0 - (1.0 - right_t_raw.clamp(0.0, 1.0)).powi(3);
+        let right_animating = (right_t_raw - target_right_t).abs() > 0.005;
+        if right_t <= 0.005 {
+            return;
+        }
+
+        let mut right_panel = egui::SidePanel::right("right_sidebar")
+            .frame(
+                egui::Frame::none()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::same(12.0)),
+            )
+            .resizable(!right_animating && self.right_sidebar_open)
+            .width_range(60.0..=1200.0);
+        if right_animating {
+            right_panel = right_panel.exact_width(self.right_sidebar_width * right_t);
+        } else {
+            right_panel = right_panel.default_width(self.right_sidebar_width);
+        }
+
+        let panel_response = right_panel.show(ctx, |ui| {
+            let bg_procs = crate::tools::shell::get_background_processes();
+            if !bg_procs.is_empty() {
+                style::section_label(ui, &format!("Background processes · {}", bg_procs.len()), p);
+                for proc in bg_procs {
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if style::link_button(ui, "Kill", p)
+                                .on_hover_text("Kill this background process")
+                                .clicked()
+                            {
+                                crate::tools::shell::kill_background_process(proc.pid);
+                            }
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{}", proc.pid))
+                                            .font(egui::FontId::monospace(11.0))
+                                            .color(p.faint),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&proc.command)
+                                                .font(egui::FontId::monospace(12.0))
+                                                .color(p.text),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&proc.command);
+                                },
+                            );
+                        });
+                    });
+                }
+                ui.add_space(12.0);
+            }
+
+            // Tabs
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let changed_label = format!("Changed  {}", self.session_written_files.len());
+                if style::nav_button(ui, &changed_label, self.right_tab == RightTab::Changed, p)
+                    .on_hover_text("Files created or changed in this chat")
+                    .clicked()
+                {
+                    self.right_tab = RightTab::Changed;
+                }
+                let all_label = format!("All files  {}", self.workspace_files.len());
+                if style::nav_button(ui, &all_label, self.right_tab == RightTab::All, p)
+                    .on_hover_text("Browse the workspace")
+                    .clicked()
+                {
+                    self.right_tab = RightTab::All;
+                }
+                if self.right_tab == RightTab::All && !self.expanded_dirs.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if style::link_button(ui, "Collapse", p)
+                            .on_hover_text("Collapse all folders")
+                            .clicked()
+                        {
+                            self.expanded_dirs.clear();
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
+
+            let list_h = if self.selected_file.is_some() {
+                (ui.available_height() * 0.42).max(120.0)
+            } else {
+                ui.available_height()
+            };
+            let mut file_to_inspect = None;
+            let time = ui.input(|i| i.time) as f32;
+            let selected = self.selected_file.clone();
+
+            // Live diff counts for the file being written, persisted counts otherwise.
+            let writing_file = self
+                .current_writing_file
+                .as_ref()
+                .filter(|_| self.current_writing_status.as_deref() == Some("writing"))
+                .map(|(f, _, _)| f.clone());
+            let live = self.current_writing_file.clone();
+            let stats = &self.file_diff_stats;
+            let decor = |path: &str| -> FileDecor {
+                let (added, deleted) = match &live {
+                    Some((f, a, d)) if f == path => (*a, *d),
+                    _ => stats.get(path).copied().unwrap_or((0, 0)),
+                };
+                FileDecor {
+                    writing: writing_file.as_deref() == Some(path),
+                    added,
+                    deleted,
+                }
+            };
+            if writing_file.is_some() {
+                ui.ctx().request_repaint();
+            }
+
+            match self.right_tab {
+                RightTab::Changed => {
+                    let mut display_files = self.session_written_files.clone();
+                    if let Some(ref active_file) = writing_file {
+                        if !active_file.is_empty() && !display_files.contains(active_file) {
+                            display_files.push(active_file.clone());
+                        }
+                    }
+
+                    if display_files.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Files the agent creates or edits in this chat show up here, live.",
+                            )
+                            .size(12.5)
+                            .color(p.faint),
+                        );
+                    } else {
+                        let tree = FileTree::build(&display_files);
+                        let mut view = TreeView {
+                            expanded: &mut self.expanded_dirs,
+                            force_open: true,
+                            selected: selected.as_deref(),
+                            decor: &decor,
+                            clicked: None,
+                            p,
+                            time,
+                        };
+                        egui::ScrollArea::vertical()
+                            .id_salt("workspace_file_list")
+                            .max_height(list_h)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                draw_tree(ui, &tree, "", 0, &mut view);
+                            });
+                        file_to_inspect = view.clicked.take();
+                    }
+                }
+                RightTab::All => {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.file_filter)
+                            .hint_text("Filter files")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(4.0);
+                    if self.file_tree_dirty || self.file_tree_filter != self.file_filter {
+                        let query = self.file_filter.to_lowercase();
+                        self.file_tree = FileTree::build(
+                            self.workspace_files
+                                .iter()
+                                .filter(|f| query.is_empty() || f.to_lowercase().contains(&query)),
+                        );
+                        self.file_tree_filter = self.file_filter.clone();
+                        self.file_tree_dirty = false;
+                    }
+                    if self.is_loading_files && self.workspace_files.is_empty() {
+                        ui.label(egui::RichText::new("Scanning…").size(12.5).color(p.faint));
+                    } else if self.file_tree.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No matching files")
+                                .size(12.5)
+                                .color(p.faint),
+                        );
+                    } else {
+                        let mut view = TreeView {
+                            expanded: &mut self.expanded_dirs,
+                            force_open: !self.file_filter.is_empty(),
+                            selected: selected.as_deref(),
+                            decor: &decor,
+                            clicked: None,
+                            p,
+                            time,
+                        };
+                        let tree = &self.file_tree;
+                        egui::ScrollArea::vertical()
+                            .id_salt("all_files_list")
+                            .max_height((list_h - 34.0).max(80.0))
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                draw_tree(ui, tree, "", 0, &mut view);
+                            });
+                        file_to_inspect = view.clicked.take();
+                    }
+                }
+            }
+
+            if let Some(filename) = file_to_inspect {
+                self.inspect_file(&filename);
+            }
+
+            if let Some(filename) = self.selected_file.clone() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if style::link_button(ui, "Close", p)
+                            .on_hover_text("Close preview")
+                            .clicked()
+                        {
+                            self.selected_file = None;
+                            self.inspected_file_content.clear();
+                            self.inspector_error = None;
+                        }
+                        if style::link_button(ui, "Open", p)
+                            .on_hover_text("Open in the default app")
+                            .clicked()
+                        {
+                            let _ = open::that(self.settings.project_root.join(&filename));
+                        }
+                        if style::link_button(ui, "Copy path", p).clicked() {
+                            ui.ctx().copy_text(filename.clone());
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&filename)
+                                        .font(egui::FontId::monospace(12.0))
+                                        .color(p.text),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&filename);
+                        });
+                    });
+                });
+
+                if let Some((ref live_file, added, deleted)) = self.current_writing_file {
+                    if *live_file == filename
+                        && self.current_writing_status.as_deref() == Some("writing")
+                    {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            style::dot(ui, p.accent);
+                            ui.label(
+                                egui::RichText::new("Agent is writing this file")
+                                    .size(12.0)
+                                    .color(p.accent),
+                            );
+                            diff_counts(ui, added, deleted, p);
+                        });
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let mut filter = self.line_range_enabled;
+                    if ui.checkbox(&mut filter, "Lines").changed() {
+                        self.line_range_enabled = filter;
+                        if filter && self.line_range_end == 0 {
+                            self.line_range_end = self.line_range_total_lines.min(100);
+                        }
+                        self.inspect_file(&filename);
+                    }
+                    if self.line_range_enabled {
+                        let mut start = self.line_range_start;
                         if ui
                             .add(
-                                egui::TextEdit::multiline(&mut val)
-                                    .desired_rows(6)
-                                    .desired_width(ui.available_width() - 20.0),
+                                egui::DragValue::new(&mut start)
+                                    .range(1..=self.line_range_total_lines.max(1)),
                             )
                             .changed()
                         {
-                            self.settings.custom_system_prompt = if val.trim().is_empty() {
-                                None
-                            } else {
-                                Some(val)
-                            };
-                            changed = true;
+                            self.line_range_start = start;
+                            self.inspect_file(&filename);
                         }
-
-                        if changed {
-                            self.sync_settings();
+                        ui.label(egui::RichText::new("to").color(p.dim));
+                        let mut end = self.line_range_end;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut end)
+                                    .range(1..=self.line_range_total_lines.max(1)),
+                            )
+                            .changed()
+                        {
+                            self.line_range_end = end;
+                            self.inspect_file(&filename);
                         }
-                    });
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("💾 Save Settings").clicked() {
-                        save_clicked = true;
+                    }
+                    ui.add_space(8.0);
+                    let mut edits = self.manual_edits_enabled;
+                    if ui.checkbox(&mut edits, "Edit").changed() {
+                        self.manual_edits_enabled = edits;
+                        if !edits {
+                            self.inspected_file_edited = false;
+                            self.inspect_file(&filename);
+                        }
+                    }
+                    if self.manual_edits_enabled && style::primary_button(ui, "Save", p).clicked() {
+                        if let Err(e) = self.save_inspected_file_changes() {
+                            self.inspector_error = Some(format!("Failed to save: {e}"));
+                        } else {
+                            self.status_text = "Saved!".to_string();
+                        }
                     }
                 });
-            });
-        if save_clicked {
-            self.sync_settings();
-            open = false;
+                ui.add_space(4.0);
+
+                if let Some(error) = &self.inspector_error {
+                    ui.label(egui::RichText::new(error).size(12.0).color(p.danger));
+                } else {
+                    let is_active_writing = self
+                        .current_writing_file
+                        .as_ref()
+                        .is_some_and(|(name, _, _)| Some(name) == self.selected_file.as_ref());
+
+                    let active_range = self.get_active_editing_range();
+                    let is_active_file = self.selected_file.as_ref().is_some()
+                        && self.selected_file.as_ref()
+                            == self.current_writing_file.as_ref().map(|(n, _, _)| n);
+
+                    egui::Frame::none()
+                        .fill(p.code_bg)
+                        .stroke(egui::Stroke::new(1.0, p.border))
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::same(8.0))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::both()
+                                .id_salt("inline_file_inspector")
+                                .auto_shrink([false, false])
+                                .stick_to_bottom(is_active_writing)
+                                .show(ui, |ui| {
+                                    if self.manual_edits_enabled {
+                                        let edit_resp = ui.add(
+                                            egui::TextEdit::multiline(
+                                                &mut self.inspected_file_content,
+                                            )
+                                            .font(egui::TextStyle::Monospace)
+                                            .frame(false)
+                                            .desired_width(f32::INFINITY)
+                                            .interactive(true),
+                                        );
+                                        if edit_resp.changed() {
+                                            self.inspected_file_edited = true;
+                                        }
+                                    } else {
+                                        let lines: Vec<&str> =
+                                            self.inspected_file_content.lines().collect();
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 1.0;
+                                            let start_line_num = if self.line_range_enabled {
+                                                self.line_range_start
+                                            } else {
+                                                1
+                                            };
+                                            let mono = egui::FontId::monospace(11.5);
+                                            for (idx, line_content) in lines.iter().enumerate() {
+                                                let line_num = start_line_num + idx;
+                                                let is_highlighted = is_active_file
+                                                    && active_range.is_some_and(|(start, end)| {
+                                                        line_num >= start && line_num <= end
+                                                    });
+
+                                                let response = ui
+                                                    .horizontal(|ui| {
+                                                        if is_highlighted {
+                                                            let rect = ui.max_rect();
+                                                            ui.painter().rect_filled(
+                                                                rect,
+                                                                0.0,
+                                                                p.accent_soft,
+                                                            );
+                                                        }
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "{:>4}  ",
+                                                                line_num
+                                                            ))
+                                                            .font(mono.clone())
+                                                            .color(if is_highlighted {
+                                                                p.accent
+                                                            } else {
+                                                                p.faint
+                                                            }),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(*line_content)
+                                                                .font(mono.clone())
+                                                                .color(p.text),
+                                                        )
+                                                    })
+                                                    .response;
+
+                                                if is_active_file {
+                                                    if let Some((start, _)) = active_range {
+                                                        if self.should_scroll_to_line == Some(start)
+                                                            && line_num == start
+                                                        {
+                                                            response.scroll_to_me(Some(
+                                                                egui::Align::Center,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
+                        });
+                }
+            }
+        });
+        if !right_animating && self.right_sidebar_open {
+            self.right_sidebar_width = panel_response.response.rect.width();
         }
-        self.show_settings_modal = open;
+    }
+
+    fn draw_composer(&mut self, ctx: &egui::Context, p: &Palette) {
+        egui::TopBottomPanel::bottom("bottom_input_panel")
+            .frame(egui::Frame::none().fill(p.bg).inner_margin(egui::Margin {
+                left: 16.0,
+                right: 16.0,
+                top: 6.0,
+                bottom: 12.0,
+            }))
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let full = ui.available_width();
+                let col = full.min(style::MAX_COLUMN);
+                let pad = ((full - col) / 2.0).max(0.0);
+                egui::Frame::none()
+                    .inner_margin(egui::Margin {
+                        left: pad,
+                        right: pad,
+                        top: 0.0,
+                        bottom: 0.0,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(col);
+                        self.draw_composer_column(ui, p);
+                    });
+            });
+    }
+
+    fn draw_composer_column(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if self.current_session_id.is_some() {
+            ui.horizontal(|ui| {
+                style::dot(ui, p.accent);
+                ui.label(
+                    egui::RichText::new("Viewing a saved chat. New messages continue it.")
+                        .size(12.0)
+                        .color(p.dim),
+                );
+            });
+            ui.add_space(4.0);
+        }
+
+        // Tool approval card, right above the message box
+        let mut user_response = None;
+        if let Some(approval) = &self.approval_pending {
+            let tool_name = approval.tool_name.clone();
+            let args_preview = approval.args_preview.clone();
+
+            let mut target_summary = String::new();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&args_preview) {
+                if let Some(path) = v
+                    .get("path")
+                    .or_else(|| v.get("TargetFile"))
+                    .and_then(|x| x.as_str())
+                {
+                    target_summary = format!("File: {path}");
+                } else if let Some(cmd) = v.get("CommandLine").and_then(|x| x.as_str()) {
+                    target_summary = format!("Command: {cmd}");
+                } else if let Some(url) = v.get("Url").and_then(|x| x.as_str()) {
+                    target_summary = format!("URL: {url}");
+                } else if let Some(obj) = v.as_object() {
+                    let mut parts = Vec::new();
+                    for (k, val) in obj {
+                        if k != "content"
+                            && k != "ReplacementContent"
+                            && k != "TargetContent"
+                            && k != "CodeContent"
+                        {
+                            let val_str = val.to_string();
+                            if val_str.len() > 60 {
+                                parts.push(format!(
+                                    "{}: {}",
+                                    k,
+                                    crate::util::truncate_chars(&val_str, 60)
+                                ));
+                            } else {
+                                parts.push(format!("{}: {}", k, val_str));
+                            }
+                        }
+                    }
+                    target_summary = parts.join(", ");
+                }
+            }
+            if target_summary.is_empty() {
+                target_summary = args_preview.clone();
+            }
+            if target_summary.len() > 120 {
+                target_summary = crate::util::truncate_chars(&target_summary, 120);
+            }
+
+            egui::Frame::none()
+                .fill(p.surface)
+                .stroke(egui::Stroke::new(1.0, p.warn.gamma_multiply(0.7)))
+                .rounding(10.0)
+                .inner_margin(egui::Margin::same(12.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        style::dot(ui, p.warn);
+                        ui.label(
+                            egui::RichText::new("Allow this tool call?")
+                                .font(style::strong(13.0))
+                                .color(p.text),
+                        );
+                        ui.label(
+                            egui::RichText::new(&tool_name)
+                                .font(egui::FontId::monospace(12.5))
+                                .color(p.dim),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    egui::Frame::none()
+                        .fill(p.code_bg)
+                        .rounding(6.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&target_summary)
+                                        .font(egui::FontId::monospace(12.0))
+                                        .color(p.text),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if style::primary_button(ui, "Allow", p).clicked() {
+                            user_response = Some(true);
+                        }
+                        if style::secondary_button(ui, "Deny", p).clicked() {
+                            user_response = Some(false);
+                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Enter to allow · Esc to deny")
+                                .size(11.5)
+                                .color(p.faint),
+                        );
+                    });
+                });
+            ui.add_space(8.0);
+        }
+
+        if let Some(approved) = user_response {
+            if let Some(_approval) = self.approval_pending.take() {
+                let _ = self.approval_tx.send(approved);
+            }
+        }
+
+        // Attachment chip
+        let mut remove_attachment = false;
+        if let Some(ref path) = self.attached_image {
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+            ui.horizontal(|ui| {
+                egui::Frame::none()
+                    .fill(p.surface)
+                    .stroke(egui::Stroke::new(1.0, p.border))
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(egui::RichText::new(filename).size(12.0).color(p.text));
+                            if style::link_button(ui, "×", p)
+                                .on_hover_text("Remove attachment")
+                                .clicked()
+                            {
+                                remove_attachment = true;
+                            }
+                        });
+                    });
+            });
+            ui.add_space(4.0);
+        }
+        if remove_attachment {
+            self.attached_image = None;
+        }
+
+        // Message box
+        let composer_id = egui::Id::new("composer_input");
+        let focused = ui.memory(|m| m.has_focus(composer_id));
+        egui::Frame::none()
+            .fill(p.surface)
+            .stroke(egui::Stroke::new(
+                1.0,
+                if focused {
+                    p.accent.gamma_multiply(0.55)
+                } else {
+                    p.border
+                },
+            ))
+            .rounding(12.0)
+            .inner_margin(egui::Margin {
+                left: 12.0,
+                right: 8.0,
+                top: 10.0,
+                bottom: 6.0,
+            })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let mut edit_response_opt = None;
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .id_salt("prompt_input_scroll")
+                    .show(ui, |ui| {
+                        let hint = if self.is_processing {
+                            "Queue a follow-up…"
+                        } else {
+                            "Message Norvexum…"
+                        };
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut self.input_text)
+                                .id(composer_id)
+                                .hint_text(egui::RichText::new(hint).color(p.faint))
+                                .text_color(p.text)
+                                .font(egui::FontId::proportional(14.0))
+                                .desired_rows(1)
+                                .margin(egui::vec2(0.0, 2.0))
+                                .frame(false)
+                                .desired_width(f32::INFINITY),
+                        );
+                        edit_response_opt = Some(resp);
+                    });
+
+                let edit_response = edit_response_opt.unwrap();
+                if std::mem::take(&mut self.focus_composer) {
+                    edit_response.request_focus();
+                }
+
+                // Up in an empty box recalls the last prompt.
+                if edit_response.has_focus()
+                    && self.input_text.is_empty()
+                    && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                {
+                    if let Some(last) = self.messages.iter().rev().find(|m| m.role == "user") {
+                        self.input_text = last.content.clone();
+                    }
+                }
+
+                if edit_response.has_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
+                {
+                    self.send_message();
+                    edit_response.request_focus();
+                }
+
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.style_mut().spacing.interact_size.y = 24.0;
+                    if attachment_button(ui, p).clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            self.attached_image = Some(path);
+                            self.status_text = "File attached!".to_string();
+                        }
+                    }
+
+                    let registry = build_registry();
+                    let mut current_provider_idx = registry
+                        .iter()
+                        .position(|p| p.name == self.settings.active_provider)
+                        .unwrap_or(0);
+
+                    egui::ComboBox::from_id_salt("provider_select_bottom")
+                        .selected_text(
+                            egui::RichText::new(&registry[current_provider_idx].display_name)
+                                .size(12.0)
+                                .color(p.dim),
+                        )
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for (idx, provider) in registry.iter().enumerate() {
+                                if ui.selectable_value(&mut current_provider_idx, idx, &provider.display_name).clicked() {
+                                    self.settings.active_provider = provider.name.clone();
+                                    if let Some(first_model) = provider.models.first() {
+                                        self.settings.active_model = first_model.id.clone();
+                                    }
+                                    self.sync_settings();
+                                }
+                            }
+                        });
+
+                    let active_provider = &registry[current_provider_idx];
+                    let mut model_display = self.settings.active_model.clone();
+                    if model_display.chars().count() > 30 {
+                        model_display = crate::util::truncate_chars(&model_display, 27);
+                    }
+
+                    let popup_id = ui.make_persistent_id("model_search_popup");
+                    let button_res = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(model_display).size(12.0).color(p.dim),
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::new(1.0, p.border))
+                            .rounding(6.0),
+                        )
+                        .on_hover_text("Choose a model");
+                    if button_res.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                    }
+                    egui::popup::popup_above_or_below_widget(ui, popup_id, &button_res, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                        ui.set_min_width(320.0);
+                        ui.set_min_height(250.0); // Prevent the Above popup bug where it gets stuck at a small height
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.model_search_query)
+                                .hint_text("Search models")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                            let mut starred = Vec::new();
+                            let mut unstarred = Vec::new();
+                            let query = self.model_search_query.to_lowercase();
+                            for model in &active_provider.models {
+                                if !query.is_empty() && !model.id.to_lowercase().contains(&query) {
+                                    continue;
+                                }
+                                if self.settings.starred_models.contains(&model.id) {
+                                    starred.push(model);
+                                } else {
+                                    unstarred.push(model);
+                                }
+                            }
+                            if starred.is_empty() && unstarred.is_empty() {
+                                ui.label(egui::RichText::new("No models match").size(12.5).color(p.faint));
+                            }
+
+                            let mut render_model = |ui: &mut egui::Ui, model: &crate::config::providers::ModelInfo| {
+                                ui.horizontal(|ui| {
+                                    let is_starred = self.settings.starred_models.contains(&model.id);
+                                    let star_icon = if is_starred { "⭐" } else { "☆" };
+                                    let star_color = if is_starred { p.warn } else { p.faint };
+                                    if ui
+                                        .add(egui::Button::new(egui::RichText::new(star_icon).color(star_color)).frame(false))
+                                        .on_hover_text(if is_starred { "Unpin" } else { "Pin to top" })
+                                        .clicked()
+                                    {
+                                        if is_starred {
+                                            self.settings.starred_models.retain(|id| id != &model.id);
+                                        } else {
+                                            self.settings.starred_models.push(model.id.clone());
+                                        }
+                                        self.sync_settings();
+                                    }
+
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.settings.active_model,
+                                            model.id.clone(),
+                                            egui::RichText::new(&model.id).size(12.5),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.sync_settings();
+                                        ui.memory_mut(|mem| mem.close_popup());
+                                    }
+
+                                    // Capability badges
+                                    let mut badges = Vec::new();
+                                    if matches!(model.vision, crate::config::providers::Vision::Yes) {
+                                        badges.push("vision".to_string());
+                                    }
+                                    if model.tool_calling {
+                                        badges.push("tools".to_string());
+                                    }
+                                    let ctx_k = model.context_window / 1000;
+                                    if ctx_k > 0 {
+                                        badges.push(format!("{ctx_k}k"));
+                                    }
+                                    if !badges.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(badges.join(" · "))
+                                                .size(11.0)
+                                                .color(p.faint),
+                                        );
+                                    }
+                                });
+                            };
+
+                            if !starred.is_empty() {
+                                for model in starred { render_model(ui, model); }
+                                ui.separator();
+                            }
+                            for model in unstarred { render_model(ui, model); }
+                        });
+                    });
+
+                    if self.settings.active_provider.to_lowercase().contains("anthropic") {
+                        if let Some(model) = active_provider.models.iter().find(|m| m.id == self.settings.active_model) {
+                            if !model.effort_levels.is_empty() || model.adaptive_thinking {
+                                let current_effort = self.settings.thinking_effort.clone().unwrap_or_else(|| "none".to_string());
+                                let label = if current_effort == "none" {
+                                    "Reasoning: off".to_string()
+                                } else {
+                                    format!("Reasoning: {}", current_effort)
+                                };
+                                egui::ComboBox::from_id_salt("thinking_select_bottom")
+                                    .selected_text(egui::RichText::new(label).size(12.0).color(p.dim))
+                                    .width(120.0)
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_value(&mut self.settings.thinking_effort, Some("none".to_string()), "Off").clicked() {
+                                            self.sync_settings();
+                                        }
+                                        for lvl in &model.effort_levels {
+                                            if ui.selectable_value(&mut self.settings.thinking_effort, Some(lvl.clone()), lvl).clicked() {
+                                                self.sync_settings();
+                                            }
+                                        }
+                                        if model.adaptive_thinking
+                                            && ui.selectable_value(&mut self.settings.thinking_effort, Some("adaptive".to_string()), "Adaptive").clicked() {
+                                                self.sync_settings();
+                                            }
+                                    });
+                            }
+                        }
+                    } else if self.probing_in_progress {
+                        ui.label(egui::RichText::new("Checking model…").size(11.5).color(p.faint));
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let has_text = !self.input_text.trim().is_empty();
+                        let send_hint = if self.is_processing {
+                            "Queue this message  (Enter)"
+                        } else {
+                            "Send  (Enter)"
+                        };
+                        if send_button(ui, has_text, p).on_hover_text(send_hint).clicked() && has_text {
+                            self.send_message();
+                            edit_response.request_focus();
+                        }
+                        if self.is_processing && stop_button(ui, p).clicked() {
+                            self.stop_run();
+                        }
+                        if ui.available_width() > 230.0 {
+                            ui.label(
+                                egui::RichText::new("Shift+Enter for a new line")
+                                    .size(11.0)
+                                    .color(p.faint),
+                            );
+                        }
+                    });
+                });
+            });
+    }
+
+    fn draw_terminal(&mut self, ctx: &egui::Context, p: &Palette) {
+        egui::TopBottomPanel::bottom("terminal_panel")
+            .frame(
+                egui::Frame::none()
+                    .fill(p.code_bg)
+                    .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
+            )
+            .resizable(true)
+            .default_height(180.0)
+            .max_height(400.0)
+            .min_height(80.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    style::section_label(ui, "Terminal", p);
+                    ui.label(
+                        egui::RichText::new(format!("{} commands", self.terminal_entries.len()))
+                            .size(11.0)
+                            .color(p.faint),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if style::link_button(ui, "Hide", p)
+                            .on_hover_text("Hide terminal  (Ctrl+J)")
+                            .clicked()
+                        {
+                            self.show_terminal_panel = false;
+                        }
+                        if style::link_button(ui, "Clear", p).clicked() {
+                            self.terminal_entries.clear();
+                        }
+
+                        let bg_procs = crate::tools::shell::get_background_processes();
+                        if !bg_procs.is_empty()
+                            && ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!(
+                                            "Kill {} background",
+                                            bg_procs.len()
+                                        ))
+                                        .size(11.5)
+                                        .color(p.danger),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE),
+                                )
+                                .clicked()
+                        {
+                            for proc in bg_procs {
+                                crate::tools::shell::kill_background_process(proc.pid);
+                            }
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+
+                let is_running_cmd = self.is_processing
+                    && self.current_tool_name.as_ref().is_some_and(|name| {
+                        name == "run_command"
+                            || name == "shell"
+                            || name == "shell_command"
+                            || name == "execute"
+                    });
+
+                let mono = egui::FontId::monospace(12.0);
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false; 2])
+                    .id_salt("terminal_scroll")
+                    .show(ui, |ui| {
+                        if self.terminal_entries.is_empty() && !is_running_cmd {
+                            ui.label(
+                                egui::RichText::new("Commands the agent runs show up here.")
+                                    .size(12.0)
+                                    .color(p.faint),
+                            );
+                            return;
+                        }
+                        let entries = self.terminal_entries.clone();
+                        for (i, entry) in entries.iter().enumerate() {
+                            let prompt_color = if entry.success { p.success } else { p.danger };
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new("$")
+                                        .font(mono.clone())
+                                        .color(prompt_color),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&entry.command)
+                                        .font(mono.clone())
+                                        .color(p.text),
+                                );
+                            });
+
+                            // Output (truncated to prevent huge renders)
+                            if !entry.output.is_empty() {
+                                let output_text = if entry.output.len() > 2000 {
+                                    format!(
+                                        "{}\n(truncated)",
+                                        crate::util::truncate_chars(&entry.output, 2000)
+                                    )
+                                } else {
+                                    entry.output.clone()
+                                };
+                                ui.label(
+                                    egui::RichText::new(&output_text)
+                                        .font(egui::FontId::monospace(11.5))
+                                        .color(p.dim),
+                                );
+                            }
+
+                            if i + 1 < entries.len() || is_running_cmd {
+                                ui.add_space(4.0);
+                                let rect = ui.available_rect_before_wrap();
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(rect.left(), rect.top()),
+                                        egui::pos2(rect.right(), rect.top()),
+                                    ],
+                                    egui::Stroke::new(1.0, p.border),
+                                );
+                                ui.add_space(6.0);
+                            }
+                        }
+
+                        // If currently executing a shell command, show it live
+                        if is_running_cmd {
+                            let cmd = extract_streaming_content(&self.current_tool_args, "command");
+                            let mut cmd_line = if cmd.is_empty() {
+                                extract_streaming_content(&self.current_tool_args, "CommandLine")
+                            } else {
+                                cmd
+                            };
+                            if cmd_line.is_empty() {
+                                cmd_line =
+                                    extract_streaming_content(&self.current_tool_args, "cmd");
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new("$").font(mono.clone()).color(p.accent),
+                                );
+                                let time = ui.input(|i| i.time);
+                                let cursor = if (time * 2.0) as i64 % 2 == 0 {
+                                    "█"
+                                } else {
+                                    " "
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("{} {}", cmd_line, cursor))
+                                        .font(mono.clone())
+                                        .color(p.text),
+                                );
+                            });
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_millis(250));
+                        }
+                    });
+            });
+    }
+
+    fn draw_empty_state(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let avail = ui.available_height();
+        ui.add_space((avail * 0.22).clamp(24.0, 170.0));
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Image::new(&self.logo_tex).fit_to_exact_size(egui::vec2(48.0, 48.0)));
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new("What should we build?")
+                    .font(style::strong(22.0))
+                    .color(p.text),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(format!("Working in {}", self.project_name()))
+                    .size(13.0)
+                    .color(p.dim),
+            );
+            ui.add_space(22.0);
+            let w = ui.available_width().min(400.0);
+            for suggestion in SUGGESTIONS {
+                let resp = ui.add_sized(
+                    [w, 34.0],
+                    egui::Button::new(egui::RichText::new(*suggestion).size(13.0).color(p.dim))
+                        .fill(p.surface)
+                        .stroke(egui::Stroke::new(1.0, p.border))
+                        .rounding(8.0),
+                );
+                if resp.clicked() {
+                    self.input_text = suggestion.to_string();
+                    self.focus_composer = true;
+                }
+            }
+            for msg in &self.messages {
+                if msg.content.contains("🧹") || msg.content.contains("cleared") {
+                    ui.add_space(14.0);
+                    ui.label(
+                        egui::RichText::new(style::clean_label(&msg.content))
+                            .size(12.0)
+                            .color(p.faint),
+                    );
+                }
+            }
+            ui.add_space(18.0);
+            ui.label(
+                egui::RichText::new("Drop a folder here to open it  ·  Ctrl+/ for shortcuts")
+                    .size(11.5)
+                    .color(p.faint),
+            );
+        });
+    }
+
+    fn draw_conversation(&mut self, ctx: &egui::Context, p: &Palette) {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(p.bg)
+                    .inner_margin(egui::Margin::symmetric(16.0, 0.0)),
+            )
+            .show(ctx, |ui| {
+                enum PendingAction {
+                    Edit(String),
+                    Reroll(String),
+                    Undo,
+                }
+                let mut pending_action = None;
+
+                let has_user_messages = self.messages.iter().any(|m| m.role == "user");
+                if !has_user_messages && !self.is_processing {
+                    self.draw_empty_state(ui, p);
+                } else {
+                    let mut scroll = egui::ScrollArea::vertical()
+                        .id_salt("chat_scroll")
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true);
+                    if std::mem::take(&mut self.scroll_to_bottom) {
+                        scroll = scroll.vertical_scroll_offset(self.chat_max_offset);
+                    }
+                    let output = scroll.show(ui, |ui| {
+                        let full = ui.available_width();
+                        let col = full.min(style::MAX_COLUMN);
+                        let pad = ((full - col) / 2.0).max(0.0);
+                        egui::Frame::none()
+                            .inner_margin(egui::Margin {
+                                left: pad,
+                                right: pad,
+                                top: 20.0,
+                                bottom: 16.0,
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(col);
+                                let available_chat_width = col;
+
+                                let last_agent_idx = self
+                                    .messages
+                                    .iter()
+                                    .enumerate()
+                                    .rfind(|(_, m)| m.role == "assistant")
+                                    .map(|(idx, _)| idx);
+
+                                // A reply is split into several bubbles around tool calls;
+                                // draw them as one message with one action row at the end.
+                                let shown: Vec<usize> = self
+                                    .messages
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, m)| is_message_shown(m))
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                let mut continues = vec![false; self.messages.len()];
+                                for pair in shown.windows(2) {
+                                    if self.messages[pair[0]].role == "assistant"
+                                        && self.messages[pair[1]].role == "assistant"
+                                    {
+                                        continues[pair[0]] = true;
+                                    }
+                                }
+
+                                for (msg_idx, msg) in self.messages.iter().enumerate() {
+                                    if !is_message_shown(msg) {
+                                        continue;
+                                    }
+                                    let is_user = msg.role == "user";
+                                    let is_status = msg.role == "status";
+                                    let is_err = msg.role == "error";
+
+                                    if is_status {
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(style::clean_label(&msg.content))
+                                                    .size(12.0)
+                                                    .color(p.faint),
+                                            );
+                                        });
+                                    } else if is_err {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("Error")
+                                                    .font(style::strong(12.5))
+                                                    .color(p.danger),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(style::clean_label(&msg.content))
+                                                    .size(12.5)
+                                                    .color(p.danger),
+                                            );
+                                        });
+                                    } else {
+                                        let alignment = if is_user {
+                                            egui::Align::RIGHT
+                                        } else {
+                                            egui::Align::LEFT
+                                        };
+
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(available_chat_width, 0.0),
+                                            egui::Layout::top_down(alignment),
+                                            |ui| {
+                                                let msg_response = ui
+                                                    .with_layout(egui::Layout::top_down(alignment), |ui| {
+                                                        if is_user {
+                                                            if let Some(ref img_path) = msg.attached_image {
+                                                                let filename = img_path.file_name().and_then(|n| n.to_str()).unwrap_or("image.png");
+                                                                ui.label(
+                                                                    egui::RichText::new(format!("Attached {filename}"))
+                                                                        .size(11.5)
+                                                                        .color(p.faint),
+                                                                );
+                                                            }
+                                                            let max_bubble_width =
+                                                                (available_chat_width * 0.78).clamp(220.0, 640.0);
+                                                            let inner_pad_x = 14.0;
+                                                            let inner_pad_total = inner_pad_x * 2.0;
+                                                            let text_max_width =
+                                                                (max_bubble_width - inner_pad_total).max(60.0);
+
+                                                            // Smooth fade-in for a newly-arriving bubble
+                                                            let entry_t = ui
+                                                                .ctx()
+                                                                .animate_value_with_time(
+                                                                    egui::Id::new(format!("user_bubble_in_{msg_idx}")),
+                                                                    1.0,
+                                                                    0.16,
+                                                                )
+                                                                .clamp(0.0, 1.0);
+                                                            let entry_alpha = 1.0 - (1.0 - entry_t).powi(3);
+
+                                                            // Measure the rendered text width to size the bubble
+                                                            let galley = ui.fonts(|f| {
+                                                                f.layout(
+                                                                    msg.content.clone(),
+                                                                    egui::FontId::proportional(style::BODY_SIZE),
+                                                                    p.text,
+                                                                    text_max_width,
+                                                                )
+                                                            });
+                                                            let text_w = galley.size().x.ceil();
+                                                            let bubble_w = (text_w + inner_pad_total + 2.0)
+                                                                .min(max_bubble_width);
+
+                                                            ui.allocate_ui_with_layout(
+                                                                egui::vec2(bubble_w, 0.0),
+                                                                egui::Layout::top_down(egui::Align::LEFT),
+                                                                |ui| {
+                                                                    ui.set_max_width(bubble_w);
+                                                                    egui::Frame::none()
+                                                                        .fill(p.bubble.linear_multiply(entry_alpha))
+                                                                        .inner_margin(egui::Margin::symmetric(inner_pad_x, 10.0))
+                                                                        .rounding(14.0)
+                                                                        .show(ui, |ui| {
+                                                                            if msg.content.len() > 1000 {
+                                                                                egui::ScrollArea::vertical()
+                                                                                    .max_height(220.0)
+                                                                                    .id_salt(format!("user_scroll_{}", msg_idx))
+                                                                                    .show(ui, |ui| {
+                                                                                        render_formatted_markdown(ui, &msg.content, p);
+                                                                                    });
+                                                                            } else {
+                                                                                render_formatted_markdown(ui, &msg.content, p);
+                                                                            }
+                                                                        });
+                                                                },
+                                                            );
+                                                        } else {
+                                                            ui.set_width(available_chat_width);
+
+                                                            // Thinking and tools, interleaved chronologically
+                                                            let is_latest_agent = Some(msg_idx) == last_agent_idx;
+                                                            let has_activity = !msg.tool_logs.is_empty()
+                                                                || msg.thinking.as_ref().is_some_and(|t| !t.trim().is_empty())
+                                                                || (is_latest_agent && self.is_processing);
+
+                                                            if has_activity {
+                                                                let (curr_name, curr_args) =
+                                                                    if is_latest_agent && self.is_processing {
+                                                                        (&self.current_tool_name, self.current_tool_args.as_str())
+                                                                    } else {
+                                                                        (&None, "")
+                                                                    };
+                                                                render_chronological_activity(
+                                                                    ui,
+                                                                    &msg.tool_logs,
+                                                                    p,
+                                                                    curr_name.as_deref().map(|n| (n, curr_args)),
+                                                                    self.is_processing && is_latest_agent,
+                                                                    &msg.thinking,
+                                                                    &self.settings.project_root,
+                                                                    msg_idx,
+                                                                );
+                                                            }
+
+                                                            if !msg.content.is_empty() {
+                                                                if has_activity {
+                                                                    ui.add_space(8.0);
+                                                                }
+                                                                render_formatted_markdown(ui, &msg.content, p);
+                                                            }
+                                                        }
+                                                    })
+                                                    .response;
+
+                                                let mut hover_rect = msg_response.rect;
+                                                hover_rect.min.x = ui.max_rect().min.x;
+                                                hover_rect.max.x = ui.max_rect().max.x;
+                                                let hover_rect = hover_rect.expand2(egui::vec2(0.0, 32.0));
+                                                let is_hovered = ui
+                                                    .ctx()
+                                                    .pointer_hover_pos()
+                                                    .map(|pos| hover_rect.contains(pos))
+                                                    .unwrap_or(false)
+                                                    || msg_response.hovered();
+
+                                                if is_user {
+                                                    ui.allocate_ui_with_layout(
+                                                        egui::vec2(ui.available_width(), 22.0),
+                                                        egui::Layout::top_down(egui::Align::LEFT),
+                                                        |ui| {
+                                                            ui.set_height(22.0);
+                                                            if is_hovered {
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                                    |ui| {
+                                                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                                                        if style::link_button(ui, "Copy", p).clicked() {
+                                                                            ui.ctx().copy_text(msg.content.clone());
+                                                                        }
+                                                                        if style::link_button(ui, "Edit", p)
+                                                                            .on_hover_text("Put this prompt back in the message box")
+                                                                            .clicked()
+                                                                        {
+                                                                            pending_action = Some(PendingAction::Edit(msg.content.clone()));
+                                                                        }
+                                                                        if style::link_button(ui, "Retry", p)
+                                                                            .on_hover_text("Send this prompt again")
+                                                                            .clicked()
+                                                                        {
+                                                                            pending_action = Some(PendingAction::Reroll(msg.content.clone()));
+                                                                        }
+                                                                        if style::link_button(ui, "Undo", p)
+                                                                            .on_hover_text("Undo the last tool change")
+                                                                            .clicked()
+                                                                        {
+                                                                            pending_action = Some(PendingAction::Undo);
+                                                                        }
+                                                                    },
+                                                                );
+                                                            }
+                                                        },
+                                                    );
+                                                } else if !continues[msg_idx] {
+                                                    ui.allocate_ui_with_layout(
+                                                        egui::vec2(ui.available_width(), 22.0),
+                                                        egui::Layout::top_down(egui::Align::LEFT),
+                                                        |ui| {
+                                                            ui.set_height(22.0);
+                                                            ui.horizontal(|ui| {
+                                                                ui.spacing_mut().item_spacing.x = 0.0;
+                                                                let is_latest_agent = Some(msg_idx) == last_agent_idx;
+                                                                if is_latest_agent && !self.is_processing {
+                                                                    draw_layered_logo_loader(
+                                                                        ui,
+                                                                        &self.last_layer_tex,
+                                                                        &self.middle_layer_tex,
+                                                                        &self.top_layer_tex,
+                                                                        false,
+                                                                        22.0,
+                                                                    );
+                                                                    ui.add_space(4.0);
+                                                                }
+                                                                if is_hovered {
+                                                                    if style::link_button(ui, "Copy", p)
+                                                                        .on_hover_text("Copy this reply")
+                                                                        .clicked()
+                                                                    {
+                                                                        ui.ctx().copy_text(reply_text(&self.messages, &shown, msg_idx));
+                                                                    }
+                                                                    if style::link_button(ui, "Undo", p)
+                                                                        .on_hover_text("Undo the last tool change")
+                                                                        .clicked()
+                                                                    {
+                                                                        pending_action = Some(PendingAction::Undo);
+                                                                    }
+                                                                }
+                                                            });
+                                                        },
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    }
+                                    ui.add_space(if continues[msg_idx] { 4.0 } else { 14.0 });
+                                }
+
+                                // Spinning logo under the last message while the agent works
+                                if self.is_processing {
+                                    let action = match self.current_tool_name.as_deref() {
+                                        Some(
+                                            "write_file"
+                                            | "write_to_file"
+                                            | "edit_file"
+                                            | "replace_file_content"
+                                            | "multi_replace_file_content",
+                                        ) => "Writing".to_string(),
+                                        Some("read_file" | "view_file" | "cat") => "Reading".to_string(),
+                                        Some("read_skill") => {
+                                            let skill_name =
+                                                extract_streaming_content(&self.current_tool_args, "name");
+                                            if skill_name.is_empty() {
+                                                "Reading a skill".to_string()
+                                            } else {
+                                                format!("Reading skill {skill_name}")
+                                            }
+                                        }
+                                        Some("web_search" | "search_web") => "Searching the web".to_string(),
+                                        Some("web_fetch" | "read_browser_page" | "browser_subagent") => {
+                                            "Browsing".to_string()
+                                        }
+                                        Some("run_command" | "shell") => "Running a command".to_string(),
+                                        Some(other) => style::sentence_case(&other.replace('_', " ")),
+                                        None => "Thinking".to_string(),
+                                    };
+                                    let loader_text = match self.thinking_start_time.map(|s| s.elapsed().as_secs()) {
+                                        Some(secs) if secs >= 60 => {
+                                            format!("{action} · {}m {:02}s", secs / 60, secs % 60)
+                                        }
+                                        Some(secs) => format!("{action} · {secs}s"),
+                                        None => action,
+                                    };
+
+                                    ui.horizontal(|ui| {
+                                        draw_layered_logo_loader(
+                                            ui,
+                                            &self.last_layer_tex,
+                                            &self.middle_layer_tex,
+                                            &self.top_layer_tex,
+                                            true,
+                                            24.0,
+                                        );
+                                        ui.label(egui::RichText::new(loader_text).size(12.5).color(p.dim));
+                                    });
+                                }
+                            });
+                    });
+
+                    // "Latest" button when scrolled away from the bottom
+                    let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+                    self.chat_max_offset = max_offset;
+                    if max_offset - output.state.offset.y > 160.0 {
+                        let pos = egui::pos2(output.inner_rect.center().x, output.inner_rect.bottom() - 12.0);
+                        egui::Area::new(egui::Id::new("jump_to_latest"))
+                            .order(egui::Order::Foreground)
+                            .pivot(egui::Align2::CENTER_BOTTOM)
+                            .fixed_pos(pos)
+                            .show(ui.ctx(), |ui| {
+                                let resp = ui.add(
+                                    egui::Button::new(egui::RichText::new("↓  Latest").size(12.0).color(p.text))
+                                        .fill(p.surface)
+                                        .stroke(egui::Stroke::new(1.0, p.border))
+                                        .rounding(14.0),
+                                );
+                                if resp.on_hover_text("Scroll to the newest message").clicked() {
+                                    self.scroll_to_bottom = true;
+                                }
+                            });
+                    }
+                }
+
+                if let Some(act) = pending_action {
+                    match act {
+                        PendingAction::Edit(txt) => {
+                            self.input_text = txt;
+                            self.focus_composer = true;
+                        }
+                        PendingAction::Reroll(txt) => {
+                            self.input_text = txt;
+                            self.send_message();
+                        }
+                        PendingAction::Undo => {
+                            let has_checkpoints =
+                                crate::agent::checkpoint::has_checkpoints(&self.settings.project_root);
+                            if !has_checkpoints {
+                                self.status_text = "Undo unavailable: no checkpoints found.".to_string();
+                            } else {
+                                let _ = self.user_tx.send("/undo".to_string());
+                                self.status_text = "Undo command sent...".to_string();
+                            }
+                        }
+                    }
+                }
+            });
+    }
+
+    fn draw_shortcuts(&mut self, ctx: &egui::Context, p: &Palette) {
+        let mut open = self.show_shortcuts;
+        egui::Window::new(egui::RichText::new("Keyboard shortcuts").font(style::strong(15.0)))
+            .id(egui::Id::new("shortcuts_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.screen_rect().center())
+            .show(ctx, |ui| {
+                egui::Grid::new("shortcut_grid")
+                    .num_columns(2)
+                    .spacing([28.0, 8.0])
+                    .show(ui, |ui| {
+                        for (keys, action) in SHORTCUTS {
+                            ui.label(
+                                egui::RichText::new(*keys)
+                                    .font(egui::FontId::monospace(12.0))
+                                    .color(p.text),
+                            );
+                            ui.label(egui::RichText::new(*action).size(12.5).color(p.dim));
+                            ui.end_row();
+                        }
+                    });
+            });
+        self.show_shortcuts = open;
+    }
+
+    /// Dims everything behind a dialog; returns true when it was clicked.
+    fn draw_modal_backdrop(&self, ctx: &egui::Context) -> bool {
+        let screen = ctx.screen_rect();
+        let mut clicked = false;
+        egui::Area::new(egui::Id::new("modal_backdrop"))
+            // Above the panels, below dialog windows.
+            .order(egui::Order::PanelResizeLine)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_black_alpha(if self.dark_mode { 120 } else { 70 }),
+                );
+                clicked = resp.clicked();
+            });
+        clicked
+    }
+
+    fn draw_drop_overlay(&self, ctx: &egui::Context) {
+        let Some(hovered) = ctx.input(|i| {
+            i.raw
+                .hovered_files
+                .first()
+                .map(|f| f.path.as_ref().is_some_and(|p| p.is_dir()))
+        }) else {
+            return;
+        };
+        let message = if hovered {
+            "Drop to open this folder as the workspace"
+        } else {
+            "Drop to attach"
+        };
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop_overlay"),
+        ));
+        let rect = ctx.screen_rect();
+        painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(140));
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            message,
+            style::strong(18.0),
+            egui::Color32::WHITE,
+        );
     }
 }
 
@@ -1999,2328 +4704,52 @@ impl eframe::App for GuiApp {
         self.poll_file_events(ctx);
         self.poll_capabilities();
 
-        // Capture dropped files
-        ctx.input(|i| {
-            if !i.raw.dropped_files.is_empty() {
-                for file in &i.raw.dropped_files {
-                    if let Some(ref path) = file.path {
-                        self.attached_image = Some(path.clone());
-                        self.status_text = format!(
-                            "Attached: {}",
-                            path.file_name().and_then(|n| n.to_str()).unwrap_or("")
-                        );
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Apply Premium Visual Theme Design
-        if self.dark_mode {
-            let mut visuals = egui::Visuals::dark();
-            visuals.panel_fill = egui::Color32::from_rgb(10, 11, 16);
-            visuals.window_fill = egui::Color32::from_rgb(19, 18, 30);
-            visuals.extreme_bg_color = egui::Color32::from_rgb(18, 20, 29);
-
-            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(22, 23, 34);
-            visuals.widgets.inactive.rounding = egui::Rounding::same(10.0);
-            visuals.widgets.inactive.fg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(202, 205, 220));
-            visuals.widgets.inactive.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(47, 48, 67));
-
-            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(47, 38, 72);
-            visuals.widgets.hovered.rounding = egui::Rounding::same(10.0);
-            visuals.widgets.hovered.fg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 240, 255));
-            visuals.widgets.hovered.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(124, 58, 237));
-
-            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(124, 58, 237); // Royal Accent Purple
-            visuals.widgets.active.rounding = egui::Rounding::same(8.0);
-            visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-
-            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(15, 16, 23);
-            visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
-            visuals.widgets.noninteractive.fg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(218, 222, 235));
-            visuals.widgets.noninteractive.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(43, 45, 60));
-            visuals.selection.bg_fill = egui::Color32::from_rgb(124, 58, 237);
-            visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(43, 39, 55));
-            visuals.faint_bg_color = egui::Color32::from_rgb(17, 17, 25);
-
-            ctx.set_visuals(visuals);
-        } else {
-            let mut visuals = egui::Visuals::light();
-            visuals.panel_fill = egui::Color32::from_rgb(243, 244, 248); // Crisp light grey
-            visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
-            visuals.extreme_bg_color = egui::Color32::from_rgb(228, 231, 242); // Distinct grayish blue background for input fields in light mode
-
-            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(240, 242, 248);
-            visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
-            visuals.widgets.inactive.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 185, 210)); // Clear visible borders in light mode!
-
-            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(212, 216, 232);
-            visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
-            visuals.widgets.hovered.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(124, 58, 237));
-
-            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(124, 58, 237);
-            visuals.widgets.active.rounding = egui::Rounding::same(8.0);
-            visuals.selection.bg_fill = egui::Color32::from_rgb(124, 58, 237);
-            visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(214, 218, 232));
-            visuals.faint_bg_color = egui::Color32::from_rgb(248, 249, 252);
-
-            ctx.set_visuals(visuals);
-        }
-
-        // Custom Layout Spacing Override
-        let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(10.0, 9.0);
-        style.spacing.button_padding = egui::vec2(13.0, 7.0);
-        style.spacing.combo_width = 150.0;
-        style.visuals.striped = true;
-        ctx.set_style(style);
-
-        // Top panel header
-        egui::TopBottomPanel::top("top_panel")
-            .frame(
-                egui::Frame::default()
-                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                    .fill(if self.dark_mode {
-                        egui::Color32::from_rgb(14, 14, 21)
-                    } else {
-                        egui::Color32::WHITE
-                    })
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        if self.dark_mode {
-                            egui::Color32::from_rgb(42, 38, 54)
-                        } else {
-                            egui::Color32::from_rgb(220, 223, 235)
-                        },
-                    )),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let screen_width = ui.ctx().screen_rect().width();
-                    let _show_text_labels = screen_width >= 1100.0;
-                    let show_brand_name = screen_width >= 850.0;
-                    let compact_buttons = screen_width < 900.0;
-                    let _spacing = if screen_width < 700.0 { 4.0 } else { 12.0 };
-
-                    ui.add(egui::Image::new(&self.logo_tex).max_width(30.0));
-                    ui.add_space(2.0);
-                    if show_brand_name {
-                        ui.label(
-                            egui::RichText::new("NORVEXUM")
-                                .font(egui::FontId::proportional(20.0))
-                                .strong()
-                                .color(if self.dark_mode {
-                                    egui::Color32::from_rgb(244, 241, 255)
-                                } else {
-                                    egui::Color32::from_rgb(31, 25, 45)
-                                }),
-                        );
-                    }
-                    let left_sidebar_btn = if compact_buttons {
-                        "⚙"
-                    } else if self.left_sidebar_open {
-                        "◀ Settings"
-                    } else {
-                        "▶ Settings"
-                    };
-                    if ui
-                        .button(left_sidebar_btn)
-                        .on_hover_text("Toggle left workspace settings sidebar")
-                        .clicked()
-                    {
-                        self.left_sidebar_open = !self.left_sidebar_open;
-                    }
-
-                    ui.add_space(if screen_width < 700.0 { 4.0 } else { 16.0 });
-
-                    // Pickers moved to chat box layout
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button(if self.dark_mode { "☀" } else { "🌙" })
-                            .on_hover_text("Toggle Theme")
-                            .clicked()
-                        {
-                            self.dark_mode = !self.dark_mode;
-                        }
-
-                        ui.add_space(4.0);
-
-                        // Terminal toggle
-                        let term_label = if compact_buttons {
-                            "💻"
-                        } else if self.show_terminal_panel {
-                            "▼ Terminal"
-                        } else {
-                            "▲ Terminal"
-                        };
-                        let term_btn =
-                            egui::Button::new(egui::RichText::new(term_label).size(12.0).color(
-                                if self.show_terminal_panel {
-                                    egui::Color32::from_rgb(52, 211, 153)
-                                } else if self.dark_mode {
-                                    egui::Color32::from_rgb(148, 163, 184)
-                                } else {
-                                    egui::Color32::from_rgb(100, 116, 139)
-                                },
-                            ))
-                            .fill(if self.show_terminal_panel {
-                                if self.dark_mode {
-                                    egui::Color32::from_rgb(20, 40, 30)
-                                } else {
-                                    egui::Color32::from_rgb(220, 252, 231)
-                                }
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            })
-                            .stroke(egui::Stroke::new(
-                                0.5,
-                                if self.show_terminal_panel {
-                                    egui::Color32::from_rgb(52, 211, 153)
-                                } else if self.dark_mode {
-                                    egui::Color32::from_rgb(55, 55, 70)
-                                } else {
-                                    egui::Color32::from_rgb(200, 205, 218)
-                                },
-                            ))
-                            .rounding(8.0);
-                        if ui
-                            .add(term_btn)
-                            .on_hover_text("Toggle AI terminal panel")
-                            .clicked()
-                        {
-                            self.show_terminal_panel = !self.show_terminal_panel;
-                        }
-
-                        ui.add_space(4.0);
-
-                        let right_sidebar_btn = if compact_buttons {
-                            "📁"
-                        } else if self.right_sidebar_open {
-                            "Files ▶"
-                        } else {
-                            "◀ Files"
-                        };
-                        if ui
-                            .button(right_sidebar_btn)
-                            .on_hover_text("Toggle right workspace files sidebar")
-                            .clicked()
-                        {
-                            self.right_sidebar_open = !self.right_sidebar_open;
-                        }
-                    });
-                });
-            });
-
-        // Left Panel (Sidebar Settings) — animated open/close + generously
-        // wide resize range so the user can pull/push the panel freely.
-        let target_left_t = if self.left_sidebar_open { 1.0 } else { 0.0 };
-        let left_t_raw =
-            ctx.animate_value_with_time(egui::Id::new("left_sidebar_anim"), target_left_t, 0.18);
-        // ease-out-cubic for a snappy, premium feel
-        let left_t = 1.0 - (1.0 - left_t_raw.clamp(0.0, 1.0)).powi(3);
-        let left_animating = (left_t_raw - target_left_t).abs() > 0.005;
-
-        if left_t > 0.005 {
-            let mut left_panel = egui::SidePanel::left("left_sidebar")
-                .frame(
-                    egui::Frame::default()
-                        .inner_margin(16.0)
-                        .fill(if self.dark_mode {
-                            egui::Color32::from_rgb(13, 14, 21)
-                        } else {
-                            egui::Color32::WHITE
-                        }),
-                )
-                // Disable resize only while the open/close tween is running;
-                // once settled I let egui remember & control the user width.
-                .resizable(!left_animating && self.left_sidebar_open)
-                .width_range(60.0..=1200.0);
-            if left_animating {
-                left_panel = left_panel.exact_width(self.left_sidebar_width * left_t);
+        // Dropped files are attached; a dropped folder becomes the workspace.
+        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        if let Some(path) = dropped {
+            if path.is_dir() {
+                self.folder_input = path.to_string_lossy().to_string();
+                self.load_project_folder(&path, ctx.clone());
             } else {
-                left_panel = left_panel.default_width(self.left_sidebar_width);
-            }
-            let panel_response = left_panel.show(ctx, |ui| {
-                    let pinned_bottom_h = 124.0;
-                    let scroll_height = (ui.available_height() - pinned_bottom_h).max(80.0);
-
-                    egui::ScrollArea::vertical()
-                        .max_height(scroll_height)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("WORKSPACE")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(167, 139, 250)),
-                            );
-                            ui.label(
-                                egui::RichText::new("Project settings")
-                                    .font(egui::FontId::proportional(18.0))
-                                    .strong(),
-                            );
-                            ui.add_space(8.0);
-
-                // Group the workspace folder loader in a styled card frame
-                egui::Frame::group(ui.style())
-                    .fill(ctx.style().visuals.window_fill)
-                    .inner_margin(10.0)
-                    .rounding(10.0)
-                    .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new("Active Workspace Folder:")
-                                .small()
-                                .color(if self.dark_mode { egui::Color32::from_rgb(180, 185, 210) } else { egui::Color32::from_rgb(80, 85, 110) })
-                            );
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.folder_input).desired_width(110.0));
-                                if ui.button("📂 Select").on_hover_text("Browse workspace folder from system dialog").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                        self.folder_input = path.to_string_lossy().to_string();
-                                        self.load_project_folder(&path, ctx.clone());
-                                    }
-                                }
-                                if ui.button("📁 Load").clicked() {
-                                    let path = std::path::PathBuf::from(&self.folder_input);
-                                    if path.exists() && path.is_dir() {
-                                        self.load_project_folder(&path, ctx.clone());
-                                    } else {
-                                        self.folder_error = Some("Directory path not found!".to_string());
-                                    }
-                                }
-                            });
-                            if let Some(ref err) = self.folder_error {
-                                ui.colored_label(egui::Color32::RED, err);
-                            }
-                        });
-                    });
-
-                ui.add_space(12.0);
-
-                // API Key Settings inside a card frame
-                egui::Frame::group(ui.style())
-                    .fill(ctx.style().visuals.window_fill)
-                    .inner_margin(10.0)
-                    .rounding(10.0)
-                    .show(ui, |ui| {
-                        ui.collapsing(egui::RichText::new("🔑 API Keys Settings").strong().color(if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK }), |ui| {
-                            ui.add_space(6.0);
-                            self.draw_key_field(ui, "google_ai_api_key", "Google AI direct key");
-                            self.draw_key_field(ui, "openai_api_key", "OpenAI key");
-                            self.draw_key_field(ui, "anthropic_api_key", "Anthropic key");
-                            self.draw_key_field(ui, "tavily_api_key", "Tavily web search key");
-                            self.draw_key_field(ui, "aicredits_api_key", "AICredits.in key");
-                            self.draw_key_field(ui, "ocr_space_api_key", "OCR Space key");
-                            self.draw_key_field(ui, "pollinations_api_key", "Pollinations image key");
-                        });
-                    });
-
-                ui.add_space(12.0);
-
-                // Custom Skills Section inside a card frame
-                egui::Frame::group(ui.style())
-                    .fill(ctx.style().visuals.window_fill)
-                    .inner_margin(10.0)
-                    .rounding(10.0)
-                    .show(ui, |ui| {
-                        ui.collapsing(egui::RichText::new("✨ Custom Skills Settings").strong().color(if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK }), |ui| {
-                            ui.add_space(6.0);
-
-                            if ui.button("📂 Upload Skill File").on_hover_text("Upload a custom skill markdown file").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().add_filter("Markdown", &["md"]).pick_file() {
-                                    let skill_dir = crate::skills::get_global_skills_dir();
-                                    let _ = std::fs::create_dir_all(&skill_dir);
-                                    if let Some(filename) = path.file_name() {
-                                        let dest = skill_dir.join(filename);
-                                        if std::fs::copy(&path, &dest).is_ok() {
-                                            self.status_text = format!("Skill file {} uploaded!", filename.to_string_lossy());
-                                            self.skills_list = crate::skills::load_all_skills(&self.settings.project_root);
-                                        }
-                                    }
-                                }
-                            }
-
-                            ui.separator();
-
-                            ui.label(egui::RichText::new("Create Custom Skill:").strong().color(if self.dark_mode { egui::Color32::LIGHT_BLUE } else { egui::Color32::DARK_BLUE }));
-
-                            ui.label(egui::RichText::new("Skill Name:").small().color(if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK }));
-                            ui.add(egui::TextEdit::singleline(&mut self.custom_skill_name).desired_width(180.0));
-
-                            ui.label(egui::RichText::new("Description:").small().color(if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK }));
-                            ui.add(egui::TextEdit::singleline(&mut self.custom_skill_desc).desired_width(180.0));
-
-                            ui.label(egui::RichText::new("Trigger Patterns (comma sep):").small().color(if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK }));
-                            ui.add(egui::TextEdit::singleline(&mut self.custom_skill_triggers).desired_width(180.0));
-
-                            ui.label(egui::RichText::new("System Instructions:").small().color(if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK }));
-                            ui.add(egui::TextEdit::multiline(&mut self.custom_skill_instructions).desired_rows(3).desired_width(180.0));
-
-                            ui.add_space(4.0);
-                            if ui.button("➕ Add Skill").clicked() {
-                                let name = self.custom_skill_name.trim().to_string();
-                                let inst = self.custom_skill_instructions.trim().to_string();
-                                if !name.is_empty() && !inst.is_empty() {
-                                    let desc = self.custom_skill_desc.trim().to_string();
-                                    let triggers: Vec<String> = self.custom_skill_triggers
-                                        .split(',')
-                                        .map(|s| s.trim().to_string())
-                                        .filter(|s| !s.is_empty())
-                                        .collect();
-
-                                    let triggers_str = if triggers.is_empty() {
-                                        format!("  - {}", name.to_lowercase())
-                                    } else {
-                                        triggers.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n")
-                                    };
-
-                                    let content = format!(
-                                        "---\nname: {}\ndescription: {}\ntrigger_patterns:\n{}\n---\n{}",
-                                        name, desc, triggers_str, inst
-                                    );
-
-                                    let skill_dir = crate::skills::get_global_skills_dir();
-                                    let _ = std::fs::create_dir_all(&skill_dir);
-                                    let file_path = skill_dir.join(format!("{}.md", name.to_lowercase()));
-                                    if std::fs::write(&file_path, content).is_ok() {
-                                        self.status_text = format!("Skill {} saved!", name);
-                                        self.skills_list = crate::skills::load_all_skills(&self.settings.project_root);
-
-                                        self.custom_skill_name.clear();
-                                        self.custom_skill_desc.clear();
-                                        self.custom_skill_triggers.clear();
-                                        self.custom_skill_instructions.clear();
-                                    }
-                                }
-                            }
-
-                            ui.separator();
-                                   ui.label(egui::RichText::new("Loaded Skills:").strong().color(if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK }));
-                            egui::ScrollArea::vertical().max_height(80.0).show(ui, |ui| {
-                                for skill in &self.skills_list {
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(format!("• {}", skill.name)).strong().color(if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK }));
-
-                                        let desc_color = if self.dark_mode {
-                                            egui::Color32::from_rgb(148, 163, 184) // Slate 400
-                                        } else {
-                                            egui::Color32::from_rgb(100, 116, 139) // Slate 500
-                                        };
-                                        ui.small(egui::RichText::new(format!("({})", skill.description)).color(desc_color).italics());
-                                    });
-                                }
-                            });
-                        });
-                    });
-
-                ui.add_space(16.0);
-                ui.label(
-                    egui::RichText::new("RECENT CHATS")
-                        .size(11.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(167, 139, 250)),
+                self.status_text = format!(
+                    "Attached: {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("")
                 );
-                ui.add_space(4.0);
-
-                // Active session indicator
-                let active_selected = self.current_session_id.is_none();
-                if ui.selectable_label(active_selected, egui::RichText::new("● Current Active Session").strong()).clicked() {
-                    if let Some(active_messages) = self.active_messages_backup.take() {
-                        self.messages = active_messages;
-                    }
-                    self.current_session_id = None;
-                    self.status_text = "Returned to current active chat session.".to_string();
-                }
-
-                // Render previous sessions
-                let mut session_to_delete = None;
-                let mut session_to_load = None;
-                for summary in &self.history_sessions {
-                    let title = format!("Chat ({})", &summary.id[..6.min(summary.id.len())]);
-                    let display_text = format!("💬 {}", title);
-                    let is_selected = self.current_session_id.as_deref() == Some(&summary.id);
-
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(is_selected, display_text)
-                            .on_hover_text(format!("Model: {}\nMessages: {}", summary.model, summary.message_count))
-                            .clicked()
-                        {
-                            session_to_load = Some(summary.id.clone());
-                        }
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(egui::RichText::new("🗑").color(egui::Color32::from_rgb(239, 68, 68)))
-                                .on_hover_text("Delete conversation")
-                                .clicked()
-                            {
-                                session_to_delete = Some(summary.id.clone());
-                            }
-                        });
-                    });
-                }
-
-                if let Some(id) = session_to_load {
-                    if let Some(loaded_sess) = crate::agent::session::Session::load_by_id(&self.settings.project_root, &id) {
-                        if let Some(ref saved_root) = loaded_sess.project_root {
-                            let saved_path = std::path::PathBuf::from(saved_root);
-                            if saved_path.exists() && saved_path.is_dir() && saved_path != self.settings.project_root {
-                                let ctx = ui.ctx().clone();
-                                self.load_project_folder(&saved_path, ctx);
-                            }
-                        }
-                        if self.current_session_id.is_none() {
-                            self.active_messages_backup = Some(self.messages.clone());
-                        }
-                        self.current_session_id = Some(id.clone());
-                        self.messages = loaded_sess.messages.iter().filter_map(|m| {
-                            let role = match m.role {
-                                crate::ai::types::Role::User => "user",
-                                crate::ai::types::Role::Assistant => "assistant",
-                                crate::ai::types::Role::System | crate::ai::types::Role::Tool => return None,
-                            };
-                            let content = m.text();
-                            if content.trim().is_empty() {
-                                return None;
-                            }
-                            Some(GuiMessage {
-                                role: role.to_string(),
-                                content,
-                                thinking: None,
-                                is_thinking_done: true,
-                                tool_logs: Vec::new(),
-                                attached_image: None,
-                            })
-                        }).collect();
-                        self.session_written_files.clear();
-                        self.file_diff_stats.clear();
-                        self.terminal_entries.clear();
-                        let title = format!("Chat ({})", &id[..6.min(id.len())]);
-                        self.status_text = format!("Loaded conversation: {}", title);
-                    }
-                }
-
-                if let Some(id) = session_to_delete {
-                    let session_dir = self.settings.project_root.join(".norvexum").join("sessions");
-                    let file_path = session_dir.join(format!("{}.json", id));
-                    if std::fs::remove_file(&file_path).is_ok() {
-                        if self.current_session_id.as_deref() == Some(&id) {
-                            if let Some(active_messages) = self.active_messages_backup.take() {
-                                self.messages = active_messages;
-                            }
-                            self.current_session_id = None;
-                            self.session_written_files.clear();
-                            self.file_diff_stats.clear();
-                            self.terminal_entries.clear();
-                        }
-                        self.history_sessions = crate::agent::session::Session::list(&self.settings.project_root);
-                        self.status_text = "Session deleted.".to_string();
-                    }
-                }
-            });
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    // Pinned Logo and Settings Button at the bottom
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Image::new(&self.logo_tex).max_width(42.0));
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new("Norvexum").strong());
-                            egui::Frame::default()
-                                .fill(if self.dark_mode {
-                                    egui::Color32::from_rgb(42, 31, 68)
-                                } else {
-                                    egui::Color32::from_rgb(237, 233, 254)
-                                })
-                                .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                                .rounding(8.0)
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new("v0.1.0 · GUI")
-                                            .size(11.0)
-                                            .strong()
-                                            .color(if self.dark_mode {
-                                                egui::Color32::from_rgb(196, 181, 253)
-                                            } else {
-                                                egui::Color32::from_rgb(91, 33, 182)
-                                            }),
-                                    );
-                                });
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(egui::RichText::new("⚙").font(egui::FontId::proportional(16.0)))
-                                .on_hover_text("Open Settings")
-                                .clicked()
-                            {
-                                self.show_settings_modal = !self.show_settings_modal;
-                            }
-                        });
-                    });
-                });
-            if !left_animating && self.left_sidebar_open {
-                self.left_sidebar_width = panel_response.response.rect.width();
+                self.attached_image = Some(path);
             }
         }
 
-        // Right Panel (Workspace Files explorer - styled premium file tree)
-        // Animated open/close + widened resize range so the user can pull it
-        // out wide enough to actually read code previews without scroll-back.
-        let target_right_t = if self.right_sidebar_open { 1.0 } else { 0.0 };
-        let right_t_raw =
-            ctx.animate_value_with_time(egui::Id::new("right_sidebar_anim"), target_right_t, 0.18);
-        let right_t = 1.0 - (1.0 - right_t_raw.clamp(0.0, 1.0)).powi(3);
-        let right_animating = (right_t_raw - target_right_t).abs() > 0.005;
-
-        if right_t > 0.005 {
-            let mut right_panel = egui::SidePanel::right("right_sidebar")
-                .frame(
-                    egui::Frame::default()
-                        .inner_margin(14.0)
-                        .fill(if self.dark_mode {
-                            egui::Color32::from_rgb(18, 16, 25)
-                        } else {
-                            egui::Color32::WHITE
-                        }),
-                )
-                .resizable(!right_animating && self.right_sidebar_open)
-                .width_range(60.0..=1200.0);
-            if right_animating {
-                right_panel = right_panel.exact_width(self.right_sidebar_width * right_t);
-            } else {
-                right_panel = right_panel.default_width(self.right_sidebar_width);
-            }
-            let panel_response = right_panel.show(ctx, |ui| {
-                let bg_procs = crate::tools::shell::get_background_processes();
-                if !bg_procs.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Background Processes")
-                                .font(egui::FontId::proportional(16.0))
-                                .strong(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{}", bg_procs.len()))
-                                    .small()
-                                    .color(egui::Color32::from_rgb(167, 139, 250)),
-                            );
-                        });
-                    });
-                    ui.add_space(8.0);
-                    for proc in bg_procs {
-                        ui.horizontal(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .button("Kill")
-                                        .on_hover_text("Kill this background process")
-                                        .clicked()
-                                    {
-                                        crate::tools::shell::kill_background_process(proc.pid);
-                                    }
-
-                                    ui.with_layout(
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("[{}]", proc.pid))
-                                                    .small()
-                                                    .color(egui::Color32::from_rgb(148, 163, 184)),
-                                            );
-                                            let mut cmd_str = proc.command.clone();
-                                            if cmd_str.len() > 25 {
-                                                cmd_str.truncate(22);
-                                                cmd_str.push_str("...");
-                                            }
-                                            ui.label(egui::RichText::new(cmd_str).monospace());
-                                        },
-                                    );
-                                },
-                            );
-                        });
-                    }
-                    ui.add_space(16.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Workspace files")
-                            .font(egui::FontId::proportional(16.0))
-                            .strong(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{}", self.session_written_files.len()))
-                                .small()
-                                .color(egui::Color32::from_rgb(167, 139, 250)),
-                        );
-                    });
-                });
-                ui.label(
-                    egui::RichText::new("Created or changed this session")
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(148, 163, 184)),
-                );
-                ui.add_space(8.0);
-
-                let mut file_to_inspect = None;
-                egui::ScrollArea::vertical()
-                    .id_salt("workspace_file_list")
-                    .max_height((ui.available_height() * 0.46).max(120.0))
-                    .show(ui, |ui| {
-                        let mut display_files = self.session_written_files.clone();
-                        if let Some((ref active_file, _, _)) = self.current_writing_file {
-                            if self.current_writing_status.as_deref() == Some("writing")
-                                && !active_file.is_empty()
-                                && !display_files.contains(active_file)
-                            {
-                                display_files.push(active_file.clone());
-                            }
-                        }
-
-                        if display_files.is_empty() {
-                            egui::Frame::default()
-                                .fill(ctx.style().visuals.faint_bg_color)
-                                .inner_margin(12.0)
-                                .rounding(10.0)
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new("Your files will appear here.")
-                                            .size(13.0)
-                                            .color(egui::Color32::from_rgb(148, 163, 184)),
-                                    );
-                                });
-                        } else {
-                            for filename in &display_files {
-                                let icon = get_file_icon(filename);
-
-                                let is_writing = if let Some((ref active_file, _, _)) =
-                                    self.current_writing_file
-                                {
-                                    active_file == filename
-                                        && self.current_writing_status.as_deref() == Some("writing")
-                                } else {
-                                    false
-                                };
-
-                                let label_text = if is_writing {
-                                    let tool_name = self.current_tool_name.as_deref().unwrap_or("");
-                                    let action = if tool_name == "write_file"
-                                        || tool_name == "write_to_file"
-                                    {
-                                        "Writing"
-                                    } else {
-                                        "Editing"
-                                    };
-                                    format!("📝 {} [{}...]", filename, action)
-                                } else {
-                                    format!("{} {}", icon, filename)
-                                };
-
-                                let label = if is_writing {
-                                    egui::RichText::new(label_text)
-                                        .color(egui::Color32::from_rgb(16, 185, 129))
-                                        .strong()
-                                } else {
-                                    egui::RichText::new(label_text)
-                                };
-
-                                let is_selected = self.selected_file.as_deref() == Some(filename);
-                                if ui
-                                    .selectable_label(is_selected, label)
-                                    .on_hover_text("Preview file")
-                                    .clicked()
-                                {
-                                    file_to_inspect = Some(filename.clone());
-                                }
-
-                                // Show diff stats: prefer live current_writing_file, fall back to persisted file_diff_stats
-                                let (show_added, show_deleted) =
-                                    if let Some((active_file, added, deleted)) =
-                                        &self.current_writing_file
-                                    {
-                                        if active_file == filename {
-                                            (*added, *deleted)
-                                        } else if let Some(&(a, d)) =
-                                            self.file_diff_stats.get(filename.as_str())
-                                        {
-                                            (a, d)
-                                        } else {
-                                            (0, 0)
-                                        }
-                                    } else if let Some(&(a, d)) =
-                                        self.file_diff_stats.get(filename.as_str())
-                                    {
-                                        (a, d)
-                                    } else {
-                                        (0, 0)
-                                    };
-
-                                if show_added > 0 || show_deleted > 0 {
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(22.0);
-                                        if show_added > 0 {
-                                            ui.label(
-                                                egui::RichText::new(format!("+{show_added}"))
-                                                    .small()
-                                                    .color(egui::Color32::from_rgb(16, 185, 129)),
-                                            );
-                                        }
-                                        if show_deleted > 0 {
-                                            ui.label(
-                                                egui::RichText::new(format!("-{show_deleted}"))
-                                                    .small()
-                                                    .color(egui::Color32::from_rgb(239, 68, 68)),
-                                            );
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    });
-
-                if let Some(filename) = file_to_inspect {
-                    self.inspect_file(&filename);
-                }
-
-                if let Some(filename) = self.selected_file.clone() {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("File preview").strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("×")
-                                .on_hover_text("Close preview")
-                                .clicked()
-                            {
-                                self.selected_file = None;
-                                self.inspected_file_content.clear();
-                                self.inspector_error = None;
-                            }
-                        });
-                    });
-                    ui.label(
-                        egui::RichText::new(&filename)
-                            .monospace()
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(167, 139, 250)),
-                    );
-
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        let mut filter = self.line_range_enabled;
-                        if ui.checkbox(&mut filter, "Filter lines").changed() {
-                            self.line_range_enabled = filter;
-                            if filter && self.line_range_end == 0 {
-                                self.line_range_end = self.line_range_total_lines.min(100);
-                            }
-                            self.inspect_file(&filename);
-                        }
-                        if self.line_range_enabled {
-                            ui.label("From:");
-                            let mut start = self.line_range_start;
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut start)
-                                        .range(1..=self.line_range_total_lines.max(1)),
-                                )
-                                .changed()
-                            {
-                                self.line_range_start = start;
-                                self.inspect_file(&filename);
-                            }
-                            ui.label("To:");
-                            let mut end = self.line_range_end;
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut end)
-                                        .range(1..=self.line_range_total_lines.max(1)),
-                                )
-                                .changed()
-                            {
-                                self.line_range_end = end;
-                                self.inspect_file(&filename);
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let mut edits = self.manual_edits_enabled;
-                        if ui.checkbox(&mut edits, "✏️ Edit").changed() {
-                            self.manual_edits_enabled = edits;
-                            if !edits {
-                                self.inspected_file_edited = false;
-                                self.inspect_file(&filename);
-                            }
-                        }
-                        if self.manual_edits_enabled && ui.button("💾 Save").clicked() {
-                            if let Err(e) = self.save_inspected_file_changes() {
-                                self.inspector_error = Some(format!("Failed to save: {e}"));
-                            } else {
-                                self.status_text = "Saved!".to_string();
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
-
-                    if let Some(error) = &self.inspector_error {
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(error)
-                                .size(12.0)
-                                .color(egui::Color32::from_rgb(248, 113, 113)),
-                        );
-                    } else {
-                        let is_active_writing = self
-                            .current_writing_file
-                            .as_ref()
-                            .is_some_and(|(name, _, _)| Some(name) == self.selected_file.as_ref());
-
-                        let active_range = self.get_active_editing_range();
-                        let is_active_file = self.selected_file.as_ref().is_some()
-                            && self.selected_file.as_ref()
-                                == self.current_writing_file.as_ref().map(|(n, _, _)| n);
-
-                        egui::ScrollArea::both()
-                            .id_salt("inline_file_inspector")
-                            .auto_shrink([false, false])
-                            .stick_to_bottom(is_active_writing)
-                            .show(ui, |ui| {
-                                if self.manual_edits_enabled {
-                                    let edit_resp = ui.add(
-                                        egui::TextEdit::multiline(&mut self.inspected_file_content)
-                                            .font(egui::TextStyle::Monospace)
-                                            .desired_width(f32::INFINITY)
-                                            .interactive(true),
-                                    );
-                                    if edit_resp.changed() {
-                                        self.inspected_file_edited = true;
-                                    }
-                                } else {
-                                    let lines: Vec<&str> =
-                                        self.inspected_file_content.lines().collect();
-                                    ui.vertical(|ui| {
-                                        let start_line_num = if self.line_range_enabled {
-                                            self.line_range_start
-                                        } else {
-                                            1
-                                        };
-                                        for (idx, line_content) in lines.iter().enumerate() {
-                                            let line_num = start_line_num + idx;
-                                            let is_highlighted = is_active_file
-                                                && active_range.is_some_and(|(start, end)| {
-                                                    line_num >= start && line_num <= end
-                                                });
-
-                                            let line_text =
-                                                format!("{:>4} | {}", line_num, line_content);
-                                            let mut rich_text = egui::RichText::new(line_text)
-                                                .font(egui::FontId::monospace(11.0));
-
-                                            if is_highlighted {
-                                                rich_text = rich_text
-                                                    .color(egui::Color32::from_rgb(16, 185, 129))
-                                                    .strong();
-                                            } else {
-                                                rich_text = rich_text.color(if self.dark_mode {
-                                                    egui::Color32::from_rgb(209, 213, 219)
-                                                } else {
-                                                    egui::Color32::from_rgb(55, 65, 81)
-                                                });
-                                            }
-
-                                            let response = ui
-                                                .horizontal(|ui| {
-                                                    if is_highlighted {
-                                                        let bg = if self.dark_mode {
-                                                            egui::Color32::from_rgb(20, 45, 30)
-                                                        } else {
-                                                            egui::Color32::from_rgb(230, 253, 240)
-                                                        };
-                                                        let rect = ui.max_rect();
-                                                        ui.painter().rect_filled(rect, 0.0, bg);
-                                                    }
-                                                    ui.label(rich_text)
-                                                })
-                                                .response;
-
-                                            if is_active_file {
-                                                if let Some((start, _)) = active_range {
-                                                    if self.should_scroll_to_line == Some(start)
-                                                        && line_num == start
-                                                    {
-                                                        response.scroll_to_me(Some(
-                                                            egui::Align::Center,
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                    }
-                }
-            });
-            if !right_animating && self.right_sidebar_open {
-                self.right_sidebar_width = panel_response.response.rect.width();
-            }
+        if self.applied_theme != Some(self.dark_mode) {
+            style::apply(ctx, &self.pal(), self.dark_mode);
+            self.applied_theme = Some(self.dark_mode);
         }
+        let p = self.pal();
 
-        // Bottom Chat Input panel docked at the bottom of the center area (below the main chat, between sidebars)
-        egui::TopBottomPanel::bottom("bottom_input_panel")
-            .frame(
-                egui::Frame::default()
-                    .inner_margin(egui::Margin::symmetric(12.0, 6.0))
-                    .fill(if self.dark_mode {
-                        egui::Color32::from_rgb(12, 13, 19)
-                    } else {
-                        egui::Color32::from_rgb(248, 249, 252)
-                    })
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        if self.dark_mode {
-                            egui::Color32::from_rgb(37, 35, 50)
-                        } else {
-                            egui::Color32::from_rgb(220, 223, 235)
-                        },
-                    )),
-            )
-            .resizable(false)
-            .show(ctx, |ui| {
-                if self.current_session_id.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("📁 Loaded Session (Active)")
-                                .size(11.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(16, 185, 129)),
-                        );
-                        ui.label(
-                            egui::RichText::new("You can continue chatting to update this session thread.")
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(148, 163, 184)),
-                        );
-                    });
-                }
+        self.handle_shortcuts(ctx);
 
-                // Modal/Overlay for Tool Approval requests (rendered right above prompt box inside bottom panel)
-                let mut user_response = None;
-                if let Some(approval) = &self.approval_pending {
-                    let tool_name = approval.tool_name.clone();
-                    let args_preview = approval.args_preview.clone();
-
-                    ui.centered_and_justified(|ui| {
-                        let available_width = ui.available_width();
-                        let max_chat_width: f32 = 920.0;
-                        let chat_width = max_chat_width.min(available_width - 36.0).max(200.0);
-                        let horizontal_margin = ((available_width - chat_width) / 2.0).max(0.0);
-
-                        ui.horizontal(|ui| {
-                            ui.add_space(horizontal_margin);
-
-                            egui::Frame::group(ui.style())
-                                .fill(if self.dark_mode {
-                                    egui::Color32::from_rgb(30, 32, 45)
-                                } else {
-                                    egui::Color32::from_rgb(254, 243, 199)
-                                })
-                                .stroke(egui::Stroke::new(
-                                    1.0,
-                                    egui::Color32::from_rgb(234, 179, 8),
-                                ))
-                                .inner_margin(14.0)
-                                .rounding(10.0)
-                                .show(ui, |ui| {
-                                    ui.set_width(chat_width);
-                                    ui.vertical(|ui| {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(234, 179, 8),
-                                            "⚠️ User Approval Required for Tool Call:",
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!("Tool: {}", tool_name))
-                                                .strong(),
-                                        );
-                                        let mut target_summary = String::new();
-                                        if let Ok(v) =
-                                            serde_json::from_str::<serde_json::Value>(&args_preview)
-                                        {
-                                            if let Some(path) = v
-                                                .get("path")
-                                                .or_else(|| v.get("TargetFile"))
-                                                .and_then(|x| x.as_str())
-                                            {
-                                                target_summary = format!("File: {path}");
-                                            } else if let Some(cmd) =
-                                                v.get("CommandLine").and_then(|x| x.as_str())
-                                            {
-                                                target_summary = format!("Command: {cmd}");
-                                            } else if let Some(url) =
-                                                v.get("Url").and_then(|x| x.as_str())
-                                            {
-                                                target_summary = format!("URL: {url}");
-                                            } else if let Some(obj) = v.as_object() {
-                                                let mut parts = Vec::new();
-                                                for (k, val) in obj {
-                                                    if k != "content"
-                                                        && k != "ReplacementContent"
-                                                        && k != "TargetContent"
-                                                        && k != "CodeContent"
-                                                    {
-                                                        let val_str = val.to_string();
-                                                        if val_str.len() > 60 {
-                                                            parts.push(format!(
-                                                                "{}: {}",
-                                                                k,
-                                                                crate::util::truncate_chars(&val_str, 60)
-                                                            ));
-                                                        } else {
-                                                            parts.push(format!(
-                                                                "{}: {}",
-                                                                k, val_str
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                                target_summary = parts.join(", ");
-                                            }
-                                        }
-                                        if target_summary.is_empty() {
-                                            target_summary = args_preview.clone();
-                                        }
-                                        if target_summary.len() > 120 {
-                                            target_summary.truncate(120);
-                                            target_summary.push_str("...");
-                                        }
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new("Target:").strong());
-                                            ui.code(&target_summary);
-                                        });
-                                        ui.add_space(8.0);
-                                        ui.horizontal(|ui| {
-                                            if ui.button("✅ Approve").clicked() {
-                                                user_response = Some(true);
-                                            }
-                                            ui.add_space(10.0);
-                                            if ui.button("❌ Deny").clicked() {
-                                                user_response = Some(false);
-                                            }
-                                        });
-                                    });
-                                });
-                        });
-                    });
-                    ui.add_space(8.0);
-                }
-
-                if let Some(approved) = user_response {
-                    if let Some(_approval) = self.approval_pending.take() {
-                        let _ = self.approval_tx.send(approved);
-                    }
-                }
-                let available_width = ui.available_width();
-                let max_chat_width: f32 = 920.0;
-                let chat_width = max_chat_width.min(available_width - 36.0).max(200.0);
-                let horizontal_margin = ((available_width - chat_width) / 2.0).max(0.0);
-
-                if let Some(ref path) = self.attached_image {
-                    let filename = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("file");
-                    let tag_text = format!("📎 {filename} ❌");
-                    ui.horizontal(|ui| {
-                        ui.add_space(horizontal_margin + 12.0);
-                        let bg_color = if self.dark_mode {
-                            egui::Color32::from_rgb(30, 24, 45)
-                        } else {
-                            egui::Color32::from_rgb(245, 243, 255)
-                        };
-                        egui::Frame::default()
-                            .fill(bg_color)
-                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                            .rounding(6.0)
-                            .show(ui, |ui| {
-                                if ui
-                                    .button(
-                                        egui::RichText::new(tag_text)
-                                            .color(egui::Color32::from_rgb(239, 68, 68))
-                                            .size(12.0),
-                                    )
-                                    .on_hover_text("Click to remove file")
-                                    .clicked()
-                                {
-                                    self.attached_image = None;
-                                }
-                            });
-                    });
-                    ui.add_space(4.0);
-                }
-
-                // Model selectors floating above the input frame
-                ui.horizontal(|ui| {
-                    ui.add_space(horizontal_margin + 18.0); // indent slightly past the input frame's left edge
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.style_mut().spacing.interact_size.y = 20.0;
-                        ui.style_mut().spacing.item_spacing.x = 6.0;
-                        ui.label(egui::RichText::new("✨").size(11.0).color(egui::Color32::from_rgb(130, 110, 200)));
-
-                        let registry = build_registry();
-                        let mut current_provider_idx = registry
-                            .iter()
-                            .position(|p| p.name == self.settings.active_provider)
-                            .unwrap_or(0);
-
-                        egui::ComboBox::from_id_salt("provider_select_bottom")
-                            .selected_text(&registry[current_provider_idx].display_name)
-                            .show_ui(ui, |ui| {
-                                for (idx, provider) in registry.iter().enumerate() {
-                                    if ui.selectable_value(&mut current_provider_idx, idx, &provider.display_name).clicked() {
-                                        self.settings.active_provider = provider.name.clone();
-                                        if let Some(first_model) = provider.models.first() {
-                                            self.settings.active_model = first_model.id.clone();
-                                        }
-                                        self.sync_settings();
-                                    }
-                                }
-                            });
-
-                        ui.add_space(4.0);
-                        let active_provider = &registry[current_provider_idx];
-
-                        let active_model_info = active_provider.models.iter().find(|m| m.id == self.settings.active_model);
-                        let vision_icon = if let Some(m) = active_model_info {
-                            if matches!(m.vision, crate::config::providers::Vision::Yes) { " 👁" } else { "" }
-                        } else { "" };
-                        let mut model_display = format!("{}{}", self.settings.active_model, vision_icon);
-                        if model_display.chars().count() > 30 {
-                            model_display = crate::util::truncate_chars(&model_display, 27);
-                        }
-
-                        let popup_id = ui.make_persistent_id("model_search_popup");
-                        let button_res = ui.add(egui::Button::new(model_display).frame(false));
-                        if button_res.clicked() {
-                            ui.memory_mut(|mem| mem.toggle_popup(popup_id));
-                        }
-                        egui::popup::popup_above_or_below_widget(ui, popup_id, &button_res, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
-                            ui.set_min_width(280.0);
-                            ui.set_min_height(250.0); // Prevent the Above popup bug where it gets stuck at a small height
-                            ui.add_space(4.0);
-                            ui.add(egui::TextEdit::singleline(&mut self.model_search_query).hint_text("Search models..."));
-                            ui.separator();
-                            egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
-
-                                let mut starred = Vec::new();
-                                let mut unstarred = Vec::new();
-                                let query = self.model_search_query.to_lowercase();
-                                for model in &active_provider.models {
-                                    if !query.is_empty() && !model.id.to_lowercase().contains(&query) {
-                                        continue;
-                                    }
-                                    if self.settings.starred_models.contains(&model.id) {
-                                        starred.push(model);
-                                    } else {
-                                        unstarred.push(model);
-                                    }
-                                }
-
-                                let mut render_model = |ui: &mut egui::Ui, model: &crate::config::providers::ModelInfo| {
-                                    ui.horizontal(|ui| {
-                                        let is_starred = self.settings.starred_models.contains(&model.id);
-                                        let star_icon = if is_starred { "⭐" } else { "☆" };
-                                        let star_color = if is_starred { egui::Color32::from_rgb(250, 204, 21) } else { egui::Color32::from_rgb(100, 116, 139) };
-                                        if ui.add(egui::Button::new(egui::RichText::new(star_icon).color(star_color)).frame(false)).clicked() {
-                                            if is_starred {
-                                                self.settings.starred_models.retain(|id| id != &model.id);
-                                            } else {
-                                                self.settings.starred_models.push(model.id.clone());
-                                            }
-                                            self.sync_settings();
-                                        }
-
-                                        // Build capability badges
-                                        let mut badges = String::new();
-                                        if matches!(model.vision, crate::config::providers::Vision::Yes) {
-                                            badges.push_str(" 👁");
-                                        }
-                                        if model.tool_calling {
-                                            badges.push_str(" 🔧");
-                                        }
-                                        // Show context window in compact form (e.g. "128k")
-                                        let ctx_k = model.context_window / 1000;
-                                        if ctx_k > 0 {
-                                            badges.push_str(&format!(" {}k", ctx_k));
-                                        }
-
-                                        let display_text = format!("{}{}", model.id, badges);
-                                        if ui.selectable_value(&mut self.settings.active_model, model.id.clone(), display_text).clicked() {
-                                            self.sync_settings();
-                                            ui.memory_mut(|mem| mem.close_popup());
-                                        }
-                                    });
-                                };
-
-                                if !starred.is_empty() {
-                                    for model in starred { render_model(ui, model); }
-                                    ui.separator();
-                                }
-                                for model in unstarred { render_model(ui, model); }
-                            });
-                        });
-
-                        if self.settings.active_provider.to_lowercase().contains("anthropic") {
-                            if let Some(model) = active_provider.models.iter().find(|m| m.id == self.settings.active_model) {
-                                if !model.effort_levels.is_empty() || model.adaptive_thinking {
-                                    ui.add_space(4.0);
-                                    let current_effort = self.settings.thinking_effort.clone().unwrap_or_else(|| "none".to_string());
-                                    let label = if current_effort == "none" {
-                                        "Thinking: Off".to_string()
-                                    } else {
-                                        format!("Thinking: {}", current_effort)
-                                    };
-                                    egui::ComboBox::from_id_salt("thinking_select_bottom")
-                                        .selected_text(label)
-                                        .show_ui(ui, |ui| {
-                                            if ui.selectable_value(&mut self.settings.thinking_effort, Some("none".to_string()), "Off").clicked() {
-                                                self.sync_settings();
-                                            }
-                                            for lvl in &model.effort_levels {
-                                                if ui.selectable_value(&mut self.settings.thinking_effort, Some(lvl.clone()), lvl).clicked() {
-                                                    self.sync_settings();
-                                                }
-                                            }
-                                            if model.adaptive_thinking
-                                                && ui.selectable_value(&mut self.settings.thinking_effort, Some("adaptive".to_string()), "Adaptive").clicked() {
-                                                    self.sync_settings();
-                                                }
-                                        });
-                                }
-                            }
-                        } else if self.probing_in_progress {
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new("Checking...").italics().color(egui::Color32::from_rgb(120, 120, 140)));
-                        }
-                    });
-                });
-
-                ui.add_space(4.0); // Space between the selectors and the text input
-
-                ui.horizontal(|ui| {
-                    ui.add_space(horizontal_margin);
-
-                    // Premium slim input frame
-                    egui::Frame::default()
-                        .fill(if self.dark_mode {
-                            egui::Color32::from_rgb(22, 23, 35)
-                        } else {
-                            egui::Color32::from_rgb(250, 250, 255)
-                        })
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            if self.dark_mode {
-                                egui::Color32::from_rgb(55, 45, 85)
-                            } else {
-                                egui::Color32::from_rgb(196, 181, 253)
-                            },
-                        ))
-                        .inner_margin(egui::Margin::symmetric(8.0, 5.0))
-                        .rounding(24.0)
-                        .show(ui, |ui| {
-                            ui.set_width(chat_width - 24.0);
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                if attachment_button(ui, self.dark_mode).clicked() {
-                                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                        self.attached_image = Some(path);
-                                        self.status_text = "File attached!".to_string();
-                                    }
-                                }
-
-                                ui.add_space(4.0);
-
-                                let buttons_w = if self.is_processing { 80.0 } else { 36.0 };
-                                let remaining_w = (ui.available_width() - buttons_w).max(80.0);
-                                let mut edit_response_opt = None;
-
-                                egui::ScrollArea::vertical()
-                                    .max_height(100.0)
-                                    .id_salt("prompt_input_scroll")
-                                    .show(ui, |ui| {
-                                        let resp = ui.add(
-                                            egui::TextEdit::multiline(&mut self.input_text)
-                                                .hint_text(
-                                                    egui::RichText::new("Ask Norvexum anything…")
-                                                        .size(13.0)
-                                                        .color(if self.dark_mode {
-                                                            egui::Color32::from_rgb(100, 100, 130)
-                                                        } else {
-                                                            egui::Color32::from_rgb(160, 160, 185)
-                                                        })
-                                                )
-                                                .text_color(if self.dark_mode {
-                                                    egui::Color32::from_rgb(220, 222, 235)
-                                                } else {
-                                                    egui::Color32::from_rgb(30, 41, 59)
-                                                })
-                                                .desired_rows(1)
-                                                .margin(egui::vec2(4.0, 4.0))
-                                                .interactive(true)
-                                                .frame(false)
-                                                .desired_width(remaining_w),
-                                        );
-                                        edit_response_opt = Some(resp);
-                                    });
-
-                                let edit_response = edit_response_opt.unwrap();
-
-                                if edit_response.has_focus()
-                                    && ui.input(|i| {
-                                        i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
-                                    })
-                                {
-                                    self.send_message();
-                                    edit_response.request_focus();
-                                }
-
-                                // Send / Stop buttons — circular arrow for send, pill for stop
-                                if self.is_processing {
-                                    ui.horizontal(|ui| {
-                                        // Circular send arrow
-                                        let has_text = !self.input_text.trim().is_empty();
-                                        let send_color = if has_text {
-                                            egui::Color32::from_rgb(109, 40, 217)
-                                        } else {
-                                            egui::Color32::from_rgb(50, 40, 70)
-                                        };
-                                        let (send_rect, send_resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
-                                        ui.painter().circle_filled(send_rect.center(), 15.0, send_color);
-                                        let center = send_rect.center();
-                                        let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
-                                        ui.painter().line_segment([center + egui::vec2(0.0, 5.0), center + egui::vec2(0.0, -5.0)], stroke);
-                                        ui.painter().line_segment([center + egui::vec2(-4.0, -1.0), center + egui::vec2(0.0, -6.0)], stroke);
-                                        ui.painter().line_segment([center + egui::vec2(4.0, -1.0), center + egui::vec2(0.0, -6.0)], stroke);
-                                        if send_resp.clicked() && has_text {
-                                            self.send_message();
-                                            edit_response.request_focus();
-                                        }
-
-                                        // Stop pill
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new("■")
-                                                        .color(egui::Color32::WHITE)
-                                                        .size(12.0),
-                                                )
-                                                .fill(egui::Color32::from_rgb(190, 52, 74))
-                                                .rounding(14.0),
-                                            )
-                                            .on_hover_text("Stop the current response")
-                                            .clicked()
-                                        {
-                                            let _ = self.cancel_tx.send(());
-                                            self.is_processing = false;
-                                            self.status_text = "Stopped".to_string();
-                                        }
-                                    });
-                                } else {
-                                    // Circular send arrow
-                                    let has_text = !self.input_text.trim().is_empty();
-                                    let send_color = if has_text {
-                                        egui::Color32::from_rgb(109, 40, 217)
-                                    } else {
-                                        egui::Color32::from_rgb(50, 40, 70)
-                                    };
-                                    let (send_rect, send_resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
-                                    ui.painter().circle_filled(send_rect.center(), 15.0, send_color);
-                                    let center = send_rect.center();
-                                    let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
-                                    ui.painter().line_segment([center + egui::vec2(0.0, 5.0), center + egui::vec2(0.0, -5.0)], stroke);
-                                    ui.painter().line_segment([center + egui::vec2(-4.0, -1.0), center + egui::vec2(0.0, -6.0)], stroke);
-                                    ui.painter().line_segment([center + egui::vec2(4.0, -1.0), center + egui::vec2(0.0, -6.0)], stroke);
-                                    if send_resp.clicked() && has_text {
-                                        self.send_message();
-                                        edit_response.request_focus();
-                                    }
-                                }
-                            });
-                        });
-                    ui.add_space(horizontal_margin);
-                });
-            });
-
-        // Terminal Panel (togglable, sits above input panel)
+        // Panel order matters: the status bar spans the full width, the
+        // composer and terminal sit between the sidebars.
+        self.draw_top_bar(ctx, &p);
+        self.draw_status_bar(ctx, &p);
+        self.draw_left_sidebar(ctx, &p);
+        self.draw_right_sidebar(ctx, &p);
+        self.draw_composer(ctx, &p);
         if self.show_terminal_panel {
-            egui::TopBottomPanel::bottom("terminal_panel")
-                .frame(
-                    egui::Frame::default()
-                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                        .fill(if self.dark_mode {
-                            egui::Color32::from_rgb(8, 10, 14)
-                        } else {
-                            egui::Color32::from_rgb(24, 24, 32)
-                        })
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            if self.dark_mode {
-                                egui::Color32::from_rgb(30, 40, 35)
-                            } else {
-                                egui::Color32::from_rgb(50, 55, 65)
-                            },
-                        )),
-                )
-                .resizable(true)
-                .default_height(180.0)
-                .max_height(400.0)
-                .min_height(80.0)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("⬛ TERMINAL")
-                                .size(10.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(52, 211, 153)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("({} commands)", self.terminal_entries.len()))
-                                .size(10.0)
-                                .color(egui::Color32::from_rgb(100, 116, 139)),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("Clear")
-                                            .size(10.0)
-                                            .color(egui::Color32::from_rgb(148, 163, 184)),
-                                    )
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::NONE),
-                                )
-                                .clicked()
-                            {
-                                self.terminal_entries.clear();
-                            }
-
-                            let bg_procs = crate::tools::shell::get_background_processes();
-                            if !bg_procs.is_empty()
-                                && ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new(format!("Kill {} Background Processes", bg_procs.len()))
-                                                .size(10.0)
-                                                .color(egui::Color32::from_rgb(239, 68, 68)),
-                                        )
-                                        .fill(egui::Color32::TRANSPARENT)
-                                        .stroke(egui::Stroke::NONE),
-                                    )
-                                    .clicked()
-                                {
-                                    for proc in bg_procs {
-                                        crate::tools::shell::kill_background_process(proc.pid);
-                                    }
-                                }
-                        });
-                    });
-                    ui.add_space(4.0);
-
-                    let is_running_cmd = self.is_processing && self.current_tool_name.as_ref().is_some_and(|name| {
-                        name == "run_command" || name == "shell" || name == "shell_command" || name == "execute"
-                    });
-
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .auto_shrink([false; 2])
-                        .id_salt("terminal_scroll")
-                        .show(ui, |ui| {
-                            if self.terminal_entries.is_empty() && !is_running_cmd {
-                                ui.label(
-                                    egui::RichText::new("No commands executed yet. Agent terminal output will appear here.")
-                                        .size(11.0)
-                                        .italics()
-                                        .color(egui::Color32::from_rgb(75, 85, 99)),
-                                );
-                            } else {
-                                let entries = self.terminal_entries.clone();
-                                for (i, entry) in entries.iter().enumerate() {
-                                    // Command prompt line
-                                    let cmd_color = if entry.success {
-                                        egui::Color32::from_rgb(52, 211, 153)
-                                    } else {
-                                        egui::Color32::from_rgb(248, 113, 113)
-                                    };
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("$")
-                                                .size(12.0)
-                                                .strong()
-                                                .color(cmd_color)
-                                                .monospace(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(&entry.command)
-                                                .size(12.0)
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(226, 232, 240))
-                                                .monospace(),
-                                        );
-                                    });
-
-                                    // Output (truncated to prevent huge renders)
-                                    if !entry.output.is_empty() {
-                                        let output_text = if entry.output.len() > 2000 {
-                                            format!("{}\n(truncated)", crate::util::truncate_chars(&entry.output, 2000))
-                                        } else {
-                                            entry.output.clone()
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(&output_text)
-                                                .size(11.0)
-                                                .color(egui::Color32::from_rgb(148, 163, 184))
-                                                .monospace(),
-                                        );
-                                    }
-
-                                    if i + 1 < entries.len() || is_running_cmd {
-                                        ui.add_space(6.0);
-                                        let separator_color = egui::Color32::from_rgb(30, 35, 45);
-                                        let rect = ui.available_rect_before_wrap();
-                                        let y = rect.top();
-                                        ui.painter().line_segment(
-                                            [
-                                                egui::pos2(rect.left(), y),
-                                                egui::pos2(rect.right(), y),
-                                            ],
-                                            egui::Stroke::new(0.5, separator_color),
-                                        );
-                                        ui.add_space(6.0);
-                                    }
-                                }
-
-                                // If currently executing a shell command, show it live!
-                                if is_running_cmd {
-                                    let cmd = extract_streaming_content(&self.current_tool_args, "command");
-                                    let mut cmd_line = if cmd.is_empty() {
-                                        extract_streaming_content(&self.current_tool_args, "CommandLine")
-                                    } else {
-                                        cmd
-                                    };
-                                    if cmd_line.is_empty() {
-                                        cmd_line = extract_streaming_content(&self.current_tool_args, "cmd");
-                                    }
-
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("$")
-                                                .size(12.0)
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(167, 139, 250)) // Purple prompt for active
-                                                .monospace(),
-                                        );
-
-                                        // Make block character blink slightly (using sinus animation)
-                                        let time = ui.input(|i| i.time);
-                                        let cursor = if (time * 2.0) as i64 % 2 == 0 { "█" } else { " " };
-
-                                        ui.label(
-                                            egui::RichText::new(format!("{} {}", cmd_line, cursor))
-                                                .size(12.0)
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(226, 232, 240))
-                                                .monospace(),
-                                        );
-                                    });
-
-                                    // Request repaint for blinking cursor
-                                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-                                }
-                            }
-                        });
-                });
+            self.draw_terminal(ctx, &p);
         }
+        self.draw_conversation(ctx, &p);
 
-        // Center Panel (Chat Conversation Area)
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::default()
-                    .inner_margin(egui::Margin::symmetric(24.0, 18.0))
-                    .fill(if self.dark_mode {
-                        egui::Color32::from_rgb(10, 11, 16)
-                    } else {
-                        egui::Color32::from_rgb(246, 247, 251)
-                    }),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("CONVERSATION")
-                                .size(11.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(167, 139, 250)),
-                        );
-                        ui.label(
-                            egui::RichText::new("Norvexum Agent")
-                                .font(egui::FontId::proportional(20.0))
-                                .strong(),
-                        );
-                    });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                !self.is_processing,
-                                egui::Button::new(
-                                    egui::RichText::new("+  New chat")
-                                        .color(if self.dark_mode {
-                                            egui::Color32::from_rgb(221, 214, 254)
-                                        } else {
-                                            egui::Color32::from_rgb(91, 33, 182)
-                                        })
-                                        .strong(),
-                                )
-                                .fill(if self.dark_mode {
-                                    egui::Color32::from_rgb(37, 29, 58)
-                                } else {
-                                    egui::Color32::from_rgb(237, 233, 254)
-                                })
-                                .stroke(egui::Stroke::new(
-                                    1.0,
-                                    egui::Color32::from_rgb(124, 58, 237),
-                                ))
-                                .rounding(10.0),
-                            )
-                            .on_hover_text("Start a fresh conversation")
-                            .clicked()
-                        {
-                            let _ = self.user_tx.send("/clear".to_string());
-                            self.messages.clear();
-                            self.session_written_files.clear();
-                            self.file_diff_stats.clear();
-                            self.terminal_entries.clear();
-                            self.current_session_id = None;
-                            self.active_messages_backup = None;
-                            self.selected_file = None;
-                            self.status_text = "Chat cleared".to_string();
-                        }
-                    });
-                });
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                enum PendingAction {
-                    Edit(String),
-                    Reroll(String),
-                    Undo,
-                }
-                let mut pending_action = None;
-
-                let has_user_messages = self.messages.iter().any(|m| m.role == "user");
-                if !has_user_messages && !self.is_processing {
-                    ui.add_space((ui.available_height() * 0.20).min(120.0));
-                    ui.vertical_centered(|ui| {
-                        ui.add(egui::Image::new(&self.logo_tex).max_width(54.0));
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("What shall we build?")
-                                .font(egui::FontId::proportional(24.0))
-                                .strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new(
-                                "Ask Norvexum to explore, explain, or change your workspace.",
-                            )
-                            .size(13.0)
-                            .color(egui::Color32::from_rgb(148, 163, 184)),
-                        );
-                        for msg in &self.messages {
-                            if msg.content.contains("🧹") || msg.content.contains("cleared") {
-                                ui.add_space(16.0);
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(110, 120, 140),
-                                    &msg.content,
-                                );
-                            }
-                        }
-                    });
-                    ui.add_space(24.0);
-                } else {
-                    // Chat Scroll area takes up 100% of the CentralPanel!
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            let available_chat_width = ui.available_width();
-                            ui.set_min_width(available_chat_width);
-
-                            let last_agent_idx = self
-                                .messages
-                                .iter()
-                                .enumerate()
-                                .rfind(|(_, m)| m.role == "assistant")
-                                .map(|(idx, _)| idx);
-
-                            for (msg_idx, msg) in self.messages.iter().enumerate() {
-                                if msg.role == "system" {
-                                    continue;
-                                }
-                                // Skip ghost assistant messages: empty content + no thinking + no tool activity
-                                if msg.role == "assistant"
-                                    && msg.content.trim().is_empty()
-                                    && msg.thinking.as_ref().is_none_or(|t| t.trim().is_empty())
-                                    && msg.tool_logs.is_empty()
-                                {
-                                    continue;
-                                }
-                                let is_user = msg.role == "user";
-                                let is_status = msg.role == "status";
-                                let is_err = msg.role == "error";
-
-                                if is_status {
-                                    ui.centered_and_justified(|ui| {
-                                        let display_text = if msg.content.contains('🧹') {
-                                            msg.content.clone()
-                                        } else {
-                                            format!("ℹ️ {}", msg.content)
-                                        };
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(110, 120, 140),
-                                            display_text,
-                                        );
-                                    });
-                                } else if is_err {
-                                    ui.centered_and_justified(|ui| {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(239, 68, 68),
-                                            format!("⚠️ {}", msg.content),
-                                        );
-                                    });
-                                } else {
-                                    let alignment = if is_user {
-                                        egui::Align::RIGHT
-                                    } else {
-                                        egui::Align::LEFT
-                                    };
-
-                                    ui.allocate_ui_with_layout(
-                                         egui::vec2(available_chat_width, 0.0),
-                                         egui::Layout::top_down(alignment),
-                                         |ui| {
-                                             let msg_response = ui
-                                                 .with_layout(egui::Layout::top_down(alignment), |ui| {
-                                                     if is_user {
-                                                         if let Some(ref img_path) = msg.attached_image {
-                                                             let filename = img_path.file_name().and_then(|n| n.to_str()).unwrap_or("image.png");
-                                                             ui.label(
-                                                                 egui::RichText::new(format!("📎 {}", filename))
-                                                                     .color(egui::Color32::from_rgb(148, 163, 184))
-                                                                     .small(),
-                                                             );
-                                                         }
-                                                         // User speech bubble: clean slate background
-                                                         let max_bubble_width =
-                                                             (available_chat_width * 0.72)
-                                                                 .clamp(260.0, 760.0);
-                                                         let inner_pad_x = 16.0;
-                                                         let inner_pad_total = inner_pad_x * 2.0;
-                                                         let text_max_width =
-                                                             (max_bubble_width - inner_pad_total)
-                                                                 .max(60.0);
-
-                                                         let theme_color = if self.dark_mode {
-                                                             egui::Color32::from_rgb(47, 37, 72)
-                                                         } else {
-                                                             egui::Color32::from_rgb(237, 233, 254)
-                                                         };
-                                                         let text_color = if self.dark_mode {
-                                                             egui::Color32::WHITE
-                                                         } else {
-                                                             egui::Color32::from_rgb(30, 41, 59)
-                                                         };
-                                                         let stroke_color = if self.dark_mode {
-                                                             egui::Color32::from_rgb(91, 70, 145)
-                                                         } else {
-                                                             egui::Color32::from_rgb(196, 181, 253)
-                                                         };
-
-                                                         // Smooth fade-in animation for newly-arriving user bubble
-                                                         let entry_t = ui
-                                                             .ctx()
-                                                             .animate_value_with_time(
-                                                                 egui::Id::new(format!("user_bubble_in_{msg_idx}")),
-                                                                 1.0,
-                                                                 0.16,
-                                                             )
-                                                             .clamp(0.0, 1.0);
-                                                         let entry_alpha = 1.0 - (1.0 - entry_t).powi(3);
-
-                                                         // Measure the exact rendered text width with the proportional font
-                                                         let galley = ui.fonts(|f| {
-                                                             f.layout(
-                                                                 msg.content.clone(),
-                                                                 egui::FontId::proportional(13.0),
-                                                                 text_color,
-                                                                 text_max_width,
-                                                             )
-                                                         });
-                                                         let text_w = galley.size().x.ceil();
-                                                         let bubble_w = (text_w + inner_pad_total)
-                                                             .min(max_bubble_width);
-
-                                                         ui.label(
-                                                             egui::RichText::new("YOU")
-                                                                 .size(9.0)
-                                                                 .strong()
-                                                                 .color(
-                                                                     egui::Color32::from_rgb(
-                                                                         167, 139, 250,
-                                                                     )
-                                                                     .linear_multiply(entry_alpha),
-                                                                 ),
-                                                         );
-                                                         ui.add_space(4.0);
-
-                                                         let tinted_fill = theme_color.linear_multiply(entry_alpha);
-                                                         let tinted_stroke = egui::Stroke::new(
-                                                             1.0,
-                                                             stroke_color.linear_multiply(entry_alpha),
-                                                         );
-
-                                                         ui.allocate_ui_with_layout(
-                                                             egui::vec2(bubble_w, 0.0),
-                                                             egui::Layout::top_down(egui::Align::LEFT),
-                                                             |ui| {
-                                                                 ui.set_max_width(bubble_w);
-                                                                 egui::Frame::default()
-                                                                     .fill(tinted_fill)
-                                                                     .stroke(tinted_stroke)
-                                                                     .inner_margin(
-                                                                         egui::Margin::symmetric(
-                                                                             inner_pad_x, 12.0,
-                                                                         ),
-                                                                     )
-                                                                     .rounding(14.0)
-                                                                     .show(ui, |ui| {
-                                                                         if msg.content.len() > 1000 {
-                                                                             egui::ScrollArea::vertical()
-                                                                                 .max_height(220.0)
-                                                                                 .id_salt(format!("user_scroll_{}", msg_idx))
-                                                                                 .show(ui, |ui| {
-                                                                                     render_formatted_markdown(
-                                                                                         ui,
-                                                                                         &msg.content,
-                                                                                         self.dark_mode,
-                                                                                     );
-                                                                                 });
-                                                                         } else {
-                                                                             render_formatted_markdown(
-                                                                                 ui,
-                                                                                 &msg.content,
-                                                                                 self.dark_mode,
-                                                                             );
-                                                                         }
-                                                                     });
-                                                             },
-                                                         );
-                                                    } else {
-                                                        // Agent response: subtle left accent bar + clean background
-                                                        let agent_width = (available_chat_width - 36.0)
-                                                                .clamp(260.0, 960.0);
-                                                        let accent_color = if self.dark_mode {
-                                                            egui::Color32::from_rgb(124, 58, 237)
-                                                        } else {
-                                                            egui::Color32::from_rgb(139, 92, 246)
-                                                        };
-
-                                                        // Paint a left accent bar
-                                                        let before_rect = ui.cursor();
-                                                        let accent_id = egui::Id::new(format!("agent_accent_{msg_idx}"));
-                                                        let _ = accent_id; // used below after content
-
-                                                        ui.set_width(agent_width);
-                                                        ui.add_space(4.0);
-
-                                                        let content_start_y = ui.cursor().top();
-
-                                                        // Render thinking and tools chronologically interleaved
-                                                        let is_latest_agent =
-                                                            Some(msg_idx) == last_agent_idx;
-                                                        let has_activity = !msg
-                                                            .tool_logs
-                                                            .is_empty()
-                                                            || (msg.thinking.as_ref().is_some_and(
-                                                                |t| !t.trim().is_empty(),
-                                                            ))
-                                                            || (is_latest_agent
-                                                                && self.is_processing);
-
-                                                        if has_activity {
-                                                            let (curr_name, curr_args) =
-                                                                if is_latest_agent
-                                                                    && self.is_processing
-                                                                {
-                                                                    (
-                                                                        &self.current_tool_name,
-                                                                        self.current_tool_args
-                                                                            .as_str(),
-                                                                    )
-                                                                } else {
-                                                                    (&None, "")
-                                                                };
-                                                            render_chronological_activity(
-                                                                ui,
-                                                                &msg.tool_logs,
-                                                                self.dark_mode,
-                                                                curr_name.as_deref().map(|n| (n, curr_args)),
-                                                                self.is_processing
-                                                                    && is_latest_agent,
-                                                                &msg.thinking,
-                                                                &self.settings.project_root,
-                                                            );
-                                                            ui.add_space(8.0);
-                                                        }
-
-                                                        // Render message body text directly
-                                                        if !msg.content.is_empty() {
-                                                            if has_activity {
-                                                                ui.add_space(8.0);
-                                                            }
-                                                            render_formatted_markdown(
-                                                                ui,
-                                                                &msg.content,
-                                                                self.dark_mode,
-                                                            );
-                                                        }
-
-                                                        // Paint the left accent bar only when there is actual content or activity
-                                                        let content_end_y = ui.cursor().top();
-                                                        if (has_activity || !msg.content.is_empty()) && content_end_y > content_start_y + 2.0 {
-                                                            let bar_x = before_rect.left() - 6.0;
-                                                            ui.painter().line_segment(
-                                                                [
-                                                                    egui::pos2(bar_x, content_start_y),
-                                                                    egui::pos2(bar_x, content_end_y - 4.0),
-                                                                ],
-                                                                egui::Stroke::new(2.5, accent_color.linear_multiply(0.6)),
-                                                            );
-                                                        }
-                                                    }
-                                                })
-                                                .response;
-
-                                            let mut hover_rect = msg_response.rect;
-                                            hover_rect.min.x = ui.max_rect().min.x;
-                                            hover_rect.max.x = ui.max_rect().max.x;
-                                            let hover_rect = hover_rect.expand2(egui::vec2(0.0, 32.0));
-                                            let is_hovered = ui
-                                                .ctx()
-                                                .pointer_hover_pos()
-                                                .map(|pos| hover_rect.contains(pos))
-                                                .unwrap_or(false)
-                                                || msg_response.hovered();
-
-                                             if is_user {
-                                                 ui.allocate_ui_with_layout(
-                                                     egui::vec2(ui.available_width(), 22.0),
-                                                     egui::Layout::top_down(egui::Align::LEFT),
-                                                     |ui| {
-                                                         ui.set_height(22.0);
-                                                         if is_hovered {
-                                                             ui.with_layout(
-                                                                 egui::Layout::right_to_left(
-                                                                     egui::Align::Center,
-                                                                 ),
-                                                                 |ui| {
-                                                                     if ui.small_button("Copy").clicked() {
-                                                                         ui.ctx().copy_text(msg.content.clone());
-                                                                     }
-                                                                     if ui.small_button("Edit").clicked() {
-                                                                         pending_action =
-                                                                             Some(PendingAction::Edit(
-                                                                                 msg.content.clone(),
-                                                                             ));
-                                                                     }
-                                                                     if ui
-                                                                         .small_button("Re-run")
-                                                                         .on_hover_text("Send this prompt again")
-                                                                         .clicked()
-                                                                     {
-                                                                         pending_action =
-                                                                             Some(PendingAction::Reroll(
-                                                                                 msg.content.clone(),
-                                                                             ));
-                                                                     }
-                                                                     if ui
-                                                                         .small_button("Undo")
-                                                                         .on_hover_text(
-                                                                             "Undo the last tool change",
-                                                                         )
-                                                                         .clicked()
-                                                                     {
-                                                                         pending_action =
-                                                                             Some(PendingAction::Undo);
-                                                                     }
-                                                                 },
-                                                             );
-                                                         }
-                                                     },
-                                                 );
-                                             } else {
-                                                 ui.allocate_ui_with_layout(
-                                                     egui::vec2(ui.available_width(), 22.0),
-                                                     egui::Layout::top_down(egui::Align::LEFT),
-                                                     |ui| {
-                                                         ui.set_height(22.0);
-                                                         ui.horizontal(|ui| {
-                                                             let is_latest_agent =
-                                                                 Some(msg_idx) == last_agent_idx;
-                                                             if is_latest_agent && !self.is_processing {
-                                                                 draw_layered_logo_loader(
-                                                                     ui,
-                                                                     &self.last_layer_tex,
-                                                                     &self.middle_layer_tex,
-                                                                     &self.top_layer_tex,
-                                                                     false,
-                                                                     22.0,
-                                                                 );
-                                                             }
-                                                             if is_hovered {
-                                                                 if ui.small_button("Copy").clicked() {
-                                                                     ui.ctx().copy_text(msg.content.clone());
-                                                                 }
-                                                                 if ui
-                                                                     .small_button("Undo")
-                                                                     .on_hover_text(
-                                                                         "Undo the last tool change",
-                                                                     )
-                                                                     .clicked()
-                                                                 {
-                                                                     pending_action =
-                                                                         Some(PendingAction::Undo);
-                                                                 }
-                                                             }
-                                                         });
-                                                     },
-                                                 );
-                                             }
-                                        },
-                                    );
-                                }
-                                ui.add_space(10.0);
-                            }
-
-                            // Tiny rotating loader spinner under the last message
-                            if self.is_processing {
-                                let loader_text = if let Some(ref tool_name) =
-                                    self.current_tool_name
-                                {
-                                    match tool_name.as_str() {
-                                        "write_file"
-                                        | "write_to_file"
-                                        | "edit_file"
-                                        | "replace_file_content"
-                                        | "multi_replace_file_content" => {
-                                            "Norvexum agent is writing...".to_string()
-                                        }
-                                        "read_file" | "view_file" | "cat" => {
-                                            "Norvexum agent is reading...".to_string()
-                                        }
-                                        "read_skill" => {
-                                            let skill_name = extract_streaming_content(
-                                                &self.current_tool_args,
-                                                "name",
-                                            );
-                                            if skill_name.is_empty() {
-                                                "Norvexum agent is reading skill...".to_string()
-                                            } else {
-                                                format!(
-                                                    "Norvexum agent is reading skill {}...",
-                                                    skill_name
-                                                )
-                                            }
-                                        }
-                                        "web_search" | "search_web" => {
-                                            "Norvexum agent is searching...".to_string()
-                                        }
-                                        "web_fetch" | "read_browser_page" | "browser_subagent" => {
-                                            "Norvexum agent is browsing...".to_string()
-                                        }
-                                        "run_command" | "shell" => {
-                                            "Norvexum agent is executing command...".to_string()
-                                        }
-                                        _ => {
-                                            format!(
-                                                "Norvexum agent is executing {}...",
-                                                tool_name.replace('_', " ")
-                                            )
-                                        }
-                                    }
-                                } else {
-                                    let secs = self.thinking_start_time.map_or(0, |s| s.elapsed().as_secs());
-                                    if secs < 60 {
-                                        format!("Norvexum agent is thinking ({secs}s)...")
-                                    } else {
-                                        let mins = secs / 60;
-                                        let remaining = secs % 60;
-                                        format!("Norvexum agent is thinking ({mins}m {remaining}s)...")
-                                    }
-                                };
-
-                                ui.horizontal(|ui| {
-                                    draw_layered_logo_loader(
-                                        ui,
-                                        &self.last_layer_tex,
-                                        &self.middle_layer_tex,
-                                        &self.top_layer_tex,
-                                        true,
-                                        24.0,
-                                    );
-
-                                    ui.label(
-                                        egui::RichText::new(loader_text)
-                                            .italics()
-                                            .size(12.0)
-                                            .color(egui::Color32::from_rgb(190, 198, 218)),
-                                    );
-                                });
-
-                                if let Some(ref name) = self.current_tool_name {
-                                    let is_write = name == "write_file"
-                                        || name == "write_to_file"
-                                        || name == "edit_file"
-                                        || name == "replace_file_content"
-                                        || name == "multi_replace_file_content";
-                                    if is_write {
-                                        if let Some((ref filename, added, deleted)) =
-                                            self.current_writing_file
-                                        {
-                                            let (pill_fill, pill_stroke, pill_label) =
-                                                if self.dark_mode {
-                                                    (
-                                                        egui::Color32::from_rgb(40, 30, 18),
-                                                        egui::Color32::from_rgb(120, 80, 30),
-                                                        egui::Color32::from_rgb(253, 224, 168),
-                                                    )
-                                                } else {
-                                                    (
-                                                        egui::Color32::from_rgb(255, 247, 237),
-                                                        egui::Color32::from_rgb(214, 158, 46),
-                                                        egui::Color32::from_rgb(120, 53, 15),
-                                                    )
-                                                };
-                                            ui.horizontal(|ui| {
-                                                ui.add_space(28.0);
-                                                egui::Frame::default()
-                                                    .fill(pill_fill)
-                                                    .stroke(egui::Stroke::new(1.0, pill_stroke))
-                                                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                                                    .rounding(6.0)
-                                                    .show(ui, |ui| {
-                                                        ui.horizontal(|ui| {
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "Writing {}",
-                                                                    filename
-                                                                ))
-                                                                .size(11.0)
-                                                                .color(pill_label)
-                                                                .strong()
-                                                                .monospace(),
-                                                            );
-                                                            ui.add_space(6.0);
-                                                            if added > 0 {
-                                                                ui.label(
-                                                                    egui::RichText::new(format!(
-                                                                        "+{}",
-                                                                        added
-                                                                    ))
-                                                                    .size(11.0)
-                                                                    .strong()
-                                                                    .color(egui::Color32::from_rgb(
-                                                                        34, 197, 94,
-                                                                    )),
-                                                                );
-                                                            }
-                                                            if deleted > 0 {
-                                                                ui.label(
-                                                                    egui::RichText::new(format!(
-                                                                        "-{}",
-                                                                        deleted
-                                                                    ))
-                                                                    .size(11.0)
-                                                                    .strong()
-                                                                    .color(egui::Color32::from_rgb(
-                                                                        239, 68, 68,
-                                                                    )),
-                                                                );
-                                                            }
-                                                        });
-                                                    });
-                                            });
-                                        }
-                                    } else {
-                                        let args_summary =
-                                            format_tool_args_summary(name, &self.current_tool_args);
-                                        let text = format_tool_text(name, true, &args_summary);
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(28.0);
-                                            ui.label(
-                                                egui::RichText::new(format!("{}...", text))
-                                                    .small()
-                                                    .color(egui::Color32::from_rgb(148, 163, 184))
-                                                    .italics(),
-                                            );
-                                        });
-                                    }
-                                }
-                            }
-                        });
-                }
-
-                if let Some(act) = pending_action {
-                    match act {
-                        PendingAction::Edit(txt) => {
-                            self.input_text = txt;
-                        }
-                        PendingAction::Reroll(txt) => {
-                            self.input_text = txt;
-                            self.send_message();
-                        }
-                        PendingAction::Undo => {
-                            let has_checkpoints =
-                                crate::agent::checkpoint::has_checkpoints(&self.settings.project_root);
-                            if !has_checkpoints {
-                                self.status_text = "Undo unavailable: no checkpoints found.".to_string();
-                            } else {
-                                let _ = self.user_tx.send("/undo".to_string());
-                                self.status_text = "Undo command sent...".to_string();
-                            }
-                        }
-                    }
-                }
-            });
-
-        // Draw the command approvals and project settings modal window if open
+        if (self.show_settings_modal || self.show_shortcuts) && self.draw_modal_backdrop(ctx) {
+            self.show_settings_modal = false;
+            self.show_shortcuts = false;
+        }
         if self.show_settings_modal {
             self.draw_settings_modal(ctx);
         }
+        if self.show_shortcuts {
+            self.draw_shortcuts(ctx, &p);
+        }
+        self.draw_drop_overlay(ctx);
 
         self.should_scroll_to_line = None;
     }
@@ -4471,20 +4900,31 @@ fn get_relative_path(path: &str, project_root: &std::path::Path) -> String {
     }
 }
 
-fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, dark_mode: bool) {
+fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, p: &Palette) {
     let sanitized_text = text.replace('\u{fe0f}', "");
     let mut lines = sanitized_text.lines().peekable();
-    let text_color = if dark_mode {
-        egui::Color32::from_rgb(226, 232, 240) // Slate 200
-    } else {
-        egui::Color32::from_rgb(30, 41, 59) // Slate 800
-    };
+    let body = style::BODY_SIZE;
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
-        // Check if it's a table
+
+        // Fenced code block (an unterminated fence renders what has streamed so far)
+        if trimmed.starts_with("```") {
+            let lang = trimmed.trim_start_matches('`').trim().to_string();
+            let mut code = Vec::new();
+            for next in lines.by_ref() {
+                if next.trim_start().starts_with("```") {
+                    break;
+                }
+                code.push(next);
+            }
+            render_code_block(ui, &lang, &code.join("\n"), p);
+            ui.add_space(6.0);
+            continue;
+        }
+
+        // Table: collect all consecutive table lines
         if trimmed.starts_with('|') {
-            // Collect all consecutive table lines
             let mut table_lines = vec![trimmed.to_string()];
             while let Some(next_line) = lines.peek() {
                 let next_trimmed = next_line.trim();
@@ -4495,65 +4935,94 @@ fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, dark_mode: bool) {
                     break;
                 }
             }
+            render_markdown_table(ui, &table_lines, p);
+            ui.add_space(6.0);
+            continue;
+        }
 
-            render_markdown_table(ui, &table_lines, dark_mode);
+        // Horizontal rule
+        if trimmed.len() >= 3
+            && (trimmed.chars().all(|c| c == '-')
+                || trimmed.chars().all(|c| c == '*')
+                || trimmed.chars().all(|c| c == '_'))
+        {
+            ui.add_space(4.0);
+            ui.separator();
             ui.add_space(4.0);
             continue;
         }
 
-        // Check if it's a heading
-        if trimmed.starts_with("### ") {
-            let heading_text = trimmed.strip_prefix("### ").unwrap().trim();
+        // Headings
+        let heading = [("### ", 14.5, 4.0), ("## ", 16.5, 6.0), ("# ", 19.0, 8.0)]
+            .into_iter()
+            .find_map(|(prefix, size, space)| {
+                trimmed
+                    .strip_prefix(prefix)
+                    .map(|h| (h.trim(), size, space))
+            });
+        if let Some((heading_text, size, space)) = heading {
+            ui.add_space(space);
             ui.horizontal_wrapped(|ui| {
                 ui.style_mut().spacing.item_spacing.x = 0.0;
-                render_styled_line_parts(ui, heading_text, text_color, 15.0, true);
+                render_styled_line_parts(ui, heading_text, p.text, size, true, p);
             });
-            ui.add_space(6.0);
+            ui.add_space(2.0);
             continue;
         }
-        if trimmed.starts_with("## ") {
-            let heading_text = trimmed.strip_prefix("## ").unwrap().trim();
-            ui.horizontal_wrapped(|ui| {
-                ui.style_mut().spacing.item_spacing.x = 0.0;
-                render_styled_line_parts(ui, heading_text, text_color, 17.0, true);
-            });
-            ui.add_space(6.0);
+
+        // Block quote
+        if let Some(quote) = trimmed
+            .strip_prefix("> ")
+            .or_else(|| trimmed.strip_prefix('>'))
+        {
+            let response = ui
+                .horizontal_wrapped(|ui| {
+                    ui.add_space(12.0);
+                    ui.style_mut().spacing.item_spacing.x = 0.0;
+                    render_styled_line_parts(ui, quote.trim(), p.dim, body, false, p);
+                })
+                .response;
+            let r = response.rect;
+            ui.painter().line_segment(
+                [
+                    r.left_top() + egui::vec2(3.0, 1.0),
+                    r.left_bottom() + egui::vec2(3.0, -1.0),
+                ],
+                egui::Stroke::new(2.0, p.border),
+            );
             continue;
         }
-        if trimmed.starts_with("# ") {
-            let heading_text = trimmed.strip_prefix("# ").unwrap().trim();
-            ui.horizontal_wrapped(|ui| {
-                ui.style_mut().spacing.item_spacing.x = 0.0;
-                render_styled_line_parts(ui, heading_text, text_color, 20.0, true);
-            });
-            ui.add_space(8.0);
-            continue;
-        }
+
+        let indent = (line.len() - line.trim_start().len()).min(12) as f32 * 5.0;
 
         // Bullet point
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            let content = &trimmed[2..];
+        if let Some(content) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+        {
             ui.horizontal_wrapped(|ui| {
                 ui.style_mut().spacing.item_spacing.x = 0.0;
-                ui.label(egui::RichText::new("  •  ").color(text_color).strong());
-                render_styled_line_parts(ui, content, text_color, 13.0, false);
+                ui.add_space(6.0 + indent);
+                ui.label(egui::RichText::new("•   ").size(body).color(p.faint));
+                render_styled_line_parts(ui, content, p.text, body, false, p);
             });
             continue;
         }
 
-        // Ordered list
-        if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) && trimmed.contains(". ") {
-            if let Some(pos) = trimmed.find(". ") {
-                let num = &trimmed[..pos + 2];
-                let content = &trimmed[pos + 2..];
+        // Ordered list: "12. item"
+        let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+        if (1..=3).contains(&digits) {
+            if let Some(content) = trimmed[digits..].strip_prefix(". ") {
                 ui.horizontal_wrapped(|ui| {
                     ui.style_mut().spacing.item_spacing.x = 0.0;
+                    ui.add_space(6.0 + indent);
                     ui.label(
-                        egui::RichText::new(format!("  {} ", num))
-                            .color(text_color)
-                            .strong(),
+                        egui::RichText::new(format!("{}.  ", &trimmed[..digits]))
+                            .size(body)
+                            .color(p.dim),
                     );
-                    render_styled_line_parts(ui, content, text_color, 13.0, false);
+                    render_styled_line_parts(ui, content, p.text, body, false, p);
                 });
                 continue;
             }
@@ -4563,12 +5032,50 @@ fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, dark_mode: bool) {
         if !trimmed.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.style_mut().spacing.item_spacing.x = 0.0;
-                render_styled_line_parts(ui, trimmed, text_color, 13.0, false);
+                render_styled_line_parts(ui, trimmed, p.text, body, false, p);
             });
         } else {
             ui.add_space(6.0);
         }
     }
+}
+
+fn render_code_block(ui: &mut egui::Ui, lang: &str, code: &str, p: &Palette) {
+    egui::Frame::none()
+        .fill(p.code_bg)
+        .stroke(egui::Stroke::new(1.0, p.border))
+        .rounding(8.0)
+        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(if lang.is_empty() { "code" } else { lang })
+                        .size(11.0)
+                        .color(p.faint),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if style::link_button(ui, "Copy", p)
+                        .on_hover_text("Copy code")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(code.to_string());
+                    }
+                });
+            });
+            egui::ScrollArea::horizontal()
+                .id_salt(ui.next_auto_id())
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(code)
+                                .font(egui::FontId::monospace(12.5))
+                                .color(p.text),
+                        )
+                        .extend(),
+                    );
+                });
+        });
 }
 
 fn render_styled_line_parts(
@@ -4577,6 +5084,7 @@ fn render_styled_line_parts(
     text_color: egui::Color32,
     size: f32,
     force_bold: bool,
+    p: &Palette,
 ) {
     let mut parts = vec![(text.to_string(), false, false)];
 
@@ -4611,31 +5119,23 @@ fn render_styled_line_parts(
     parts = temp_parts;
 
     for (part, is_bold, is_code) in parts {
-        let mut text_item = egui::RichText::new(&part).size(size);
-        if is_code {
-            text_item = text_item
+        let text_item = if is_code {
+            egui::RichText::new(&part)
                 .font(egui::FontId::monospace(size - 1.0))
-                .color(if ui.visuals().dark_mode {
-                    egui::Color32::from_rgb(244, 63, 94)
-                } else {
-                    egui::Color32::from_rgb(225, 29, 72)
-                })
-                .background_color(if ui.visuals().dark_mode {
-                    egui::Color32::from_rgb(30, 27, 40)
-                } else {
-                    egui::Color32::from_rgb(240, 240, 245)
-                });
+                .color(p.code_text)
+                .background_color(p.code_bg)
+        } else if force_bold || is_bold {
+            egui::RichText::new(&part)
+                .font(style::strong(size))
+                .color(text_color)
         } else {
-            text_item = text_item.color(text_color);
-            if force_bold || is_bold {
-                text_item = text_item.strong();
-            }
-        }
+            egui::RichText::new(&part).size(size).color(text_color)
+        };
         ui.add(egui::Label::new(text_item));
     }
 }
 
-fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], dark_mode: bool) {
+fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], p: &Palette) {
     let is_separator = |line: &str| {
         line.chars()
             .all(|c| c == '-' || c == '|' || c == ':' || c == ' ' || c == '\t')
@@ -4682,66 +5182,26 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], dark_mode: bool) {
         }
     }
 
-    // Compute a per-column max width so columns line up cleanly and the
-    // table actually looks like a table instead of a stacked list.
+    // Per-column width so columns line up; capped so one giant cell can't
+    // blow up the layout.
     let mut col_widths = vec![0.0_f32; max_cols];
     for row in &rows {
         for (i, cell) in row.iter().enumerate() {
-            // Approximate glyph width: 7.5 px per char at size 12.
-            let w = (cell.chars().count() as f32 * 7.5).max(40.0);
+            let w = (cell.chars().count() as f32 * 7.2).max(40.0);
             if w > col_widths[i] {
                 col_widths[i] = w;
             }
         }
     }
-    // Cap each column so a single giant cell doesn't blow up the layout.
-    let max_col_w = 320.0_f32;
     for w in &mut col_widths {
-        *w = w.min(max_col_w);
+        *w = w.min(320.0);
     }
 
-    let header_bg = if dark_mode {
-        egui::Color32::from_rgb(48, 38, 78)
-    } else {
-        egui::Color32::from_rgb(237, 233, 254)
-    };
-    let header_fg = if dark_mode {
-        egui::Color32::from_rgb(245, 243, 255)
-    } else {
-        egui::Color32::from_rgb(46, 16, 101)
-    };
-    let body_bg_a = if dark_mode {
-        egui::Color32::from_rgb(20, 22, 32)
-    } else {
-        egui::Color32::from_rgb(255, 255, 255)
-    };
-    let body_bg_b = if dark_mode {
-        egui::Color32::from_rgb(26, 28, 40)
-    } else {
-        egui::Color32::from_rgb(248, 250, 252)
-    };
-    let body_fg = if dark_mode {
-        egui::Color32::from_rgb(220, 226, 240)
-    } else {
-        egui::Color32::from_rgb(30, 41, 59)
-    };
-    let border_color = if dark_mode {
-        egui::Color32::from_rgb(50, 52, 70)
-    } else {
-        egui::Color32::from_rgb(203, 213, 225)
-    };
+    let total_width: f32 = col_widths.iter().sum::<f32>() + (max_cols as f32) * 24.0;
 
-    let total_width: f32 = col_widths.iter().sum::<f32>() + (max_cols as f32 - 1.0) * 16.0 + 24.0;
-
-    egui::Frame::default()
-        .fill(if dark_mode {
-            egui::Color32::from_rgb(16, 18, 26)
-        } else {
-            egui::Color32::from_rgb(248, 250, 252)
-        })
-        .stroke(egui::Stroke::new(1.0, border_color))
-        .inner_margin(0.0)
-        .rounding(6.0)
+    egui::Frame::none()
+        .stroke(egui::Stroke::new(1.0, p.border))
+        .rounding(8.0)
         .show(ui, |ui| {
             ui.set_min_width(total_width.min(ui.available_width()));
             egui::Grid::new(ui.next_auto_id())
@@ -4749,33 +5209,31 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], dark_mode: bool) {
                 .spacing([0.0, 0.0])
                 .min_col_width(40.0)
                 .show(ui, |ui| {
-                    // Header row
                     for (i, cell) in rows[0].iter().enumerate() {
                         let w = col_widths[i];
-                        egui::Frame::default()
-                            .fill(header_bg)
-                            .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                        egui::Frame::none()
+                            .fill(p.panel)
+                            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                             .show(ui, |ui| {
                                 ui.set_min_width(w);
                                 ui.set_max_width(w);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.style_mut().spacing.item_spacing.x = 0.0;
-                                    render_styled_line_parts(ui, cell, header_fg, 12.5, true);
+                                    render_styled_line_parts(ui, cell, p.text, 12.5, true, p);
                                 });
                             });
                     }
                     ui.end_row();
 
-                    // Body rows
                     for (row_idx, row) in rows[1..].iter().enumerate() {
                         let row_bg = if row_idx % 2 == 0 {
-                            body_bg_a
+                            egui::Color32::TRANSPARENT
                         } else {
-                            body_bg_b
+                            p.panel.gamma_multiply(0.5)
                         };
                         for (i, cell) in row.iter().enumerate() {
                             let w = col_widths[i];
-                            egui::Frame::default()
+                            egui::Frame::none()
                                 .fill(row_bg)
                                 .inner_margin(egui::Margin::symmetric(12.0, 7.0))
                                 .show(ui, |ui| {
@@ -4783,7 +5241,7 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], dark_mode: bool) {
                                     ui.set_max_width(w);
                                     ui.horizontal_wrapped(|ui| {
                                         ui.style_mut().spacing.item_spacing.x = 0.0;
-                                        render_styled_line_parts(ui, cell, body_fg, 12.0, false);
+                                        render_styled_line_parts(ui, cell, p.text, 12.5, false, p);
                                     });
                                 });
                         }
@@ -4793,6 +5251,7 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], dark_mode: bool) {
         });
     ui.add_space(2.0);
 }
+
 fn get_file_icon(filename: &str) -> &'static str {
     let lower = filename.to_lowercase();
     if lower.ends_with(".rs") {
@@ -5197,117 +5656,117 @@ fn format_tool_text(name: &str, success: bool, summary: &str) -> String {
     }
 }
 
+/// One reasoning step. Live reasoning is shown open and follows the stream;
+/// once the step is over it gets a new id and starts collapsed.
+fn render_reasoning_block(
+    ui: &mut egui::Ui,
+    title: &str,
+    thinking: &str,
+    p: &Palette,
+    key: (usize, usize),
+    live: bool,
+) {
+    if thinking.trim().is_empty() {
+        return;
+    }
+    let title = style::clean_label(title.trim_end_matches("..."));
+    let title = if title.is_empty() || title == "Thinking" {
+        "Reasoning".to_string()
+    } else {
+        title.replacen("Thinking", "Reasoning", 1)
+    };
+    egui::CollapsingHeader::new(egui::RichText::new(title).size(12.5).color(p.dim))
+        .id_salt(("reasoning", key.0, key.1, live))
+        .default_open(live)
+        .show(ui, |ui| {
+            let response = egui::Frame::none()
+                .inner_margin(egui::Margin {
+                    left: 12.0,
+                    right: 4.0,
+                    top: 2.0,
+                    bottom: 2.0,
+                })
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("reasoning_scroll", key.0, key.1))
+                        .max_height(240.0)
+                        .stick_to_bottom(live)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(thinking.trim())
+                                        .size(12.5)
+                                        .italics()
+                                        .color(p.faint),
+                                )
+                                .wrap(),
+                            );
+                        });
+                })
+                .response;
+            let r = response.rect;
+            ui.painter().line_segment(
+                [
+                    r.left_top() + egui::vec2(2.0, 2.0),
+                    r.left_bottom() + egui::vec2(2.0, -2.0),
+                ],
+                egui::Stroke::new(1.5, p.border),
+            );
+        });
+    ui.add_space(2.0);
+}
+
+/// "✔ read main.rs" style row used for finished tool calls.
+fn activity_row(ui: &mut egui::Ui, mark: &str, mark_color: egui::Color32, text: &str, p: &Palette) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(mark).size(11.0).color(mark_color));
+        ui.add(egui::Label::new(egui::RichText::new(text).size(12.5).color(p.dim)).truncate());
+    });
+}
+
+fn diff_counts(ui: &mut egui::Ui, added: usize, deleted: usize, p: &Palette) {
+    if added > 0 {
+        ui.label(
+            egui::RichText::new(format!("+{added}"))
+                .font(egui::FontId::monospace(11.5))
+                .color(p.success),
+        );
+    }
+    if deleted > 0 {
+        ui.label(
+            egui::RichText::new(format!("-{deleted}"))
+                .font(egui::FontId::monospace(11.5))
+                .color(p.danger),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_chronological_activity(
     ui: &mut egui::Ui,
     logs: &[String],
-    dark_mode: bool,
+    p: &Palette,
     // (name, streamed JSON args) of the tool currently running, if any
     current_tool: Option<(&str, &str)>,
     is_processing: bool,
     fallback_thinking: &Option<String>,
     project_root: &std::path::Path,
+    msg_idx: usize,
 ) {
     let has_thinking_deltas = logs.iter().any(|log| log.starts_with("THINKING_DELTA|"));
+    let mut block = 0usize;
 
     if !has_thinking_deltas {
         if let Some(thinking) = fallback_thinking {
-            if !thinking.trim().is_empty() {
-                egui::CollapsingHeader::new(
-                    egui::RichText::new("💭 Thinking process")
-                        .size(12.0)
-                        .strong()
-                        .color(if dark_mode {
-                            egui::Color32::from_rgb(196, 181, 253)
-                        } else {
-                            egui::Color32::from_rgb(91, 33, 182)
-                        }),
-                )
-                .id_salt(ui.next_auto_id())
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(thinking.trim())
-                                .font(egui::FontId::monospace(11.0))
-                                .color(if dark_mode {
-                                    egui::Color32::from_rgb(190, 198, 218)
-                                } else {
-                                    egui::Color32::from_rgb(71, 85, 105)
-                                }),
-                        )
-                        .wrap(),
-                    );
-                });
-                ui.add_space(4.0);
-            }
+            render_reasoning_block(ui, "Reasoning", thinking, p, (msg_idx, block), false);
+            block += 1;
         }
     }
 
     let mut current_loop_title: Option<String> = None;
     let mut current_loop_thinking = String::new();
-
-    let render_loop_block = |ui: &mut egui::Ui, title: &str, thinking: &str| {
-        let clean_title = title.replace('\u{fe0f}', "");
-        if thinking.trim().is_empty() {
-            ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!("⚙ {}", clean_title))
-                        .size(12.0)
-                        .color(if dark_mode {
-                            egui::Color32::from_rgb(148, 163, 184)
-                        } else {
-                            egui::Color32::from_rgb(100, 116, 139)
-                        }),
-                );
-            });
-        } else {
-            egui::CollapsingHeader::new(
-                egui::RichText::new(format!("💭 {}", clean_title))
-                    .size(12.0)
-                    .strong()
-                    .color(if dark_mode {
-                        egui::Color32::from_rgb(196, 181, 253)
-                    } else {
-                        egui::Color32::from_rgb(91, 33, 182)
-                    }),
-            )
-            .id_salt(ui.next_auto_id())
-            .default_open(true)
-            .show(ui, |ui| {
-                let thinking_bg = if dark_mode {
-                    egui::Color32::from_rgb(16, 17, 26)
-                } else {
-                    egui::Color32::from_rgb(245, 243, 255)
-                };
-                let thinking_border = if dark_mode {
-                    egui::Color32::from_rgb(55, 45, 80)
-                } else {
-                    egui::Color32::from_rgb(196, 181, 253)
-                };
-                egui::Frame::default()
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                    .fill(thinking_bg)
-                    .stroke(egui::Stroke::new(0.5, thinking_border))
-                    .rounding(6.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(thinking.trim())
-                                    .font(egui::FontId::monospace(11.0))
-                                    .color(if dark_mode {
-                                        egui::Color32::from_rgb(190, 198, 218)
-                                    } else {
-                                        egui::Color32::from_rgb(71, 85, 105)
-                                    }),
-                            )
-                            .wrap(),
-                        );
-                    });
-            });
-        }
-        ui.add_space(4.0);
-    };
 
     for log in logs {
         if let Some(delta) = log.strip_prefix("THINKING_DELTA|") {
@@ -5315,7 +5774,15 @@ fn render_chronological_activity(
         } else if log.starts_with("ℹ️ Thinking (loop ") || log.starts_with("ℹ️ Thinking (step ")
         {
             if let Some(ref title) = current_loop_title {
-                render_loop_block(ui, title, &current_loop_thinking);
+                render_reasoning_block(
+                    ui,
+                    title,
+                    &current_loop_thinking,
+                    p,
+                    (msg_idx, block),
+                    false,
+                );
+                block += 1;
             }
             let raw_title = log.trim_start_matches("ℹ️ ").trim_end_matches("...");
             current_loop_title = Some(raw_title.to_string());
@@ -5324,235 +5791,152 @@ fn render_chronological_activity(
             let title = current_loop_title
                 .take()
                 .unwrap_or_else(|| "Thinking".to_string());
-            if !current_loop_thinking.trim().is_empty() || title != "Thinking" {
-                render_loop_block(ui, &title, &current_loop_thinking);
-            }
+            render_reasoning_block(
+                ui,
+                &title,
+                &current_loop_thinking,
+                p,
+                (msg_idx, block),
+                false,
+            );
+            block += 1;
             current_loop_thinking.clear();
 
             if let Some(payload) = log.strip_prefix("TOOL_RESULT|") {
                 let parts: Vec<&str> = payload.split('|').collect();
                 if parts.len() >= 3 {
-                    let icon = parts[0];
                     let name = parts[1];
                     let success = parts[2].contains("Success") || parts[2].contains('✅');
                     let summary = parts.get(3).cloned().unwrap_or("");
-
-                    let text = format_tool_text(name, success, summary);
-                    ui.horizontal(|ui| {
-                        ui.add_space(4.0);
-                        ui.label(format!("{} {}", icon, text));
-                    });
-                    ui.add_space(2.0);
+                    let text = style::sentence_case(&format_tool_text(name, success, summary));
+                    if success {
+                        activity_row(ui, "✔", p.success, &text, p);
+                    } else {
+                        activity_row(ui, "✖", p.danger, &text, p);
+                    }
                 }
             }
         } else if log.starts_with("FILE_CHANGE|") {
             let title = current_loop_title
                 .take()
                 .unwrap_or_else(|| "Thinking".to_string());
-            if !current_loop_thinking.trim().is_empty() || title != "Thinking" {
-                render_loop_block(ui, &title, &current_loop_thinking);
-            }
+            render_reasoning_block(
+                ui,
+                &title,
+                &current_loop_thinking,
+                p,
+                (msg_idx, block),
+                false,
+            );
+            block += 1;
             current_loop_thinking.clear();
 
             if let Some(payload) = log.strip_prefix("FILE_CHANGE|") {
                 // Payload format: <icon>|<path>|+<added>|-<deleted>
                 let parts: Vec<&str> = payload.split('|').collect();
                 if parts.len() >= 4 {
-                    let icon = parts[0];
                     let path = parts[1];
                     // Strip the leading + / - signs so usize::parse succeeds.
                     let added: usize = parts[2].trim_start_matches('+').parse().unwrap_or(0);
                     let deleted: usize = parts[3].trim_start_matches('-').parse().unwrap_or(0);
-
-                    let filename = std::path::Path::new(path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path.to_string());
-
                     let action = if deleted == 0 && added > 0 {
-                        "Created".to_string()
+                        "Created"
                     } else if added == 0 && deleted > 0 {
-                        "Deleted".to_string()
+                        "Deleted"
                     } else {
-                        "Edited".to_string()
+                        "Edited"
                     };
-
-                    // Render every written file as a polished pill so the
-                    // whole timeline of file changes is visible — not just
-                    // the most recent one.
-                    let (card_fill, card_stroke, label_color) = if dark_mode {
-                        (
-                            egui::Color32::from_rgb(22, 28, 38),
-                            egui::Color32::from_rgb(48, 60, 80),
-                            egui::Color32::from_rgb(220, 230, 245),
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new("✔").size(11.0).color(p.success));
+                        ui.label(egui::RichText::new(action).size(12.5).color(p.dim));
+                        ui.label(
+                            egui::RichText::new(path)
+                                .font(egui::FontId::monospace(12.0))
+                                .color(p.text),
                         )
-                    } else {
-                        (
-                            egui::Color32::from_rgb(248, 250, 252),
-                            egui::Color32::from_rgb(203, 213, 225),
-                            egui::Color32::from_rgb(30, 41, 59),
-                        )
-                    };
-
-                    egui::Frame::default()
-                        .fill(card_fill)
-                        .stroke(egui::Stroke::new(1.0, card_stroke))
-                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                        .rounding(8.0)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{} {}", icon, action))
-                                        .size(12.0)
-                                        .color(label_color)
-                                        .strong(),
-                                );
-                                ui.label(
-                                    egui::RichText::new(filename)
-                                        .size(12.0)
-                                        .color(label_color)
-                                        .monospace(),
-                                );
-                                ui.add_space(6.0);
-                                if added > 0 {
-                                    ui.label(
-                                        egui::RichText::new(format!("+{}", added))
-                                            .size(11.0)
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(34, 197, 94)),
-                                    );
-                                }
-                                if deleted > 0 {
-                                    ui.label(
-                                        egui::RichText::new(format!("-{}", deleted))
-                                            .size(11.0)
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(239, 68, 68)),
-                                    );
-                                }
-                            });
-                        });
-                    ui.add_space(3.0);
+                        .on_hover_text(path);
+                        diff_counts(ui, added, deleted, p);
+                    });
                 }
+            }
+        } else if let Some(warning) = log.strip_prefix("⚠️ ") {
+            // Errors are already appended to the message body.
+            if !warning.starts_with("Error:") {
+                activity_row(ui, "!", p.warn, &style::clean_label(warning), p);
             }
         }
     }
 
+    // Reasoning that hasn't been followed by a tool call yet is still live.
+    let trailing_live = is_processing && current_tool.is_none();
     match current_loop_title {
-        Some(ref title) => render_loop_block(ui, title, &current_loop_thinking),
-        None if !current_loop_thinking.trim().is_empty() => {
-            render_loop_block(ui, "Thinking", &current_loop_thinking)
-        }
-        None => {}
+        Some(ref title) => render_reasoning_block(
+            ui,
+            title,
+            &current_loop_thinking,
+            p,
+            (msg_idx, block),
+            trailing_live,
+        ),
+        None => render_reasoning_block(
+            ui,
+            "Thinking",
+            &current_loop_thinking,
+            p,
+            (msg_idx, block),
+            trailing_live,
+        ),
     }
 
     if is_processing {
         if let Some((name, current_tool_args)) = current_tool {
-            let icon = get_tool_icon(name);
             let args_summary = format_tool_args_summary(name, current_tool_args);
-            let text = format_tool_text(name, true, &args_summary);
-
             let is_write = name == "write_file"
                 || name == "write_to_file"
                 || name == "edit_file"
                 || name == "replace_file_content"
                 || name == "multi_replace_file_content";
 
-            // Live "writing…" card — same visual language as the historical
-            // FILE_CHANGE cards above, but with an amber accent + subtle
-            // pulse so the user can clearly see the active write with its
-            // running +x / -y counter.
-            let (live_fill, live_stroke, live_label) = if dark_mode {
-                (
-                    egui::Color32::from_rgb(40, 30, 18),
-                    egui::Color32::from_rgb(120, 80, 30),
-                    egui::Color32::from_rgb(253, 224, 168),
-                )
-            } else {
-                (
-                    egui::Color32::from_rgb(255, 247, 237),
-                    egui::Color32::from_rgb(214, 158, 46),
-                    egui::Color32::from_rgb(120, 53, 15),
-                )
-            };
-
+            // Live row: a softly pulsing accent dot marks the running call.
             let time = ui.ctx().input(|input| input.time) as f32;
-            let pulse = 0.5 + 0.5 * (time * std::f32::consts::TAU / 1.6).sin();
-            let pulse_alpha = (120.0 + pulse * 100.0) as u8;
-            // Tint with pulse — the stroke slowly breathes in/out so the
-            // user can tell the write is still in progress at a glance.
-            let stroke_color = egui::Color32::from_rgba_unmultiplied(
-                live_stroke.r(),
-                live_stroke.g(),
-                live_stroke.b(),
-                pulse_alpha,
-            );
-
-            egui::Frame::default()
-                .fill(live_fill)
-                .stroke(egui::Stroke::new(1.4, stroke_color))
-                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                .rounding(8.0)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if is_write {
-                            let action_label = if name == "write_file" || name == "write_to_file" {
-                                "Writing"
-                            } else {
-                                "Editing"
-                            };
-                            ui.label(
-                                egui::RichText::new(format!("{} {}", icon, action_label))
-                                    .size(12.0)
-                                    .color(live_label)
-                                    .strong(),
-                            );
-                            ui.label(
-                                egui::RichText::new(args_summary)
-                                    .size(12.0)
-                                    .color(live_label)
-                                    .monospace(),
-                            );
-                            ui.add_space(6.0);
-
-                            let (added, deleted) =
-                                estimate_live_diff_stats(name, current_tool_args, project_root);
-                            if added > 0 {
-                                ui.label(
-                                    egui::RichText::new(format!("+{}", added))
-                                        .size(11.0)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(34, 197, 94)),
-                                );
-                            }
-                            if deleted > 0 {
-                                ui.label(
-                                    egui::RichText::new(format!("-{}", deleted))
-                                        .size(11.0)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(239, 68, 68)),
-                                );
-                            }
-                            ui.add_space(4.0);
-                            // Animated dotted progress hint
-                            let dots = match (time as usize) % 3 {
-                                0 => ".",
-                                1 => "..",
-                                _ => "...",
-                            };
-                            ui.label(egui::RichText::new(dots).size(11.0).color(live_label));
-                        } else {
-                            ui.label(
-                                egui::RichText::new(format!("{} {}…", icon, text))
-                                    .size(12.0)
-                                    .color(live_label)
-                                    .strong(),
-                            );
-                        }
-                    });
-                });
+            let pulse = 0.55 + 0.45 * (time * std::f32::consts::TAU / 1.4).sin();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add_space(2.0);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(rect.center(), 3.5, p.accent.gamma_multiply(pulse));
+                if is_write {
+                    let action = if name == "write_file" || name == "write_to_file" {
+                        "Writing"
+                    } else {
+                        "Editing"
+                    };
+                    ui.label(egui::RichText::new(action).size(12.5).color(p.text));
+                    ui.label(
+                        egui::RichText::new(args_summary)
+                            .font(egui::FontId::monospace(12.0))
+                            .color(p.text),
+                    );
+                    let (added, deleted) =
+                        estimate_live_diff_stats(name, current_tool_args, project_root);
+                    diff_counts(ui, added, deleted, p);
+                } else {
+                    let text = style::sentence_case(&format_tool_text(name, true, &args_summary));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{text}…"))
+                                .size(12.5)
+                                .color(p.text),
+                        )
+                        .truncate(),
+                    );
+                }
+            });
             ui.ctx().request_repaint();
-            ui.add_space(3.0);
         }
     }
 }
@@ -5592,4 +5976,86 @@ fn attachment_destination(
         n += 1;
     }
     candidate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_tree_groups_paths_into_folders() {
+        let paths: Vec<String> = [
+            "src/main.rs",
+            "src/ui/mod.rs",
+            "Cargo.toml",
+            r"src\gui\app.rs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let tree = FileTree::build(&paths);
+        assert_eq!(tree.files.len(), 1);
+        assert_eq!(tree.files[0].0, "Cargo.toml");
+        let src = &tree.dirs["src"];
+        assert_eq!(
+            src.files[0],
+            ("main.rs".to_string(), "src/main.rs".to_string())
+        );
+        assert!(src.dirs.contains_key("ui"));
+        assert!(src.dirs.contains_key("gui"));
+        assert_eq!(src.dirs["gui"].files[0].1, r"src\gui\app.rs");
+    }
+
+    fn message(role: &str, content: &str, tool_logs: &[&str]) -> GuiMessage {
+        GuiMessage {
+            role: role.into(),
+            content: content.into(),
+            thinking: None,
+            is_thinking_done: true,
+            tool_logs: tool_logs.iter().map(|s| s.to_string()).collect(),
+            attached_image: None,
+        }
+    }
+
+    #[test]
+    fn reply_text_joins_the_bubbles_of_one_answer() {
+        let messages = vec![
+            message("user", "make a game", &[]),
+            message("assistant", "I'll build it.", &["TOOL_START|x|write_file"]),
+            message(
+                "assistant",
+                "",
+                &["TOOL_RESULT|x|write_file|Success|game.html"],
+            ),
+            message("assistant", "Done — open game.html.", &[]),
+            message("assistant", "", &[]), // ghost bubble, not shown
+        ];
+        let shown: Vec<usize> = (0..messages.len())
+            .filter(|&i| is_message_shown(&messages[i]))
+            .collect();
+        assert_eq!(shown, vec![0, 1, 2, 3]);
+        assert_eq!(
+            reply_text(&messages, &shown, 3),
+            "I'll build it.\n\nDone — open game.html."
+        );
+        assert_eq!(reply_text(&messages, &shown, 1), "I'll build it.");
+    }
+
+    #[test]
+    fn workspace_scan_recurses_and_skips_build_dirs() {
+        let root = std::env::temp_dir().join(format!("norvexum_tree_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src/deep/deeper")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("README.md"), "x").unwrap();
+        std::fs::write(root.join(".hidden"), "x").unwrap();
+        std::fs::write(root.join("src/deep/deeper/a.rs"), "x").unwrap();
+        std::fs::write(root.join("target/debug/out"), "x").unwrap();
+        let files = list_workspace_files(&root);
+        assert_eq!(
+            files,
+            vec!["README.md".to_string(), "src/deep/deeper/a.rs".to_string()]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
