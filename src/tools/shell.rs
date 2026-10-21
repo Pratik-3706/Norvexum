@@ -535,11 +535,14 @@ impl Tool for ShellCommandTool {
 
         if fallback {
             // Fallback path: Run command via cmd.exe on Windows, or sh on Unix
-            let mut cmd = if cfg!(target_os = "windows") {
+            #[cfg(windows)]
+            let mut cmd = {
                 let mut c = tokio::process::Command::new("cmd.exe");
                 c.arg("/C").raw_arg(command_str);
                 c
-            } else {
+            };
+            #[cfg(not(windows))]
+            let mut cmd = {
                 let mut c = tokio::process::Command::new("sh");
                 c.arg("-c").arg(command_str);
                 c

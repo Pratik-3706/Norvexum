@@ -54,10 +54,12 @@ pub async fn run(settings: &Settings, action: ConfigAction) -> Result<()> {
         }
         ConfigAction::Get { key } => match get_value(settings, &key) {
             Some(value) => println!("{value}"),
-            None => eyre::bail!(
-                "Unknown configuration key '{key}'. Known keys: {}",
-                KEYS.join(", ")
-            ),
+            None => {
+                return Err(eyre::eyre!(
+                    "Unknown configuration key '{key}'. Known keys: {}",
+                    KEYS.join(", ")
+                ));
+            }
         },
         ConfigAction::Set { key, value } => {
             let mut current = settings.clone();
@@ -115,9 +117,11 @@ fn set_value(s: &mut Settings, key: &str, value: &str) -> Result<()> {
             s.thinking_effort = match value {
                 "none" | "" => None,
                 "low" | "medium" | "high" | "xhigh" | "max" | "adaptive" => Some(value.to_string()),
-                _ => eyre::bail!(
-                    "thinking_effort must be one of: none, low, medium, high, xhigh, max, adaptive"
-                ),
+                _ => {
+                    return Err(eyre::eyre!(
+                        "thinking_effort must be one of: none, low, medium, high, xhigh, max, adaptive"
+                    ));
+                }
             }
         }
         "max_thinking_loops" => s.max_thinking_loops = int(value)?,
@@ -127,7 +131,7 @@ fn set_value(s: &mut Settings, key: &str, value: &str) -> Result<()> {
             s.ask_perms = match value {
                 "true" | "on" | "yes" | "1" => true,
                 "false" | "off" | "no" | "0" => false,
-                _ => eyre::bail!("ask_perms must be true or false"),
+                _ => return Err(eyre::eyre!("ask_perms must be true or false")),
             }
         }
         "require_approval" => {
@@ -139,11 +143,17 @@ fn set_value(s: &mut Settings, key: &str, value: &str) -> Result<()> {
                 .collect();
         }
         "ollama_base_url" => s.ollama_base_url = Some(value.trim_end_matches('/').to_string()),
-        "project_root" => eyre::bail!("project_root is derived from the directory you run in"),
-        _ => eyre::bail!(
-            "Unknown configuration key '{key}'. Known keys: {}",
-            KEYS.join(", ")
-        ),
+        "project_root" => {
+            return Err(eyre::eyre!(
+                "project_root is derived from the directory you run in"
+            ));
+        }
+        _ => {
+            return Err(eyre::eyre!(
+                "Unknown configuration key '{key}'. Known keys: {}",
+                KEYS.join(", ")
+            ));
+        }
     }
     Ok(())
 }

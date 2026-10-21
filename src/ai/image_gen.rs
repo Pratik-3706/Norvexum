@@ -51,11 +51,11 @@ pub async fn generate_image(
         }
     }
 
-    eyre::bail!(
+    Err(eyre::eyre!(
         "No image generation provider available. \
          Set GOOGLE_AI_API_KEY for free Gemini image gen, \
          or Pollinations API may be temporarily unavailable."
-    )
+    ))
 }
 
 /// Generate via Google Gemini 3.1 Flash Image (FREE).

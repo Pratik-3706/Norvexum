@@ -26,7 +26,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -43,7 +43,7 @@ jobs:
         # paths (cmd.exe, taskkill, CREATE_NO_WINDOW, winres) only compile there.
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -76,7 +76,12 @@ jobs:
       checks: write
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # zip 8.x (RUSTSEC-2026-0367/0368/0369) only reaches us through
+          # headless_chrome's `fetch` feature, which unpacks the Chromium build it
+          # downloads from Google, never user-supplied archives. headless_chrome
+          # 1.0.22 (latest) still requires zip ^8.6; drop these once it moves to 9.
+          ignore: RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369

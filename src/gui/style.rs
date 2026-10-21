@@ -101,7 +101,7 @@ pub fn apply(ctx: &egui::Context, p: &Palette, dark: bool) {
     visuals.hyperlink_color = p.accent;
     visuals.warn_fg_color = p.warn;
     visuals.error_fg_color = p.danger;
-    visuals.window_stroke = Stroke::new(1.0, p.border);
+    visuals.window_stroke = Stroke::new(1.0_f32, p.border);
     visuals.window_rounding = Rounding::same(10.0);
     visuals.menu_rounding = Rounding::same(8.0);
     let shadow = Shadow {
@@ -113,40 +113,40 @@ pub fn apply(ctx: &egui::Context, p: &Palette, dark: bool) {
     visuals.window_shadow = shadow;
     visuals.popup_shadow = shadow;
     visuals.selection.bg_fill = p.accent.gamma_multiply(0.35);
-    visuals.selection.stroke = Stroke::new(1.0, p.accent);
+    visuals.selection.stroke = Stroke::new(1.0_f32, p.accent);
     visuals.striped = false;
 
     let w = &mut visuals.widgets;
     w.noninteractive.bg_fill = p.surface;
     w.noninteractive.weak_bg_fill = p.surface;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.noninteractive.rounding = Rounding::same(6.0);
 
     w.inactive.bg_fill = p.hover;
     w.inactive.weak_bg_fill = p.surface;
-    w.inactive.bg_stroke = Stroke::new(1.0, p.border);
-    w.inactive.fg_stroke = Stroke::new(1.0, p.text);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.inactive.rounding = Rounding::same(6.0);
 
     w.hovered.bg_fill = p.hover;
     w.hovered.weak_bg_fill = p.hover;
-    w.hovered.bg_stroke = Stroke::new(1.0, p.border);
-    w.hovered.fg_stroke = Stroke::new(1.0, p.text);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, p.border);
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.hovered.rounding = Rounding::same(6.0);
     w.hovered.expansion = 0.0;
 
     w.active.bg_fill = p.accent;
     w.active.weak_bg_fill = p.hover;
-    w.active.bg_stroke = Stroke::new(1.0, p.accent);
-    w.active.fg_stroke = Stroke::new(1.0, p.text);
+    w.active.bg_stroke = Stroke::new(1.0_f32, p.accent);
+    w.active.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.active.rounding = Rounding::same(6.0);
     w.active.expansion = 0.0;
 
     w.open.bg_fill = p.hover;
     w.open.weak_bg_fill = p.hover;
-    w.open.bg_stroke = Stroke::new(1.0, p.border);
-    w.open.fg_stroke = Stroke::new(1.0, p.text);
+    w.open.bg_stroke = Stroke::new(1.0_f32, p.border);
+    w.open.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.open.rounding = Rounding::same(6.0);
 
     ctx.set_visuals(visuals);
@@ -338,7 +338,7 @@ pub fn secondary_button(ui: &mut Ui, label: &str, p: &Palette) -> Response {
     ui.add(
         egui::Button::new(RichText::new(label).size(12.5).color(p.text))
             .fill(p.surface)
-            .stroke(Stroke::new(1.0, p.border))
+            .stroke(Stroke::new(1.0_f32, p.border))
             .rounding(6.0),
     )
 }

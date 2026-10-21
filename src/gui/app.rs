@@ -313,7 +313,7 @@ fn attachment_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
     .collect();
     ui.painter().add(egui::Shape::line(
         points,
-        egui::Stroke::new(1.5, icon_color),
+        egui::Stroke::new(1.5_f32, icon_color),
     ));
 
     response.on_hover_text("Attach a file (or drop one on the window)")
@@ -2454,7 +2454,7 @@ fn tree_row(
         let x = rect.left() + 11.0 + level as f32 * INDENT;
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.0, p.border),
+            egui::Stroke::new(1.0_f32, p.border),
         );
     }
 
@@ -2588,7 +2588,7 @@ fn send_button(ui: &mut egui::Ui, enabled: bool, p: &Palette) -> egui::Response 
     };
     let c = rect.center();
     ui.painter().circle_filled(c, 14.0, fill);
-    let stroke = egui::Stroke::new(1.8, fg);
+    let stroke = egui::Stroke::new(1.8_f32, fg);
     ui.painter().line_segment(
         [c + egui::vec2(0.0, 5.0), c + egui::vec2(0.0, -5.0)],
         stroke,
@@ -2909,7 +2909,7 @@ impl GuiApp {
                     !self.is_processing,
                     egui::Button::new(egui::RichText::new("New chat").size(13.0).color(p.text))
                         .fill(p.surface)
-                        .stroke(egui::Stroke::new(1.0, p.border))
+                        .stroke(egui::Stroke::new(1.0_f32, p.border))
                         .rounding(8.0)
                         .min_size(egui::vec2(ui.available_width(), 32.0)),
                 )
@@ -3440,7 +3440,7 @@ impl GuiApp {
 
                     egui::Frame::none()
                         .fill(p.code_bg)
-                        .stroke(egui::Stroke::new(1.0, p.border))
+                        .stroke(egui::Stroke::new(1.0_f32, p.border))
                         .rounding(8.0)
                         .inner_margin(egui::Margin::same(8.0))
                         .show(ui, |ui| {
@@ -3625,7 +3625,7 @@ impl GuiApp {
 
             egui::Frame::none()
                 .fill(p.surface)
-                .stroke(egui::Stroke::new(1.0, p.warn.gamma_multiply(0.7)))
+                .stroke(egui::Stroke::new(1.0_f32, p.warn.gamma_multiply(0.7)))
                 .rounding(10.0)
                 .inner_margin(egui::Margin::same(12.0))
                 .show(ui, |ui| {
@@ -3691,7 +3691,7 @@ impl GuiApp {
             ui.horizontal(|ui| {
                 egui::Frame::none()
                     .fill(p.surface)
-                    .stroke(egui::Stroke::new(1.0, p.border))
+                    .stroke(egui::Stroke::new(1.0_f32, p.border))
                     .rounding(6.0)
                     .inner_margin(egui::Margin::symmetric(8.0, 2.0))
                     .show(ui, |ui| {
@@ -3719,7 +3719,7 @@ impl GuiApp {
         egui::Frame::none()
             .fill(p.surface)
             .stroke(egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 if focused {
                     p.accent.gamma_multiply(0.55)
                 } else {
@@ -3830,7 +3830,7 @@ impl GuiApp {
                                 egui::RichText::new(model_display).size(12.0).color(p.dim),
                             )
                             .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::new(1.0, p.border))
+                            .stroke(egui::Stroke::new(1.0_f32, p.border))
                             .rounding(6.0),
                         )
                         .on_hover_text("Choose a model");
@@ -4100,7 +4100,7 @@ impl GuiApp {
                                         egui::pos2(rect.left(), rect.top()),
                                         egui::pos2(rect.right(), rect.top()),
                                     ],
-                                    egui::Stroke::new(1.0, p.border),
+                                    egui::Stroke::new(1.0_f32, p.border),
                                 );
                                 ui.add_space(6.0);
                             }
@@ -4165,7 +4165,7 @@ impl GuiApp {
                     [w, 34.0],
                     egui::Button::new(egui::RichText::new(*suggestion).size(13.0).color(p.dim))
                         .fill(p.surface)
-                        .stroke(egui::Stroke::new(1.0, p.border))
+                        .stroke(egui::Stroke::new(1.0_f32, p.border))
                         .rounding(8.0),
                 );
                 if resp.clicked() {
@@ -4557,7 +4557,7 @@ impl GuiApp {
                                 let resp = ui.add(
                                     egui::Button::new(egui::RichText::new("↓  Latest").size(12.0).color(p.text))
                                         .fill(p.surface)
-                                        .stroke(egui::Stroke::new(1.0, p.border))
+                                        .stroke(egui::Stroke::new(1.0_f32, p.border))
                                         .rounding(14.0),
                                 );
                                 if resp.on_hover_text("Scroll to the newest message").clicked() {
@@ -4808,13 +4808,7 @@ fn get_file_diff_stats(project_root: &std::path::Path, file_path: &str) -> (i32,
         args.push("--");
         args.push(file_path);
 
-        #[cfg(windows)]
         let output_result = spawn_silent_command("git", &args, project_root);
-        #[cfg(not(windows))]
-        let output_result = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(project_root)
-            .output();
 
         if let Ok(output) = output_result {
             let out_str = String::from_utf8_lossy(&output.stdout);
@@ -4849,7 +4843,7 @@ fn get_file_diff_stats(project_root: &std::path::Path, file_path: &str) -> (i32,
     (0, 0)
 }
 
-/// Spawn an external command on Windows without flashing a console window.
+/// Run an external command; on Windows, without flashing a console window.
 /// This is the same helper the agent's `run_command` tool should use to
 /// keep cmd.exe from popping up on every tool call.
 fn spawn_silent_command(
@@ -4988,7 +4982,7 @@ fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, p: &Palette) {
                     r.left_top() + egui::vec2(3.0, 1.0),
                     r.left_bottom() + egui::vec2(3.0, -1.0),
                 ],
-                egui::Stroke::new(2.0, p.border),
+                egui::Stroke::new(2.0_f32, p.border),
             );
             continue;
         }
@@ -5043,7 +5037,7 @@ fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, p: &Palette) {
 fn render_code_block(ui: &mut egui::Ui, lang: &str, code: &str, p: &Palette) {
     egui::Frame::none()
         .fill(p.code_bg)
-        .stroke(egui::Stroke::new(1.0, p.border))
+        .stroke(egui::Stroke::new(1.0_f32, p.border))
         .rounding(8.0)
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
@@ -5200,7 +5194,7 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[String], p: &Palette) {
     let total_width: f32 = col_widths.iter().sum::<f32>() + (max_cols as f32) * 24.0;
 
     egui::Frame::none()
-        .stroke(egui::Stroke::new(1.0, p.border))
+        .stroke(egui::Stroke::new(1.0_f32, p.border))
         .rounding(8.0)
         .show(ui, |ui| {
             ui.set_min_width(total_width.min(ui.available_width()));
@@ -5710,7 +5704,7 @@ fn render_reasoning_block(
                     r.left_top() + egui::vec2(2.0, 2.0),
                     r.left_bottom() + egui::vec2(2.0, -2.0),
                 ],
-                egui::Stroke::new(1.5, p.border),
+                egui::Stroke::new(1.5_f32, p.border),
             );
         });
     ui.add_space(2.0);

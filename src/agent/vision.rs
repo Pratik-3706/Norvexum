@@ -132,8 +132,8 @@ pub async fn ocr_image(api_key: &str, image_path: &std::path::Path) -> Result<St
         _ => None,
     };
     match error {
-        Some(e) if !e.is_empty() => eyre::bail!("OCR error: {e}"),
-        _ => eyre::bail!("OCR returned no text"),
+        Some(e) if !e.is_empty() => Err(eyre::eyre!("OCR error: {e}")),
+        _ => Err(eyre::eyre!("OCR returned no text")),
     }
 }
 
