@@ -313,11 +313,16 @@ fn replace_text(
 
     let count = content.matches(target.as_str()).count();
     match count {
-        0 => Err(
-            "Target text not found. It must match the file exactly, including indentation \
-                  — re-read the relevant lines and try again."
-                .into(),
-        ),
+        0 => match loose_match(content, &target) {
+            Some(span) => {
+                let mut out = String::with_capacity(content.len() + replacement.len());
+                out.push_str(&content[..span.start]);
+                out.push_str(&replacement);
+                out.push_str(&content[span.end..]);
+                Ok((out, 1))
+            }
+            None => Err(not_found_hint(content, &target)),
+        },
         n if n > 1 && !all => Err(format!(
             "Target text appears {n} times. Add surrounding lines to make it unique, \
              set all=true, or restrict the search with start_line/end_line."
@@ -330,6 +335,83 @@ fn replace_text(
             },
             n,
         )),
+    }
+}
+
+/// Byte span of the one place where `target` matches `content` line by line
+/// once whitespace differences are ignored: first trailing whitespace, then
+/// indentation too. `None` when there is no such place, or more than one.
+fn loose_match(content: &str, target: &str) -> Option<std::ops::Range<usize>> {
+    let wanted: Vec<&str> = target.lines().collect();
+    if wanted.iter().all(|l| l.trim().is_empty()) {
+        return None;
+    }
+    // (start byte, end byte without the line break) of every line.
+    let mut lines = Vec::new();
+    let mut pos = 0;
+    for line in content.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        lines.push((pos, pos + text.len()));
+        pos += line.len();
+    }
+    let text_of = |(a, b): (usize, usize)| &content[a..b];
+    for normalize in [
+        (|l: &str| l.trim_end().to_string()) as fn(&str) -> String,
+        |l: &str| l.trim().to_string(),
+    ] {
+        let wanted: Vec<String> = wanted.iter().map(|l| normalize(l)).collect();
+        let found: Vec<usize> = (0..lines.len().saturating_sub(wanted.len() - 1))
+            .filter(|&i| {
+                wanted
+                    .iter()
+                    .enumerate()
+                    .all(|(k, w)| normalize(text_of(lines[i + k])) == *w)
+            })
+            .collect();
+        match found.as_slice() {
+            [i] => return Some(lines[*i].0..lines[*i + wanted.len() - 1].1),
+            [] => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Why a target wasn't found, with the closest line so the next try can be
+/// right without re-reading the file.
+fn not_found_hint(content: &str, target: &str) -> String {
+    let base = "Target text not found. It must match the file exactly, including indentation.";
+    let Some(first) = target.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return base.to_string();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let best = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim() == first)
+        .map(|(i, _)| i)
+        .next()
+        .or_else(|| {
+            // Otherwise the line sharing the longest stretch with the first target line.
+            let probe: String = first.chars().take(40).collect();
+            lines
+                .iter()
+                .position(|l| probe.len() >= 8 && l.contains(probe.as_str()))
+        });
+    match best {
+        Some(i) => {
+            let from = i.saturating_sub(1);
+            let to = (i + target.lines().count() + 1).min(lines.len());
+            let excerpt: Vec<String> = (from..to)
+                .map(|n| format!("{:>5} | {}", n + 1, lines[n]))
+                .collect();
+            format!(
+                "{base} Its first line is at line {} but the following lines differ. The file there reads:\n{}",
+                i + 1,
+                excerpt.join("\n")
+            )
+        }
+        None => format!("{base} Not even its first line occurs in the file; re-read it."),
     }
 }
 
@@ -404,7 +486,9 @@ impl Tool for EditFileTool {
                 "ReplacementContent",
             ],
         ) else {
-            return ToolResult::err("Missing 'replacement' argument");
+            return ToolResult::err(
+                "Missing 'replacement' (the new text; use \"\" to delete the target).",
+            );
         };
         let start_line = args["start_line"].as_u64().map(|n| n as usize);
         let end_line = args["end_line"].as_u64().map(|n| n as usize);
@@ -460,7 +544,10 @@ impl Tool for EditFileTool {
             }
             (None, None) => {
                 let Some(target) = target_opt else {
-                    return ToolResult::err("Provide `target`, or both start_line and end_line.");
+                    return ToolResult::err(
+                        "Say what to replace: `target` (the exact current text), or start_line and \
+                         end_line to replace whole lines.",
+                    );
                 };
                 match replace_text(&original, target, replacement, replace_all) {
                     Ok((text, _)) => text,
@@ -544,8 +631,15 @@ impl Tool for MultiEditTool {
 
         let mut content = original.clone();
         for (i, edit) in edits.iter().enumerate() {
-            let target = arg_str(edit, &["target", "old_string"]).unwrap_or("");
-            let replacement = arg_str(edit, &["replacement", "new_string"]).unwrap_or("");
+            let target = arg_str(edit, &["target", "old_string", "old_text"]).unwrap_or("");
+            // A missing replacement is a mistake, not a deletion (that is "").
+            let Some(replacement) = arg_str(edit, &["replacement", "new_string", "new_text"])
+            else {
+                return ToolResult::err(format!(
+                    "Edit #{} has no 'replacement' (use \"\" to delete the target); nothing was written.",
+                    i + 1
+                ));
+            };
             let all = edit["all"].as_bool().unwrap_or(false);
             match replace_text(&content, target, replacement, all) {
                 Ok((text, _)) => content = text,
@@ -1134,6 +1228,37 @@ impl Tool for CopyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edits_tolerate_whitespace_drift_but_stay_unique() {
+        let file = "fn main() {\n    let x = 1;   \n    println!(\"{x}\");\n}\n";
+        // Trailing spaces in the file, none in the target.
+        let (out, _) = replace_text(
+            file,
+            "    let x = 1;\n    println!(\"{x}\");",
+            "    let x = 2;\n    println!(\"{x}\");",
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("    let x = 2;\n    println!"), "{out}");
+        // Wrong indentation in the target.
+        let (out, _) = replace_text(
+            file,
+            "  let x = 1;\n  println!(\"{x}\");",
+            "    let y = 1;\n    println!(\"{y}\");",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "fn main() {\n    let y = 1;\n    println!(\"{y}\");\n}\n"
+        );
+        // Ambiguous after loosening: refuse rather than guess.
+        assert!(replace_text("a\n  b\nc\n    b\n", "b ", "x", false).is_err());
+        // A miss points at the closest line.
+        let err = replace_text(file, "    let x = 1;\n    print!(x);", "", false).unwrap_err();
+        assert!(err.contains("line 2"), "{err}");
+    }
 
     #[test]
     fn replace_text_handles_crlf_and_uniqueness() {

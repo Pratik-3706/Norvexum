@@ -95,6 +95,11 @@ tokio-util = "0.7"
 open = "5"
 rfd = "0.15"
 once_cell = "1.21.4"
+which = "8"
+
+[target.'cfg(windows)'.dependencies]
+# Browser discovery reads the "App Paths" entries installers register.
+winreg = "0.56"
 
 [[bin]]
 name = "norvexum-gui"

@@ -167,6 +167,14 @@ impl OpenAiCompatClient {
 
     fn tool_arguments(call: &ToolCall) -> String {
         match &call.arguments {
+            // A call cut off mid-stream leaves broken JSON in the history; gateways
+            // that re-parse it (e.g. when proxying to Claude) would reject every
+            // later request. Its tool result already tells the model what happened.
+            serde_json::Value::String(raw)
+                if serde_json::from_str::<serde_json::Value>(raw).is_err() =>
+            {
+                "{}".to_string()
+            }
             serde_json::Value::String(raw) => raw.clone(),
             value => serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()),
         }
@@ -420,7 +428,8 @@ impl AiClient for OpenAiCompatClient {
         let mut lines = SseLineBuffer::new();
         let mut splitter = ThinkTagSplitter::default();
         let mut in_reasoning_field = false;
-        let mut finish_reason = String::from("stop");
+        let mut finish_reason: Option<String> = None;
+        let mut saw_done = false;
         let mut usage: Option<UsageStats> = None;
         // Ordered by index so parallel calls keep the model's order.
         let mut pending_tool_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
@@ -439,6 +448,7 @@ impl AiClient for OpenAiCompatClient {
                     continue;
                 };
                 if data == "[DONE]" {
+                    saw_done = true;
                     break 'outer;
                 }
                 let Ok(sse) = serde_json::from_str::<SseChunk>(data) else {
@@ -537,7 +547,7 @@ impl AiClient for OpenAiCompatClient {
                     }
 
                     if let Some(reason) = &choice.finish_reason {
-                        finish_reason = reason.clone();
+                        finish_reason = Some(reason.clone());
                     }
                 }
             }
@@ -561,6 +571,10 @@ impl AiClient for OpenAiCompatClient {
             let _ = tx.send(AiStreamEvent::ToolCallComplete(tc));
         }
 
+        // Every compliant server ends with a finish_reason and/or [DONE]; a stream
+        // with neither was cut off (proxy timeout, dropped connection).
+        let finish_reason = finish_reason
+            .unwrap_or_else(|| if saw_done { "stop" } else { FINISH_INCOMPLETE }.to_string());
         let _ = tx.send(AiStreamEvent::Done {
             finish_reason,
             usage,
@@ -608,6 +622,23 @@ mod tests {
             "read_file"
         );
         assert_eq!(formatted[1]["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn cut_off_tool_arguments_are_not_replayed() {
+        let call = |args: &str| ToolCall {
+            id: "call-1".into(),
+            name: "write_file".into(),
+            arguments: json!(args),
+            thought_signature: None,
+        };
+        let cut = call(r#"{"path": "a.rs", "content": "fn ma"#);
+        assert_eq!(OpenAiCompatClient::tool_arguments(&cut), "{}");
+        let whole = call(r#"{"path": "a.rs"}"#);
+        assert_eq!(
+            OpenAiCompatClient::tool_arguments(&whole),
+            r#"{"path": "a.rs"}"#
+        );
     }
 
     #[test]
@@ -663,6 +694,8 @@ mod tests {
         for text in [
             "Here's what I can do for you — build, fix, test.",
             "<think>weigh A — B</think>Answer — done",
+            "Ayoohi!👋",
+            "<think>日本語 👋</think>héllo wörld 🎉🎉",
         ] {
             let chars: Vec<(usize, char)> = text.char_indices().collect();
             for &(cut, _) in &chars {

@@ -79,7 +79,7 @@ fn get_value(s: &Settings, key: &str) -> Option<String> {
         "active_provider" => s.active_provider.clone(),
         "active_model" => s.active_model.clone(),
         "thinking_effort" => s.thinking_effort.clone().unwrap_or_else(|| "none".into()),
-        "max_thinking_loops" => s.max_thinking_loops.to_string(),
+        "max_thinking_loops" => crate::config::describe_loop_limit(s.max_thinking_loops),
         "max_content_chars" => s.max_content_chars.to_string(),
         "browser_timeout_secs" => s.browser_timeout_secs.to_string(),
         "ask_perms" => s.ask_perms.to_string(),
@@ -124,7 +124,10 @@ fn set_value(s: &mut Settings, key: &str, value: &str) -> Result<()> {
                 }
             }
         }
-        "max_thinking_loops" => s.max_thinking_loops = int(value)?,
+        "max_thinking_loops" => {
+            s.max_thinking_loops = crate::config::parse_loop_limit(value)
+                .ok_or_else(|| eyre::eyre!("max_thinking_loops must be a number or 'unlimited'"))?
+        }
         "max_content_chars" => s.max_content_chars = int(value)?.max(1000),
         "browser_timeout_secs" => s.browser_timeout_secs = int(value)? as u64,
         "ask_perms" => {

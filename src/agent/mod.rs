@@ -16,6 +16,7 @@ pub mod checkpoint;
 pub mod compaction;
 pub mod history;
 pub mod session;
+pub mod subagent;
 pub mod vision;
 
 use eyre::Result;
@@ -76,9 +77,41 @@ pub enum AgentEvent {
     },
     /// Dynamic skill triggered
     TriggeredSkill(String),
+    /// The agent started a sub-agent (spawn_agent).
+    SubAgentStarted {
+        id: String,
+        name: String,
+        task: String,
+    },
+    /// Something a sub-agent did; `event` is its own event, as the main agent's would be.
+    SubAgent { id: String, event: Box<AgentEvent> },
+    /// A sub-agent ended; `summary` starts its report (or says why it failed).
+    SubAgentFinished {
+        id: String,
+        success: bool,
+        summary: String,
+    },
+    /// One agent messaged another (message_agent). `from`/`to` are "main" or a sub-agent's name.
+    AgentMessage {
+        from: String,
+        to: String,
+        text: String,
+    },
 }
 
 const FILE_WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "multi_edit"];
+
+/// Output budget for models whose limit isn't known. Providers that allow less
+/// say so in their error, and the request is retried with their figure.
+const DEFAULT_OUTPUT_TOKENS: u32 = 32_768;
+
+/// Runaway guard for resuming one cut-off reply; each resume is a full output
+/// budget, so this is never reached by a reply that is making progress.
+const MAX_RESUMES: usize = 16;
+
+const RESUME_PROMPT: &str = "Your previous reply was cut off before it was finished. Continue it from \
+     exactly where it stopped, even mid-sentence, mid-word or inside a code block. Do not repeat \
+     anything already written and do not add a preamble.";
 
 /// Everything one model response produced.
 #[derive(Default)]
@@ -92,6 +125,24 @@ struct ModelTurn {
     error: Option<String>,
     cancelled: bool,
     thinking_chars: usize,
+}
+
+impl ModelTurn {
+    /// Append the response that resumed this cut-off one.
+    fn absorb(&mut self, next: ModelTurn) {
+        self.text.push_str(&next.text);
+        self.tool_calls = next.tool_calls;
+        self.thinking_blocks.extend(next.thinking_blocks);
+        self.finish_reason = next.finish_reason;
+        self.streamed_args.extend(next.streamed_args);
+        self.error = next.error;
+        self.cancelled = next.cancelled;
+        self.thinking_chars += next.thinking_chars;
+    }
+
+    fn produced_output(&self) -> bool {
+        !self.text.is_empty() || !self.tool_calls.is_empty()
+    }
 }
 
 /// The core agent that orchestrates AI ↔ Tool interaction.
@@ -118,6 +169,13 @@ pub struct Agent {
     injected_skills: HashSet<String>,
     /// Whether the current turn has already executed tools (affects error recovery).
     turn_ran_tools: bool,
+    /// Output limit a provider reported for a model, overriding the built-in one.
+    learned_output_cap: Option<(String, u32)>,
+    /// Set for a sub-agent: its label. Sub-agents can't start sub-agents.
+    subagent_name: Option<String>,
+    /// Messages other agents send this one (message_agent), read at each step.
+    inbox_tx: mpsc::UnboundedSender<String>,
+    inbox_rx: mpsc::UnboundedReceiver<String>,
 }
 
 fn build_client_or_placeholder(settings: &Settings) -> Arc<dyn AiClient> {
@@ -147,6 +205,7 @@ impl Agent {
         let messages = vec![Message::system(system)];
 
         let (approval_tx, approval_rx) = mpsc::unbounded_channel();
+        let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         let max_loops = settings.max_thinking_loops;
 
         Self {
@@ -166,6 +225,31 @@ impl Agent {
             )),
             injected_skills: HashSet::new(),
             turn_ran_tools: false,
+            learned_output_cap: None,
+            subagent_name: None,
+            inbox_tx,
+            inbox_rx,
+        }
+    }
+
+    /// Turn this agent into a sub-agent called `name`: no spawn_agent tool,
+    /// and a system prompt saying it works on a delegated task.
+    pub(crate) fn make_subagent(&mut self, name: &str) {
+        self.subagent_name = Some(name.to_string());
+        self.tools = Arc::new(subagent_tools(ToolRegistry::new(&self.settings)));
+        if let Some(system) = self.messages.first_mut().filter(|m| m.role == Role::System) {
+            *system = Message::system(format!(
+                "{}
+
+# You are a sub-agent (\"{name}\")
+Another agent gave you one task. Work on it independently with your tools; the user can't answer \
+                 questions mid-task (if you are truly blocked, ask \"main\" with message_agent and keep going). \
+                 When done, reply with a concise report: what you did, files changed, results, anything left open. \
+                 Other agents may be working at the same time: message_agent reaches \"main\" \
+                 (who started you) or another sub-agent by name, and their notes reach you as \
+                 \"[Message from agent ...]\".",
+                system.text()
+            ));
         }
     }
 
@@ -178,6 +262,11 @@ impl Agent {
         self.approval_tx.clone()
     }
 
+    /// Where other agents' messages for this one go.
+    pub fn inbox_sender(&self) -> mpsc::UnboundedSender<String> {
+        self.inbox_tx.clone()
+    }
+
     /// Update the settings, AiClient, tools, and system prompt dynamically without losing message history.
     pub fn update_settings(&mut self, mut settings: Settings) -> Result<()> {
         let _ = std::env::set_current_dir(&settings.project_root);
@@ -188,7 +277,11 @@ impl Agent {
             );
         }
         let built = ai::build_client(&settings);
-        let tools = Arc::new(ToolRegistry::new(&settings));
+        let mut tools = ToolRegistry::new(&settings);
+        if self.subagent_name.is_some() {
+            tools = subagent_tools(tools);
+        }
+        let tools = Arc::new(tools);
         let settings = Arc::new(settings);
 
         let system = build_system_prompt(&settings);
@@ -268,7 +361,7 @@ impl Agent {
                         "📖 **Norvexum commands**",
                         "  `/help`                 Show this help",
                         "  `/ask_perms <on/off>`   Toggle tool approval prompts",
-                        "  `/loops <num>`          Set the tool-loop limit for one request",
+                        "  `/loops <num|unlimited>` Set the tool-loop limit for one request",
                         "  `/clear`                Clear the chat and conversation memory",
                         "  `/compact`              Summarize older messages to free context",
                         "  `/copy` / `/copy chat`  Copy the last answer / whole chat",
@@ -278,6 +371,13 @@ impl Agent {
                         "  `/model [id]`           List models or switch",
                         "  `/exit`                 Quit",
                         "",
+                        "**Terminal UI only**",
+                        "  `/agents [N|name|main|split|stop N]`  Show or switch sub-agents",
+                        "  `/msg <agent> <text>`    Send a note to a running sub-agent",
+                        "  `/copy code`             Copy the last code block",
+                        "  `/keys`                  Keyboard shortcuts (also F1)",
+                        "",
+                        "💡 *Ask for sub-agents (\"use sub-agents to …\") to split a job between agents that work at the same time.*",
                         "💡 *Esc stops a running request. Messages typed while it runs are queued.*",
                     ]
                     .join("\n"),
@@ -305,19 +405,22 @@ impl Agent {
                     ));
                 }
             },
-            "/loops" => match arg.map(str::parse::<usize>) {
-                Some(Ok(num)) if num > 0 => {
+            "/loops" => match arg.map(crate::config::parse_loop_limit) {
+                Some(Some(num)) => {
                     self.max_loops = num;
-                    self.reply(format!("🔄 Tool-loop limit set to {num}."));
+                    self.reply(format!(
+                        "🔄 Tool-loop limit set to {}.",
+                        crate::config::describe_loop_limit(num)
+                    ));
                 }
-                Some(_) => {
+                Some(None) => {
                     let _ = self.event_tx.send(AgentEvent::Error(
-                        "Usage: `/loops <num>` (greater than 0)".into(),
+                        "Usage: `/loops <num>` or `/loops unlimited`".into(),
                     ));
                 }
                 None => self.reply(format!(
-                    "Current tool-loop limit: {}\nUsage: `/loops <num>`",
-                    self.max_loops
+                    "Current tool-loop limit: {}\nUsage: `/loops <num>` or `/loops unlimited`",
+                    crate::config::describe_loop_limit(self.max_loops)
                 )),
             },
             "/clear" => {
@@ -745,38 +848,25 @@ impl Agent {
         user_input: &str,
         cancel_rx: &mut mpsc::UnboundedReceiver<()>,
     ) -> Result<Vec<String>> {
-        let mut text = user_input;
-        let mut explicit_images = Vec::new();
-        let mut attachment = None;
-
-        // GUI attachment protocol: "/image_prompt |<path>| <prompt>". The GUI
-        // has already placed the file inside the project (in place, or copied
-        // to .norvexum/attachments/).
-        if let Some(rest) = text.strip_prefix("/image_prompt |") {
-            if let Some((file_path, prompt)) = rest.split_once('|') {
-                let path = std::path::PathBuf::from(file_path);
-                if path.is_file() {
-                    // Only real images are sent as pictures; anything else would
-                    // be rejected by the provider as a broken image.
-                    if is_image_path(&path) {
-                        explicit_images.push(path.clone());
-                    }
-                    attachment = Some(path);
-                }
-                text = prompt.trim();
-            }
-        }
+        let (attachments, mut text) = split_attachments(user_input);
+        // Only real images are sent as pictures; anything else would be
+        // rejected by the provider as a broken image.
+        let explicit_images: Vec<_> = attachments
+            .iter()
+            .filter(|p| is_image_path(p))
+            .cloned()
+            .collect();
 
         if text.starts_with('/') && self.handle_slash_command(text).await {
             return Ok(self.drain_instructions());
         }
 
-        // Tell the model where the file is so its tools can use it.
+        // Tell the model where the files are so its tools can use them.
         let with_note;
-        if let Some(path) = &attachment {
+        if !attachments.is_empty() {
             with_note = format!(
                 "{text}\n\n{}",
-                attachment_note(path, &self.settings.project_root)
+                attachment_notes(&attachments, &self.settings.project_root, true)
             );
             text = &with_note;
         }
@@ -851,14 +941,17 @@ impl Agent {
                 )));
             }
 
+            // Gateways cap the request body; screenshots pile up within a turn.
+            compaction::fit_request_size(&mut active_messages);
             let request = self.build_request(active_messages);
-            let turn = self.stream_with_retry(request, cancel_rx, &mut usage).await;
+            let turn = self.stream_full_reply(request, cancel_rx, &mut usage).await;
 
             if turn.cancelled {
                 if !turn.text.is_empty() {
                     self.messages.push(Message::assistant(&turn.text));
                 }
                 self.status("⏹️ Run stopped");
+                self.stop_subagents();
                 self.save_session();
                 self.done(Some(usage));
                 return Ok(self.drain_instructions());
@@ -894,9 +987,26 @@ impl Agent {
                     msg.thinking_blocks = turn.thinking_blocks;
                     self.messages.push(msg);
                 }
+                // The main agent answers only once its sub-agents are done:
+                // wait for them, then have it summarize everyone's work.
+                if self.subagent_name.is_none() && subagent::outstanding(&self.inbox_tx) {
+                    if !self.wait_for_subagents(cancel_rx).await {
+                        self.status("⏹️ Run stopped");
+                        self.save_session();
+                        self.done(Some(usage));
+                        return Ok(self.drain_instructions());
+                    }
+                    loop_num += 1;
+                    continue;
+                }
                 if is_truncated(&turn.finish_reason) {
                     let _ = self.event_tx.send(AgentEvent::Warning(
                         "The reply hit the output token limit and may be cut off — type 'continue' to get the rest."
+                            .into(),
+                    ));
+                } else if turn.finish_reason == FINISH_INCOMPLETE && !turn.text.is_empty() {
+                    let _ = self.event_tx.send(AgentEvent::Warning(
+                        "The connection dropped before the reply finished — type 'continue' to get the rest."
                             .into(),
                     ));
                 }
@@ -929,12 +1039,14 @@ impl Agent {
 
             let Some(approvals) = self.collect_approvals(&calls, cancel_rx).await else {
                 self.finish_cancelled_tools(&calls, "Cancelled by the user before running.");
+                self.stop_subagents();
                 self.done(Some(usage));
                 return Ok(self.drain_instructions());
             };
 
             let Some(results) = self.execute_tools(&calls, &approvals, cancel_rx).await else {
                 self.finish_cancelled_tools(&calls, "Cancelled by the user while running.");
+                self.stop_subagents();
                 self.done(Some(usage));
                 return Ok(self.drain_instructions());
             };
@@ -949,8 +1061,32 @@ impl Agent {
         }
     }
 
+    /// Output budget for a request over `messages`: the model's whole output
+    /// limit, trimmed so prompt + reply still fit in the context window (some
+    /// APIs reject requests whose sum overflows it).
+    fn output_budget(&self, messages: &[Message]) -> u32 {
+        let model = &self.settings.active_model;
+        let cap = match &self.learned_output_cap {
+            Some((m, cap)) if m == model => *cap,
+            _ => ai::max_output_tokens(model).unwrap_or(DEFAULT_OUTPUT_TOKENS),
+        };
+        let window = self.get_context_window();
+        // Small or missing windows in model listings are usually wrong.
+        if window < 32_000 {
+            return cap;
+        }
+        // The estimate runs low on code; leave slack for it and the tool schemas.
+        let estimate = compaction::estimate_tokens(messages);
+        let prompt = estimate + estimate / 8 + 6_000;
+        let room = window.saturating_sub(prompt).max(8_192);
+        cap.min(u32::try_from(room).unwrap_or(u32::MAX))
+    }
+
     fn build_request(&self, messages: Vec<Message>) -> AiRequest {
-        let mut request = AiRequest::new(messages).with_tools(self.tools.tool_defs());
+        let max_tokens = self.output_budget(&messages);
+        let mut request = AiRequest::new(messages)
+            .with_tools(self.tools.tool_defs())
+            .with_max_tokens(max_tokens);
         let mut temperature = 0.7;
         // Models using `reasoning_effort` (o-series, DeepSeek V4, …) stay silent
         // unless asked, so with no effort chosen they get the medium default and
@@ -974,29 +1110,115 @@ impl Agent {
             model = %self.settings.active_model,
             effort = ?request.thinking_effort,
             reasoning = ?request.reasoning_type,
+            max_tokens = ?request.max_tokens,
             "model request"
         );
         request.with_temperature(temperature)
     }
 
-    /// `stream_model_turn`, retrying transient failures (rate limits, overload,
-    /// dropped connections) with backoff before anything was streamed.
-    async fn stream_with_retry(
-        &self,
+    /// One complete reply. A reply cut off by the output limit or a dropped
+    /// connection is resumed in follow-up requests and stitched back together,
+    /// so it reaches the user and the history as one uninterrupted answer.
+    async fn stream_full_reply(
+        &mut self,
         request: AiRequest,
+        cancel_rx: &mut mpsc::UnboundedReceiver<()>,
+        usage: &mut UsageStats,
+    ) -> ModelTurn {
+        let mut turn = self
+            .stream_with_retry(request.clone(), cancel_rx, usage)
+            .await;
+        let mut resumes = 0;
+        // A cut-off tool call can't be resumed; its error result asks the model
+        // to redo it in smaller parts instead.
+        while resumes < MAX_RESUMES
+            && !turn.cancelled
+            && turn.error.is_none()
+            && turn.tool_calls.is_empty()
+            && !turn.text.trim().is_empty()
+        {
+            let why = if is_truncated(&turn.finish_reason) {
+                "output limit"
+            } else if turn.finish_reason == FINISH_INCOMPLETE {
+                "connection dropped"
+            } else {
+                break;
+            };
+            resumes += 1;
+            // Not a "Thinking (step …)" status: the UIs keep the same bubble.
+            self.status(format!("Reply was cut off ({why}), continuing it"));
+
+            let mut resume = request.clone();
+            let mut partial = Message::assistant(&turn.text);
+            partial.thinking_blocks = turn.thinking_blocks.clone();
+            resume.messages.push(partial);
+            resume.messages.push(Message::user(RESUME_PROMPT));
+            resume.max_tokens = Some(self.output_budget(&resume.messages));
+
+            let next = self.stream_with_retry(resume, cancel_rx, usage).await;
+            if let Some(err) = next.error.as_deref().filter(|_| !next.produced_output()) {
+                // Keep what already arrived; the caller warns that it is incomplete.
+                self.status(format!("Couldn't continue the reply: {}", short_error(err)));
+                break;
+            }
+            let progressed = next.produced_output();
+            turn.absorb(next);
+            if !progressed {
+                break;
+            }
+        }
+        turn
+    }
+
+    /// `stream_model_turn`, retrying transient failures (rate limits, overload,
+    /// dropped connections) with backoff before anything was streamed, and
+    /// shrinking the output budget when the provider says it is too large.
+    async fn stream_with_retry(
+        &mut self,
+        mut request: AiRequest,
         cancel_rx: &mut mpsc::UnboundedReceiver<()>,
         usage: &mut UsageStats,
     ) -> ModelTurn {
         const MAX_RETRIES: u32 = 3;
         let mut attempt = 0;
+        let mut budget_retries = 0;
         loop {
-            let turn = self
+            let mut turn = self
                 .stream_model_turn(request.clone(), cancel_rx, usage)
                 .await;
-            let produced_output = !turn.text.is_empty() || !turn.tool_calls.is_empty();
-            let delay = match &turn.error {
-                Some(err) if !produced_output && attempt < MAX_RETRIES => retry_delay(err, attempt),
-                _ => None,
+            let Some(err) = turn.error.clone() else {
+                return turn;
+            };
+            if turn.produced_output() {
+                // A connection that drops mid-reply keeps what arrived;
+                // `stream_full_reply` picks up from there.
+                if retry_delay(&err, 0).is_some() {
+                    tracing::warn!("Stream interrupted mid-reply: {err}");
+                    turn.error = None;
+                    turn.finish_reason = FINISH_INCOMPLETE.to_string();
+                }
+                return turn;
+            }
+            if let Some(requested) = request.max_tokens.filter(|_| budget_retries < 3) {
+                if let Some(limit) = output_limit_from_error(&err, requested) {
+                    budget_retries += 1;
+                    tracing::info!(
+                        requested,
+                        limit = limit.tokens,
+                        "provider lowered the output budget"
+                    );
+                    if limit.model_wide {
+                        self.learned_output_cap =
+                            Some((self.settings.active_model.clone(), limit.tokens));
+                    }
+                    request.max_tokens = Some(limit.tokens);
+                    continue;
+                }
+            }
+            let delay = if attempt < MAX_RETRIES {
+                retry_delay(&err, attempt)
+            } else {
+                None
             };
             let Some(delay) = delay else {
                 return turn;
@@ -1177,6 +1399,10 @@ impl Agent {
             cwd: self.settings.project_root.clone(),
             client: Some(self.client.clone()),
             temp_memory: self.temp_memory.clone(),
+            events: Some(self.event_tx.clone()),
+            approvals_off: self.approval_disabled,
+            agent_name: self.subagent_name.clone(),
+            inbox: Some(self.inbox_tx.clone()),
         };
 
         let mut handles = Vec::with_capacity(calls.len());
@@ -1279,7 +1505,10 @@ impl Agent {
     fn tool_result_message(&self, call: &ToolCall, result: ToolResult) -> Message {
         // Large outputs are cut in the middle: command errors and summaries live
         // at the end, file headers at the start.
-        let max_chars = self.settings.max_content_chars.clamp(2_000, 40_000);
+        let max_chars = self.settings.max_content_chars.clamp(
+            crate::config::MIN_CONTENT_CHARS,
+            crate::config::MAX_CONTENT_CHARS,
+        );
         let content = crate::util::truncate_middle(&result.to_message_content(), max_chars);
         let mut msg = Message::tool_result(&call.id, &call.name, content);
         if let Some((data, mime)) = result.base64_image {
@@ -1290,24 +1519,102 @@ impl Agent {
     }
 
     /// Fold instructions typed during a run into the conversation.
+    /// Stopping the main agent stops the sub-agents it started.
+    fn stop_subagents(&self) {
+        if self.subagent_name.is_none() {
+            subagent::cancel_owned(&self.inbox_tx);
+        }
+    }
+
+    /// Wait for running sub-agents, then hand their reports to the main agent
+    /// with a request to summarize. False when the user stopped the run.
+    async fn wait_for_subagents(&mut self, cancel_rx: &mut mpsc::UnboundedReceiver<()>) -> bool {
+        let running = subagent::running_count(&self.inbox_tx);
+        if running > 0 {
+            self.status(format!(
+                "Waiting for {running} sub-agent{} to finish...",
+                if running == 1 { "" } else { "s" }
+            ));
+            tokio::select! {
+                _ = subagent::wait_until_done(&self.inbox_tx, None) => {}
+                _ = cancel_rx.recv() => {
+                    subagent::cancel_owned(&self.inbox_tx);
+                    return false;
+                }
+            }
+        }
+        let notes: Vec<String> = subagent::take_reports(&self.inbox_tx)
+            .iter()
+            .map(subagent::Report::note)
+            .collect();
+        let text = format!(
+            "{}\n\n[All sub-agents have finished. Now answer the user: summarize what each agent did, \
+             the files changed, the combined result and anything left open.]",
+            notes.join("\n\n")
+        );
+        match self.messages.last_mut() {
+            Some(last) if last.role == Role::User => last.content.push(ContentPart::Text {
+                text: format!("\n\n{text}"),
+            }),
+            _ => self.messages.push(Message::user(text)),
+        }
+        true
+    }
+
     fn absorb_instructions(&mut self) {
-        let Some(rx) = self.instruction_rx.as_mut() else {
-            return;
-        };
         let mut incoming = Vec::new();
-        while let Ok(text) = rx.try_recv() {
+        if let Some(rx) = self.instruction_rx.as_mut() {
+            while let Ok(text) = rx.try_recv() {
+                incoming.push(text);
+            }
+        }
+        // Sub-agents that finished while the main agent kept working.
+        if self.subagent_name.is_none() {
+            incoming.extend(
+                subagent::take_reports(&self.inbox_tx)
+                    .iter()
+                    .map(subagent::Report::note),
+            );
+        }
+        // Messages from other agents read like instructions.
+        while let Ok(text) = self.inbox_rx.try_recv() {
             incoming.push(text);
         }
-        for text in incoming {
+        for raw in incoming {
+            // Files attached to a queued message arrive in the GUI protocol too.
+            let (attachments, prompt) = split_attachments(&raw);
+            let mut parts = Vec::new();
+            if self.client.supports_vision() {
+                for img in attachments.iter().filter(|p| is_image_path(p)) {
+                    if let Ok((data, mime_type)) = vision::encode_image_file(img) {
+                        parts.push(ContentPart::Image { data, mime_type });
+                    }
+                }
+            }
+            let mut text = prompt.to_string();
+            if !attachments.is_empty() {
+                let inline = !parts.is_empty();
+                text = format!(
+                    "{text}\n\n{}",
+                    attachment_notes(&attachments, &self.settings.project_root, inline)
+                );
+            }
             self.status(format!(
                 "📥 Received instruction: {}",
-                crate::util::truncate_chars(&text, 80)
+                crate::util::truncate_chars(prompt, 80)
             ));
             match self.messages.last_mut() {
-                Some(last) if last.role == Role::User => last.content.push(ContentPart::Text {
-                    text: format!("\n\n{text}"),
-                }),
-                _ => self.messages.push(Message::user(text)),
+                Some(last) if last.role == Role::User => {
+                    last.content.push(ContentPart::Text {
+                        text: format!("\n\n{text}"),
+                    });
+                    last.content.extend(parts);
+                }
+                _ => {
+                    let mut msg = Message::user(text);
+                    msg.content.extend(parts);
+                    self.messages.push(msg);
+                }
             }
         }
     }
@@ -1351,6 +1658,9 @@ impl Agent {
                 unhandled.push(msg);
             }
         }
+        while let Ok(msg) = self.inbox_rx.try_recv() {
+            unhandled.push(msg);
+        }
         unhandled
     }
 
@@ -1361,8 +1671,9 @@ impl Agent {
 
     /// Save current session to disk.
     fn save_session(&mut self) {
-        // Nothing to save until the user has said something.
-        if self.messages.len() <= 1 {
+        // Nothing to save until the user has said something. Sub-agents live
+        // inside the main agent's chat and never get a history entry of their own.
+        if self.messages.len() <= 1 || self.subagent_name.is_some() {
             return;
         }
         let root = self.settings.project_root.clone();
@@ -1440,6 +1751,90 @@ fn retry_delay(error: &str, attempt: u32) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(secs))
 }
 
+/// An output budget a provider will accept, read from its rejection.
+#[derive(Debug, PartialEq)]
+struct OutputLimit {
+    tokens: u32,
+    /// The model's own ceiling (worth remembering), rather than what happened
+    /// to fit beside this particular prompt.
+    model_wide: bool,
+}
+
+/// When `error` rejects the requested output budget (`requested` tokens), the
+/// budget to retry with. Covers the shapes providers use:
+///   "max_tokens: 128000 > 64000, which is the maximum allowed …" (Anthropic)
+///   "input length and `max_tokens` exceed context limit: 180000 + 64000 > 200000"
+///   "This model supports at most 16384 completion tokens" (OpenAI)
+///   "maximum context length is 200000 tokens … (166000 of text input, …)"
+///   "maximum context length is 128000 tokens … (76000 in the messages, …)"
+fn output_limit_from_error(error: &str, requested: u32) -> Option<OutputLimit> {
+    let lower = error.to_lowercase();
+    let about_output = [
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "maxoutputtokens",
+        "max tokens",
+        "output tokens",
+        "completion tokens",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+        || (lower.contains("context length")
+            && (lower.contains("output") || lower.contains("completion")));
+    // Rate limits also quote token counts ("8,000 output tokens per minute").
+    let rate_limited = ["rate limit", "429", "per minute", "per day", "quota"]
+        .iter()
+        .any(|k| lower.contains(k));
+    if !about_output || rate_limited {
+        return None;
+    }
+
+    let plain = lower.replace(',', "");
+    let num = |re: &str| -> Option<Vec<u64>> {
+        let caps = regex::Regex::new(re).ok()?.captures(&plain)?;
+        caps.iter()
+            .skip(1)
+            .map(|m| m?.as_str().parse().ok())
+            .collect()
+    };
+    let fit = |window: u64, input: u64| {
+        let room = window.saturating_sub(input + 1_024);
+        (room >= 1_024).then(|| OutputLimit {
+            tokens: u32::try_from(room).unwrap_or(u32::MAX).min(requested - 1),
+            model_wide: false,
+        })
+    };
+
+    if let Some(n) = num(r"(\d+)\s*\+\s*\d+\s*>\s*(\d+)") {
+        return fit(n[1], n[0]);
+    }
+    if let (Some(window), Some(input)) = (
+        num(r"context length is (\d+)"),
+        num(r"(\d+) (?:tokens )?(?:of text input|in the messages)"),
+    ) {
+        return fit(window[0], input[0]);
+    }
+    // Otherwise the largest figure below what was asked is the ceiling.
+    let ceiling = regex::Regex::new(r"\d+")
+        .ok()?
+        .find_iter(&plain)
+        .filter_map(|m| m.as_str().parse::<u64>().ok())
+        .filter(|&n| n >= 1_024 && n < u64::from(requested))
+        .max();
+    match ceiling {
+        Some(n) => Some(OutputLimit {
+            tokens: n as u32,
+            model_wide: true,
+        }),
+        // No figure to go on: halve, down to the old fixed 8k.
+        None => (requested > 8_192).then(|| OutputLimit {
+            tokens: (requested / 2).max(8_192),
+            model_wide: false,
+        }),
+    }
+}
+
 /// First meaningful line of a provider error, for status messages.
 fn short_error(error: &str) -> String {
     let line = error
@@ -1452,6 +1847,13 @@ fn short_error(error: &str) -> String {
 
 fn is_truncated(finish_reason: &str) -> bool {
     matches!(finish_reason, "length" | "max_tokens" | "MAX_TOKENS")
+}
+
+/// A sub-agent's tools: everything except starting or waiting for sub-agents.
+fn subagent_tools(tools: ToolRegistry) -> ToolRegistry {
+    tools
+        .without(subagent::TOOL_NAME)
+        .without(subagent::WAIT_TOOL_NAME)
 }
 
 /// Tool arguments arrive either as a JSON object or as a JSON-encoded string.
@@ -1546,9 +1948,50 @@ fn is_image_path(path: &std::path::Path) -> bool {
     IMAGE_EXTS.iter().any(|ext| lower.ends_with(ext))
 }
 
+/// Split the GUI attachment protocol, "/image_prompt |<path>|<path>…| <prompt>",
+/// into the attached files and the prompt. The GUI has already placed each
+/// file inside the project (in place, or copied to .norvexum/attachments/) and
+/// sends absolute paths; the first segment is always a path (older format).
+fn split_attachments(text: &str) -> (Vec<std::path::PathBuf>, &str) {
+    let Some(mut rest) = text.strip_prefix("/image_prompt |") else {
+        return (Vec::new(), text);
+    };
+    let mut files = Vec::new();
+    let mut first = true;
+    while let Some((segment, tail)) = rest.split_once('|') {
+        let path = std::path::Path::new(segment);
+        if !first && !path.is_absolute() {
+            break;
+        }
+        first = false;
+        if path.is_file() {
+            files.push(path.to_path_buf());
+        }
+        rest = tail;
+    }
+    (files, rest.trim())
+}
+
+fn attachment_notes(
+    paths: &[std::path::PathBuf],
+    project_root: &std::path::Path,
+    images_inline: bool,
+) -> String {
+    paths
+        .iter()
+        .map(|p| attachment_note(p, project_root, images_inline))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The note added to a prompt for a GUI attachment: where the file is (relative
 /// to the project), how big it is, and how the agent can use it.
-fn attachment_note(path: &std::path::Path, project_root: &std::path::Path) -> String {
+/// `image_inline` says whether an image also went along as a picture.
+fn attachment_note(
+    path: &std::path::Path,
+    project_root: &std::path::Path,
+    image_inline: bool,
+) -> String {
     let root = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
@@ -1563,8 +2006,10 @@ fn attachment_note(path: &std::path::Path, project_root: &std::path::Path) -> St
     } else {
         format!("{:.1} KB", size as f64 / 1024.0)
     };
-    let how = if is_image_path(path) {
+    let how = if is_image_path(path) && image_inline {
         "The image is attached to this message; view_image shows it again"
+    } else if is_image_path(path) {
+        "Look at it with view_image"
     } else {
         "Open it with read_file"
     };
@@ -1616,18 +2061,35 @@ mod tests {
         let png = root.join("logo.png");
         std::fs::write(&png, b"x").unwrap();
 
-        let note = attachment_note(&pdf, &root);
+        let note = attachment_note(&pdf, &root, true);
         assert!(note.contains("`.norvexum/attachments/spec.pdf`"), "{note}");
         assert!(note.contains("2.0 KB"), "{note}");
         assert!(note.contains("read_file") && note.contains("cp"), "{note}");
         assert!(!is_image_path(&pdf));
 
-        let note = attachment_note(&png, &root);
+        let note = attachment_note(&png, &root, true);
         assert!(
             note.contains("`logo.png`") && note.contains("view_image"),
             "{note}"
         );
         assert!(is_image_path(std::path::Path::new("A.JPG")));
+
+        // Several files in one message, prompt text containing '|' kept whole.
+        let msg = format!(
+            "/image_prompt |{}|{}| compare | contrast",
+            pdf.display(),
+            png.display()
+        );
+        let (files, prompt) = split_attachments(&msg);
+        assert_eq!(files, vec![pdf.clone(), png.clone()]);
+        assert_eq!(prompt, "compare | contrast");
+        // The older single-file form still parses.
+        let single = format!("/image_prompt |{}| hi", png.display());
+        let (files, prompt) = split_attachments(&single);
+        assert_eq!((files, prompt), (vec![png.clone()], "hi"));
+        let (files, prompt) = split_attachments("plain | text");
+        assert!(files.is_empty());
+        assert_eq!(prompt, "plain | text");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1668,6 +2130,207 @@ mod tests {
             None
         );
         assert_eq!(retry_delay("429 Please retry in 3600s", 0), None);
+    }
+
+    #[test]
+    fn output_budget_follows_provider_rejections() {
+        let anthropic = "Anthropic API error 400: max_tokens: 128000 > 64000, which is the maximum \
+                         allowed number of output tokens for claude-opus-5-5";
+        assert_eq!(
+            output_limit_from_error(anthropic, 128_000),
+            Some(OutputLimit {
+                tokens: 64_000,
+                model_wide: true
+            })
+        );
+        let overflow = "input length and `max_tokens` exceed context limit: 180000 + 64000 > 200000, \
+                        decrease input length or `max_tokens` and try again";
+        assert_eq!(
+            output_limit_from_error(overflow, 64_000),
+            Some(OutputLimit {
+                tokens: 18_976,
+                model_wide: false
+            })
+        );
+        let openai = "max_tokens is too large: 32768. This model supports at most 16,384 completion \
+                      tokens, whereas you provided 32768.";
+        assert_eq!(
+            output_limit_from_error(openai, 32_768).unwrap().tokens,
+            16_384
+        );
+        let gateway = "This endpoint's maximum context length is 200000 tokens. However, you requested \
+                       about 230000 tokens (166000 of text input, 64000 in the output).";
+        assert_eq!(
+            output_limit_from_error(gateway, 64_000).unwrap().tokens,
+            32_976
+        );
+        let deepseek = "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]";
+        assert_eq!(
+            output_limit_from_error(deepseek, 32_768).unwrap().tokens,
+            8_192
+        );
+
+        // Unrelated failures keep their normal handling.
+        let rate = "429: This request would exceed your limit of 8,000 output tokens per minute";
+        assert_eq!(output_limit_from_error(rate, 64_000), None);
+        assert_eq!(
+            output_limit_from_error("401 invalid x-api-key", 64_000),
+            None
+        );
+        assert_eq!(
+            output_limit_from_error("prompt is too long: 210000 tokens > 200000 maximum", 64_000),
+            None
+        );
+    }
+
+    /// Plays back one scripted response per request and records the requests.
+    struct ScriptedClient {
+        replies: std::sync::Mutex<std::collections::VecDeque<Vec<AiStreamEvent>>>,
+        requests: Arc<std::sync::Mutex<Vec<AiRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AiClient for ScriptedClient {
+        async fn chat_stream(
+            &self,
+            request: AiRequest,
+            tx: mpsc::UnboundedSender<AiStreamEvent>,
+        ) -> Result<()> {
+            self.requests.lock().unwrap().push(request);
+            let events = self.replies.lock().unwrap().pop_front().unwrap_or_default();
+            for event in events {
+                let _ = tx.send(event);
+            }
+            Ok(())
+        }
+
+        fn supports_vision(&self) -> bool {
+            false
+        }
+    }
+
+    fn done(reason: &str) -> AiStreamEvent {
+        AiStreamEvent::Done {
+            finish_reason: reason.into(),
+            usage: None,
+        }
+    }
+
+    /// Run one user message against scripted replies; returns the agent, the
+    /// requests it sent and the warnings it showed.
+    async fn run_scripted(
+        replies: Vec<Vec<AiStreamEvent>>,
+    ) -> (Agent, Vec<AiRequest>, Vec<String>) {
+        let root = std::env::temp_dir().join(format!("nvx-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = Settings {
+            project_root: root.clone(),
+            ..Settings::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(settings, tx);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.client = Arc::new(ScriptedClient {
+            replies: std::sync::Mutex::new(replies.into()),
+            requests: requests.clone(),
+        });
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        agent
+            .process_message("write it", &mut cancel_rx)
+            .await
+            .unwrap();
+
+        let mut warnings = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Warning(w) = event {
+                warnings.push(w);
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+        let requests = requests.lock().unwrap().clone();
+        (agent, requests, warnings)
+    }
+
+    fn last_reply(agent: &Agent) -> String {
+        let last = agent.messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        last.text()
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_off_by_the_output_limit_is_resumed_seamlessly() {
+        let (agent, requests, warnings) = run_scripted(vec![
+            vec![
+                AiStreamEvent::ContentDelta("The quick brown fo".into()),
+                done("length"),
+            ],
+            vec![AiStreamEvent::ContentDelta("x jumps.".into()), done("stop")],
+        ])
+        .await;
+
+        assert_eq!(last_reply(&agent), "The quick brown fox jumps.");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].max_tokens.unwrap() > 8_192);
+        // The resume request carries the partial reply and the instruction, but
+        // neither ends up in the saved history.
+        let resume = &requests[1].messages;
+        assert_eq!(resume[resume.len() - 2].text(), "The quick brown fo");
+        assert_eq!(resume[resume.len() - 1].text(), RESUME_PROMPT);
+        assert!(!agent.messages.iter().any(|m| m.text() == RESUME_PROMPT));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_keeps_the_text_and_continues() {
+        let (agent, requests, warnings) = run_scripted(vec![
+            vec![
+                AiStreamEvent::ContentDelta("Step one, ".into()),
+                AiStreamEvent::Error("Stream error: error decoding response body".into()),
+                done(FINISH_INCOMPLETE),
+            ],
+            vec![
+                AiStreamEvent::ContentDelta("step two.".into()),
+                done("stop"),
+            ],
+        ])
+        .await;
+
+        assert_eq!(last_reply(&agent), "Step one, step two.");
+        assert_eq!(requests.len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_stops_making_progress_is_left_with_a_warning() {
+        let (agent, requests, warnings) = run_scripted(vec![
+            vec![
+                AiStreamEvent::ContentDelta("Partial".into()),
+                done("length"),
+            ],
+            vec![done("length")],
+        ])
+        .await;
+
+        assert_eq!(last_reply(&agent), "Partial");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_output_budget_is_lowered_and_remembered() {
+        let (agent, requests, _) = run_scripted(vec![
+            vec![AiStreamEvent::Error(
+                "API error 400: max_tokens is too large. This model supports at most 12000 \
+                 completion tokens."
+                    .into(),
+            )],
+            vec![AiStreamEvent::ContentDelta("ok".into()), done("stop")],
+        ])
+        .await;
+
+        assert_eq!(last_reply(&agent), "ok");
+        assert_eq!(requests[1].max_tokens, Some(12_000));
+        assert_eq!(agent.output_budget(&agent.messages), 12_000);
     }
 
     #[test]

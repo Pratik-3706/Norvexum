@@ -116,6 +116,14 @@ pub struct ToolContext {
     pub client: Option<Arc<dyn crate::ai::AiClient>>,
     /// Temporary volatile RAM storage shared across the agent's lifetime
     pub temp_memory: Arc<tokio::sync::RwLock<crate::tools::memory::TempMemory>>,
+    /// The calling agent's event channel (sub-agents report through it).
+    pub events: Option<tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>>,
+    /// Tool approvals are switched off for the calling agent.
+    pub approvals_off: bool,
+    /// The calling agent's name if it is a sub-agent (`None`: the main agent).
+    pub agent_name: Option<String>,
+    /// Where messages for the calling agent go (message_agent).
+    pub inbox: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// The trait all tools must implement.
@@ -214,6 +222,11 @@ impl ToolRegistry {
         registry.register(Arc::new(shell::ShellCommandTool));
         registry.register(Arc::new(processes::ManageProcessesTool));
 
+        // ── Sub-agents ───────────────────────────────────────────────────
+        registry.register(Arc::new(crate::agent::subagent::SpawnAgentTool));
+        registry.register(Arc::new(crate::agent::subagent::MessageAgentTool));
+        registry.register(Arc::new(crate::agent::subagent::WaitForAgentsTool));
+
         // ── Git tools ────────────────────────────────────────────────────
         registry.register(Arc::new(git::GitStatusTool));
         registry.register(Arc::new(git::GitDiffTool));
@@ -221,6 +234,12 @@ impl ToolRegistry {
         registry.register(Arc::new(git::GitLogTool));
 
         registry
+    }
+
+    /// The registry without the tool called `name`.
+    pub fn without(mut self, name: &str) -> Self {
+        self.tools.remove(name);
+        self
     }
 
     fn register(&mut self, tool: Arc<dyn Tool>) {
@@ -281,6 +300,10 @@ mod tests {
             temp_memory: Arc::new(tokio::sync::RwLock::new(
                 crate::tools::memory::TempMemory::new(),
             )),
+            events: None,
+            approvals_off: false,
+            agent_name: None,
+            inbox: None,
         };
         (root, context)
     }
@@ -414,6 +437,59 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_check_allows_safe_one_liners_and_chained_cds() {
+        let (root, context) = test_context();
+        std::fs::create_dir_all(root.join("src").join("go-srp")).unwrap();
+        let check = |cmd: &str| super::shell::check_command_paths(cmd, &context);
+        // False positives reported by the agent: none of these leave the project.
+        for safe in [
+            r#"php -r "echo strlen($bin);""#,
+            r#"findstr /C:"pkg/mime" composer.lock"#,
+            r#"powershell Get-Content reports\fuzz.log -Tail 5"#,
+            r#"for %f in (*.log) do @(type %f)"#,
+            r#"python -c "print(open('/src/TNEFDecoder/x.php').read())""#,
+            r#"cd src\go-srp && git log -1 & cd ..\.."#,
+            r#"cd src/go-srp && cd ../.. && dir"#,
+            r"type reports\fuzz.log | tail -5",
+            "echo $HOME",
+        ] {
+            assert!(check(safe).is_ok(), "{safe}: {:?}", check(safe));
+        }
+        // Real escapes are still caught, including through a chained cd.
+        for escape in [
+            r"type ..\secrets.txt",
+            "cat ../secrets.txt",
+            "cd .. && dir",
+            "cd src && cd ../.. && dir",
+            r"cmd /c type ..\x.txt",
+        ] {
+            assert!(check(escape).is_err(), "{escape} should be blocked");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_command_pipes_through_unix_tools() {
+        let (root, context) = test_context();
+        let registry = ToolRegistry::new(&context.settings);
+        // On Windows this needs Git for Windows' tools; elsewhere sh has them.
+        let result = registry
+            .execute(
+                "run_command",
+                json!({ "command": "echo one& echo two& echo three | tail -n 1" }),
+                &context,
+            )
+            .await;
+        if cfg!(windows) && !std::path::Path::new(r"C:\Program Files\Git\usr\bin\tail.exe").exists()
+        {
+            return;
+        }
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("three"), "{}", result.output);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

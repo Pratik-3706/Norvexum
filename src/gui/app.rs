@@ -1,12 +1,17 @@
 use crate::agent::AgentEvent;
-use crate::config::Settings;
 use crate::config::providers::build_registry;
+use crate::config::{MAX_CONTENT_CHARS, MIN_CONTENT_CHARS, Settings};
 use crate::style::{self, Palette};
 use notify::{RecursiveMode, Result as NotifyResult, Watcher};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+mod agents;
+mod browser_view;
+
+use agents::{ChatView, SubAgentView};
 
 const LAST_LAYER_BYTES: &[u8] = include_bytes!("../../assets/loading_animation/last_layer.png");
 const MIDDLE_LAYER_BYTES: &[u8] = include_bytes!("../../assets/loading_animation/middle_layer.png");
@@ -30,7 +35,7 @@ pub struct GuiMessage {
     pub thinking: Option<String>,
     pub is_thinking_done: bool,
     pub tool_logs: Vec<String>,
-    pub attached_image: Option<std::path::PathBuf>,
+    pub attachments: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -92,7 +97,8 @@ pub struct GuiApp {
     right_sidebar_open: bool,
 
     // Image attachment, writing files tracking, and history sessions
-    attached_image: Option<std::path::PathBuf>,
+    /// Files waiting to go out with the next message.
+    attachments: Vec<std::path::PathBuf>,
     session_written_files: Vec<String>,
     current_writing_file: Option<(String, usize, usize)>,
     current_writing_status: Option<String>,
@@ -160,6 +166,21 @@ pub struct GuiApp {
     file_tree: FileTree,
     file_tree_filter: String,
     file_tree_dirty: bool,
+    /// The paste key was down last frame (edge detection for media paste).
+    paste_key_was_down: bool,
+    /// Sub-agents of the current chat, oldest first.
+    subagents: Vec<SubAgentView>,
+    /// What the chat area shows, and whether a sub-agent sits beside the main chat.
+    chat_view: ChatView,
+    split_view: bool,
+    /// The sub-agent that asked for the pending approval (None: the main agent).
+    approval_agent: Option<String>,
+    /// Browser tab: the uploaded page picture (frame number, texture) and the address box.
+    browser_tex: Option<(u64, egui::TextureHandle)>,
+    /// Window size last frame (a change forces a redraw).
+    last_window_size: Option<egui::Vec2>,
+    browser_url: String,
+    browser_url_editing: bool,
 }
 
 struct CapabilitiesUpdate {
@@ -316,7 +337,9 @@ fn attachment_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
         egui::Stroke::new(1.5_f32, icon_color),
     ));
 
-    response.on_hover_text("Attach a file (or drop one on the window)")
+    response.on_hover_text(
+        "Attach files — or drop them on the window, or paste with Ctrl+V. Right-click to paste.",
+    )
 }
 
 fn get_secure_key(name: &str) -> Option<String> {
@@ -530,7 +553,7 @@ impl GuiApp {
             new_model_id: String::new(),
             left_sidebar_open: true,
             right_sidebar_open: true,
-            attached_image: None,
+            attachments: Vec::new(),
             session_written_files: Vec::new(),
             current_writing_file: None,
             current_writing_status: None,
@@ -559,7 +582,7 @@ impl GuiApp {
             should_scroll_to_line: None,
             agent_active_session_id: None,
             left_sidebar_width: 280.0,
-            right_sidebar_width: 270.0,
+            right_sidebar_width: 380.0,
             ctx: None,
             last_active_provider: initial_provider,
             last_active_model: initial_model,
@@ -584,7 +607,23 @@ impl GuiApp {
             file_tree: FileTree::default(),
             file_tree_filter: String::new(),
             file_tree_dirty: true,
+            paste_key_was_down: false,
+            subagents: Vec::new(),
+            chat_view: ChatView::Main,
+            split_view: false,
+            approval_agent: None,
+            browser_tex: None,
+            last_window_size: None,
+            browser_url: String::new(),
+            browser_url_editing: false,
         };
+
+        // The agent's browser is shown in the Browser tab, not as a separate window.
+        crate::tools::browser::show_in_app(true);
+        {
+            let ctx = cc.egui_ctx.clone();
+            crate::tools::browser::on_new_frame(move || ctx.request_repaint());
+        }
 
         app.load_capabilities_cache();
         app.trigger_capabilities_probe();
@@ -597,7 +636,7 @@ impl GuiApp {
                 thinking: None,
                 is_thinking_done: false,
                 tool_logs: Vec::new(),
-                attached_image: None,
+                attachments: Vec::new(),
             });
             app.is_processing = true;
         }
@@ -1104,7 +1143,7 @@ impl GuiApp {
         match std::fs::metadata(&path) {
             Ok(metadata) if metadata.len() > MAX_PREVIEW_BYTES && !self.line_range_enabled => {
                 self.inspector_error = Some(format!(
-                    "Preview unavailable: this file is larger than {} KB. Check 'Filter by line range' below to view sections.",
+                    "Preview unavailable: this file is larger than {} KB. Turn on Lines to view part of it.",
                     MAX_PREVIEW_BYTES / 1024
                 ));
             }
@@ -1195,7 +1234,7 @@ impl GuiApp {
                 thinking: None,
                 is_thinking_done: false,
                 tool_logs: Vec::new(),
-                attached_image: None,
+                attachments: Vec::new(),
             });
         }
         self.messages.last_mut().unwrap()
@@ -1210,7 +1249,7 @@ impl GuiApp {
                     thinking: None,
                     is_thinking_done: false,
                     tool_logs: Vec::new(),
-                    attached_image: None,
+                    attachments: Vec::new(),
                 });
             }
         }
@@ -1541,13 +1580,57 @@ impl GuiApp {
                                 tool_name,
                                 args_preview,
                             });
+                            self.approval_agent = None;
                         }
                         AgentEvent::ModelSwitched { model, provider } => {
                             self.settings.active_model = model;
                             self.settings.active_provider = provider;
                             self.status_text = "Model updated".to_string();
                         }
+                        AgentEvent::SubAgentStarted { id, name, task } => {
+                            self.status_text = format!("Started sub-agent {name}");
+                            self.get_or_create_assistant_message()
+                                .tool_logs
+                                .push(format!(
+                                    "AGENT_EVT|started|{name}|{}",
+                                    task.replace('|', "/")
+                                ));
+                            self.subagents.push(SubAgentView::new(id, name, task));
+                        }
+                        AgentEvent::SubAgent { id, event } => {
+                            self.handle_subagent_event(&id, *event);
+                        }
+                        AgentEvent::AgentMessage { from, to, text } => {
+                            self.show_agent_message(&from, &to, &text);
+                        }
+                        AgentEvent::SubAgentFinished {
+                            id,
+                            success,
+                            summary,
+                        } => {
+                            if let Some(sub) = self.subagents.iter_mut().find(|s| s.id == id) {
+                                let line = format!(
+                                    "AGENT_EVT|{}|{}|{}",
+                                    if success { "done" } else { "stopped" },
+                                    sub.name,
+                                    summary.replace('|', "/")
+                                );
+                                sub.finished = Some((success, summary, std::time::Instant::now()));
+                                self.status_text = format!(
+                                    "Sub-agent {} {}",
+                                    sub.name,
+                                    if success { "finished" } else { "stopped" }
+                                );
+                                self.get_or_create_assistant_message().tool_logs.push(line);
+                            }
+                            if self.approval_agent.as_deref() == Some(id.as_str()) {
+                                self.approval_pending = None;
+                                self.approval_agent = None;
+                            }
+                        }
                         AgentEvent::ClearChat => {
+                            self.subagents.clear();
+                            self.chat_view = ChatView::Main;
                             self.messages.clear();
                             self.session_written_files.clear();
                             self.file_diff_stats.clear();
@@ -1619,29 +1702,128 @@ impl GuiApp {
         }
     }
 
+    /// Ctrl+V with an image or copied files on the clipboard attaches them.
+    /// egui only turns text pastes into events and swallows the key otherwise,
+    /// so the key itself is read from the OS.
+    fn handle_media_paste(&mut self, ctx: &egui::Context) {
+        let (command, focused, pasted_text) = ctx.input(|i| {
+            (
+                i.modifiers.command,
+                i.focused,
+                i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+            )
+        });
+        let down = command && focused && paste_key_down();
+        let pressed = down && !self.paste_key_was_down;
+        self.paste_key_was_down = down;
+        if command && focused {
+            // The V press itself produces no event; keep looking while Ctrl is held.
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+        // A text paste was already handled by the focused text box.
+        if pressed && !pasted_text {
+            self.paste_clipboard_media(false);
+        }
+    }
+
+    /// Attach the files or image on the clipboard. `report_empty` says so when
+    /// there is neither (only when the user explicitly asked to paste).
+    fn paste_clipboard_media(&mut self, report_empty: bool) {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return;
+        };
+        if let Ok(files) = clipboard.get().file_list() {
+            let files: Vec<_> = files.into_iter().filter(|f| f.is_file()).collect();
+            if !files.is_empty() {
+                self.add_attachments(files);
+                return;
+            }
+        }
+        match clipboard.get_image() {
+            Ok(image) => match save_pasted_image(&self.settings.project_root, &image) {
+                Ok(path) => {
+                    self.add_attachments(vec![path]);
+                    self.trigger_load_files();
+                }
+                Err(e) => self.status_text = format!("Couldn't paste the image: {e}"),
+            },
+            Err(_) if report_empty => {
+                self.status_text = "No image or files on the clipboard".to_string();
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Answer the pending approval, to the sub-agent that asked if it was one.
+    fn answer_approval(&mut self, approved: bool) {
+        if self.approval_pending.take().is_none() {
+            return;
+        }
+        match self.approval_agent.take() {
+            Some(id) => crate::agent::subagent::respond_approval(&id, approved),
+            None => {
+                let _ = self.approval_tx.send(approved);
+            }
+        }
+    }
+
+    /// Queue files for the next message, skipping ones already queued.
+    fn add_attachments(&mut self, paths: Vec<std::path::PathBuf>) {
+        let before = self.attachments.len();
+        for path in paths {
+            if !self.attachments.contains(&path) {
+                self.attachments.push(path);
+            }
+        }
+        let added = self.attachments.len() - before;
+        self.status_text = match (added, self.attachments.last()) {
+            (0, _) => "Already attached".to_string(),
+            (1, Some(path)) => format!(
+                "Attached {}",
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+            ),
+            (n, _) => format!("Attached {n} files"),
+        };
+        self.focus_composer = true;
+    }
+
     fn send_message(&mut self) {
-        if self.input_text.trim().is_empty() {
+        if self.input_text.trim().is_empty() && self.attachments.is_empty() {
             return;
         }
 
         let mut raw_prompt = self.input_text.trim().to_string();
+        if raw_prompt.is_empty() {
+            raw_prompt = if self.attachments.len() == 1 {
+                "Take a look at the attached file.".to_string()
+            } else {
+                "Take a look at the attached files.".to_string()
+            };
+        }
         let display_prompt = raw_prompt.clone();
 
-        let mut final_attached_image = None;
-        if let Some(ref file_path) = self.attached_image.take() {
-            let dest_path = attachment_destination(&self.settings.project_root, file_path);
-            let already_inside = dest_path == *file_path;
-            if already_inside || std::fs::copy(file_path, &dest_path).is_ok() {
-                raw_prompt = format!(
-                    "/image_prompt |{}| {}",
-                    dest_path.to_string_lossy(),
-                    raw_prompt
-                );
-                final_attached_image = Some(dest_path.clone());
-                self.trigger_load_files();
+        // Each file is placed inside the project so the sandboxed agent can use it.
+        let mut placed = Vec::new();
+        let mut unplaced = Vec::new();
+        for file_path in std::mem::take(&mut self.attachments) {
+            let dest_path = attachment_destination(&self.settings.project_root, &file_path);
+            let already_inside = dest_path == file_path;
+            if already_inside || std::fs::copy(&file_path, &dest_path).is_ok() {
+                placed.push(std::path::absolute(&dest_path).unwrap_or(dest_path));
             } else {
-                raw_prompt = format!("{} ({})", raw_prompt, file_path.to_string_lossy());
+                unplaced.push(file_path);
             }
+        }
+        if !placed.is_empty() {
+            let paths: String = placed
+                .iter()
+                .map(|p| format!("{}|", p.to_string_lossy()))
+                .collect();
+            raw_prompt = format!("/image_prompt |{paths} {raw_prompt}");
+            self.trigger_load_files();
+        }
+        for file_path in &unplaced {
+            raw_prompt = format!("{} ({})", raw_prompt, file_path.to_string_lossy());
         }
 
         self.messages.push(GuiMessage {
@@ -1650,7 +1832,7 @@ impl GuiApp {
             thinking: None,
             is_thinking_done: false,
             tool_logs: Vec::new(),
-            attached_image: final_attached_image,
+            attachments: placed.into_iter().chain(unplaced).collect(),
         });
 
         // If this is the start of a conversation, clear session files
@@ -2133,7 +2315,8 @@ impl GuiApp {
         });
         ui.add_space(6.0);
 
-        ui.label(egui::RichText::new("Browser timeout").color(p.text));
+        ui.label(egui::RichText::new("Browser timeout").color(p.text))
+            .on_hover_text("How long the browser tool waits for a page to load or respond");
         if ui
             .add(egui::Slider::new(&mut self.settings.browser_timeout_secs, 5..=300).suffix(" s"))
             .changed()
@@ -2142,11 +2325,15 @@ impl GuiApp {
         }
         ui.add_space(6.0);
 
-        ui.label(egui::RichText::new("Max content characters").color(p.text));
+        ui.label(egui::RichText::new("Max content characters").color(p.text))
+            .on_hover_text("Longest tool output (file reads, command logs) kept for the model; the middle of longer output is cut");
         if ui
             .add(
-                egui::Slider::new(&mut self.settings.max_content_chars, 1000..=5000000)
-                    .logarithmic(true),
+                egui::Slider::new(
+                    &mut self.settings.max_content_chars,
+                    MIN_CONTENT_CHARS..=MAX_CONTENT_CHARS,
+                )
+                .logarithmic(true),
             )
             .changed()
         {
@@ -2387,17 +2574,26 @@ struct TreeView<'a> {
 
 fn draw_tree(ui: &mut egui::Ui, node: &FileTree, prefix: &str, depth: usize, view: &mut TreeView) {
     for (name, child) in &node.dirs {
-        let key = if prefix.is_empty() {
+        let mut key = if prefix.is_empty() {
             name.clone()
         } else {
             format!("{prefix}/{name}")
         };
+        // Chains of single folders share one row ("src/engine/physics").
+        let mut label = name.clone();
+        let mut child = child;
+        while child.files.is_empty() && child.dirs.len() == 1 {
+            let (next_name, next) = child.dirs.iter().next().expect("one entry");
+            label = format!("{label}/{next_name}");
+            key = format!("{key}/{next_name}");
+            child = next;
+        }
         let open = view.force_open || view.expanded.contains(&key);
         let resp = tree_row(
             ui,
             depth,
             Some(open),
-            name,
+            &label,
             false,
             FileDecor::default(),
             view.p,
@@ -2449,6 +2645,16 @@ fn tree_row(
         painter.rect_filled(rect, 5.0, p.hover);
     } else if resp.hovered() {
         painter.rect_filled(rect, 5.0, p.surface);
+    }
+    if selected {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(0.0, 5.0),
+                egui::vec2(2.0, 14.0),
+            ),
+            1.0,
+            p.accent,
+        );
     }
     for level in 0..depth {
         let x = rect.left() + 11.0 + level as f32 * INDENT;
@@ -2520,6 +2726,84 @@ fn tree_row(
         name_g,
         color,
     );
+    resp
+}
+
+/// A changed file: name with its folder underneath, diff counts on the right,
+/// and a pulsing dot while the agent is writing it.
+fn change_row(
+    ui: &mut egui::Ui,
+    path: &str,
+    decor: FileDecor,
+    selected: bool,
+    p: &Palette,
+    time: f32,
+) -> egui::Response {
+    let (dir, name) = path.rsplit_once(['/', '\\']).unwrap_or(("", path));
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
+    let painter = ui.painter();
+    if decor.writing {
+        painter.rect_filled(rect, 7.0, p.accent_soft);
+    } else if selected {
+        painter.rect_filled(rect, 7.0, p.hover);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 7.0, p.surface);
+    }
+    // Leading mark: writing pulse, or a quiet dot.
+    let mark = egui::pos2(rect.left() + 12.0, rect.center().y);
+    if decor.writing {
+        let pulse = 0.55 + 0.45 * (time * std::f32::consts::TAU / 1.4).sin();
+        painter.circle_filled(mark, 4.0, p.accent.gamma_multiply(pulse));
+    } else {
+        painter.circle_filled(
+            mark,
+            3.0,
+            if decor.deleted > 0 && decor.added == 0 {
+                p.danger
+            } else {
+                p.success
+            }
+            .gamma_multiply(0.8),
+        );
+    }
+
+    let mut right = rect.right() - 10.0;
+    let mono = egui::FontId::monospace(11.0);
+    for (n, color, sign) in [
+        (decor.deleted, p.danger, '-'),
+        (decor.added, p.success, '+'),
+    ] {
+        if n > 0 {
+            let g = painter.layout_no_wrap(format!("{sign}{n}"), mono.clone(), color);
+            right -= g.size().x;
+            painter.galley(
+                egui::pos2(right, rect.center().y - g.size().y / 2.0),
+                g,
+                color,
+            );
+            right -= 6.0;
+        }
+    }
+    let text_x = rect.left() + 26.0;
+    let width = right - text_x - 6.0;
+    let name_g = style::one_line(ui, name, style::strong(12.5), p.text, width);
+    let dir_label = if decor.writing {
+        "writing…".to_string()
+    } else if dir.is_empty() {
+        "project root".to_string()
+    } else {
+        format!("{dir}/")
+    };
+    let dir_g = style::one_line(
+        ui,
+        &dir_label,
+        egui::FontId::proportional(11.0),
+        if decor.writing { p.accent } else { p.faint },
+        width,
+    );
+    painter.galley(egui::pos2(text_x, rect.top() + 5.0), name_g, p.text);
+    painter.galley(egui::pos2(text_x, rect.top() + 22.0), dir_g, p.faint);
     resp
 }
 
@@ -2642,6 +2926,27 @@ const SHORTCUTS: &[(&str, &str)] = &[
 enum RightTab {
     Changed,
     All,
+    Browser,
+    Agents,
+}
+
+/// Inner margin of the files panel; its divider runs out to the panel edges.
+const RIGHT_PAD: f32 = 12.0;
+
+/// Quiet placeholder for an empty list.
+fn empty_hint(ui: &mut egui::Ui, title: &str, body: &str, p: &Palette) {
+    ui.add_space(20.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new(title)
+                .font(style::strong(12.5))
+                .color(p.dim),
+        );
+        if !body.is_empty() {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(body).size(12.0).color(p.faint));
+        }
+    });
 }
 
 impl GuiApp {
@@ -2716,9 +3021,7 @@ impl GuiApp {
                 }
             });
             if let Some(approved) = answer {
-                if self.approval_pending.take().is_some() {
-                    let _ = self.approval_tx.send(approved);
-                }
+                self.answer_approval(approved);
             }
             return;
         }
@@ -2806,6 +3109,7 @@ impl GuiApp {
                         {
                             self.right_sidebar_open = !self.right_sidebar_open;
                         }
+                        self.draw_agents_nav_button(ui, p);
                     });
                 });
             });
@@ -3034,7 +3338,7 @@ impl GuiApp {
                                         thinking: None,
                                         is_thinking_done: true,
                                         tool_logs: Vec::new(),
-                                        attached_image: None,
+                                        attachments: Vec::new(),
                                     })
                                 })
                                 .collect();
@@ -3102,6 +3406,10 @@ impl GuiApp {
     }
 
     fn draw_right_sidebar(&mut self, ctx: &egui::Context, p: &Palette) {
+        // The page picture only needs refreshing while someone can see it.
+        crate::tools::browser::set_live_view(
+            self.right_sidebar_open && self.right_tab == RightTab::Browser,
+        );
         let target_right_t = if self.right_sidebar_open { 1.0 } else { 0.0 };
         let right_t_raw =
             ctx.animate_value_with_time(egui::Id::new("right_sidebar_anim"), target_right_t, 0.18);
@@ -3115,10 +3423,10 @@ impl GuiApp {
             .frame(
                 egui::Frame::none()
                     .fill(p.panel)
-                    .inner_margin(egui::Margin::same(12.0)),
+                    .inner_margin(egui::Margin::same(RIGHT_PAD)),
             )
             .resizable(!right_animating && self.right_sidebar_open)
-            .width_range(60.0..=1200.0);
+            .width_range(60.0..=(ctx.screen_rect().width() * 0.6).max(320.0));
         if right_animating {
             right_panel = right_panel.exact_width(self.right_sidebar_width * right_t);
         } else {
@@ -3126,412 +3434,572 @@ impl GuiApp {
         }
 
         let panel_response = right_panel.show(ctx, |ui| {
-            let bg_procs = crate::tools::shell::get_background_processes();
-            if !bg_procs.is_empty() {
-                style::section_label(ui, &format!("Background processes · {}", bg_procs.len()), p);
-                for proc in bg_procs {
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if style::link_button(ui, "Kill", p)
-                                .on_hover_text("Kill this background process")
-                                .clicked()
-                            {
-                                crate::tools::shell::kill_background_process(proc.pid);
-                            }
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!("{}", proc.pid))
-                                            .font(egui::FontId::monospace(11.0))
-                                            .color(p.faint),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&proc.command)
-                                                .font(egui::FontId::monospace(12.0))
-                                                .color(p.text),
-                                        )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(&proc.command);
-                                },
-                            );
-                        });
-                    });
-                }
-                ui.add_space(12.0);
+            self.draw_background_processes(ui, p);
+            self.draw_panel_tabs(ui, p);
+            match self.right_tab {
+                RightTab::Browser => self.draw_browser_tab(ui, p),
+                RightTab::Agents => self.draw_agents_tab(ui, p),
+                RightTab::Changed | RightTab::All => match self.selected_file.clone() {
+                    // An open file takes the whole panel; × goes back to the list.
+                    Some(filename) => self.draw_file_preview(ui, p, &filename),
+                    None => {
+                        let height = ui.available_height();
+                        if let Some(filename) = self.draw_file_list(ui, p, height) {
+                            self.inspect_file(&filename);
+                        }
+                    }
+                },
             }
+        });
+        if !right_animating && self.right_sidebar_open {
+            // Never let the panel crowd out the chat.
+            let max = (ctx.screen_rect().width() * 0.6).max(320.0);
+            self.right_sidebar_width = panel_response.response.rect.width().min(max);
+        }
+    }
 
-            // Tabs
+    /// Commands the agent left running, each with a way to stop it.
+    fn draw_background_processes(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let procs = crate::tools::shell::get_background_processes();
+        if procs.is_empty() {
+            return;
+        }
+        style::section_label(ui, &format!("Running · {}", procs.len()), p);
+        ui.add_space(2.0);
+        for proc in procs {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                let changed_label = format!("Changed  {}", self.session_written_files.len());
-                if style::nav_button(ui, &changed_label, self.right_tab == RightTab::Changed, p)
-                    .on_hover_text("Files created or changed in this chat")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::Changed;
+                ui.spacing_mut().item_spacing.x = 8.0;
+                style::dot(ui, p.success);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if style::link_button(ui, "Stop", p)
+                        .on_hover_text("Stop this background process")
+                        .clicked()
+                    {
+                        crate::tools::shell::kill_background_process(proc.pid);
+                    }
+                    ui.label(
+                        egui::RichText::new(proc.pid.to_string())
+                            .font(egui::FontId::monospace(11.0))
+                            .color(p.faint),
+                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&proc.command)
+                                    .font(egui::FontId::monospace(12.0))
+                                    .color(p.text),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&proc.command);
+                    });
+                });
+            });
+        }
+        ui.add_space(14.0);
+    }
+
+    /// The panel's sections as one segmented control.
+    fn draw_panel_tabs(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let tabs = [
+            RightTab::Changed,
+            RightTab::All,
+            RightTab::Browser,
+            RightTab::Agents,
+        ];
+        let changes = self.session_written_files.len();
+        let running = self.subagents.iter().filter(|s| s.running()).count();
+        let items = [
+            ("Changes", (changes > 0).then(|| changes.to_string())),
+            ("Files", None),
+            (
+                "Browser",
+                crate::tools::browser::is_open().then(|| "●".to_string()),
+            ),
+            (
+                "Agents",
+                if running > 0 {
+                    Some(running.to_string())
+                } else {
+                    (!self.subagents.is_empty()).then(|| self.subagents.len().to_string())
+                },
+            ),
+        ];
+        let selected = tabs.iter().position(|t| *t == self.right_tab).unwrap_or(0);
+        if let Some(i) = style::segmented(ui, &items, selected, p) {
+            if tabs[i] == self.right_tab && self.selected_file.is_some() {
+                // Clicking the current tab again leaves an open file.
+                self.selected_file = None;
+            }
+            self.right_tab = tabs[i];
+        }
+        ui.add_space(10.0);
+    }
+
+    /// The Changes or Files tree, `list_h` tall at most. Returns a clicked file.
+    fn draw_file_list(&mut self, ui: &mut egui::Ui, p: &Palette, list_h: f32) -> Option<String> {
+        let top = ui.cursor().top();
+        let time = ui.input(|i| i.time) as f32;
+        let selected = self.selected_file.clone();
+
+        // Live diff counts for the file being written, persisted counts otherwise.
+        let writing_file = self
+            .current_writing_file
+            .as_ref()
+            .filter(|_| self.current_writing_status.as_deref() == Some("writing"))
+            .map(|(f, _, _)| f.clone());
+        let live = self.current_writing_file.clone();
+        let stats = &self.file_diff_stats;
+        let decor = |path: &str| -> FileDecor {
+            let (added, deleted) = match &live {
+                Some((f, a, d)) if f == path => (*a, *d),
+                _ => stats.get(path).copied().unwrap_or((0, 0)),
+            };
+            FileDecor {
+                writing: writing_file.as_deref() == Some(path),
+                added,
+                deleted,
+            }
+        };
+        if writing_file.is_some() {
+            ui.ctx().request_repaint();
+        }
+
+        match self.right_tab {
+            RightTab::Changed => {
+                let mut display_files = self.session_written_files.clone();
+                if let Some(ref active_file) = writing_file {
+                    if !active_file.is_empty() && !display_files.contains(active_file) {
+                        display_files.push(active_file.clone());
+                    }
                 }
-                let all_label = format!("All files  {}", self.workspace_files.len());
-                if style::nav_button(ui, &all_label, self.right_tab == RightTab::All, p)
-                    .on_hover_text("Browse the workspace")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::All;
+                if display_files.is_empty() {
+                    empty_hint(
+                        ui,
+                        "No changes yet",
+                        "Files the agent creates or edits in this chat appear here as it writes them.",
+                        p,
+                    );
+                    return None;
                 }
-                if self.right_tab == RightTab::All && !self.expanded_dirs.is_empty() {
+
+                let (added, deleted) = display_files.iter().fold((0, 0), |(a, d), f| {
+                    let x = decor(f);
+                    (a + x.added, d + x.deleted)
+                });
+                ui.horizontal(|ui| {
+                    let n = display_files.len();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{n} file{} changed",
+                            if n == 1 { "" } else { "s" }
+                        ))
+                        .size(12.0)
+                        .color(p.dim),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if style::link_button(ui, "Collapse", p)
-                            .on_hover_text("Collapse all folders")
-                            .clicked()
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        // Right-to-left: deletions first so they read "+a −d".
+                        for (n, sign, color) in [(deleted, '-', p.danger), (added, '+', p.success)]
                         {
+                            if n > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!("{sign}{n}"))
+                                        .font(egui::FontId::monospace(11.5))
+                                        .color(color),
+                                );
+                            }
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+
+                let used = ui.cursor().top() - top;
+                let mut clicked = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("workspace_file_list")
+                    .max_height((list_h - used).max(60.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for path in &display_files {
+                            let row = change_row(
+                                ui,
+                                path,
+                                decor(path),
+                                selected.as_deref() == Some(path),
+                                p,
+                                time,
+                            );
+                            if row.on_hover_text(path.as_str()).clicked() {
+                                clicked = Some(path.clone());
+                            }
+                        }
+                    });
+                clicked
+            }
+            RightTab::Browser | RightTab::Agents => None,
+            RightTab::All => {
+                style::search_field(ui, &mut self.file_filter, "Search files", p);
+                if !self.expanded_dirs.is_empty() && self.file_filter.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if style::link_button(ui, "Collapse all", p).clicked() {
                             self.expanded_dirs.clear();
                         }
                     });
                 }
-            });
-            ui.add_space(6.0);
-
-            let list_h = if self.selected_file.is_some() {
-                (ui.available_height() * 0.42).max(120.0)
-            } else {
-                ui.available_height()
-            };
-            let mut file_to_inspect = None;
-            let time = ui.input(|i| i.time) as f32;
-            let selected = self.selected_file.clone();
-
-            // Live diff counts for the file being written, persisted counts otherwise.
-            let writing_file = self
-                .current_writing_file
-                .as_ref()
-                .filter(|_| self.current_writing_status.as_deref() == Some("writing"))
-                .map(|(f, _, _)| f.clone());
-            let live = self.current_writing_file.clone();
-            let stats = &self.file_diff_stats;
-            let decor = |path: &str| -> FileDecor {
-                let (added, deleted) = match &live {
-                    Some((f, a, d)) if f == path => (*a, *d),
-                    _ => stats.get(path).copied().unwrap_or((0, 0)),
-                };
-                FileDecor {
-                    writing: writing_file.as_deref() == Some(path),
-                    added,
-                    deleted,
-                }
-            };
-            if writing_file.is_some() {
-                ui.ctx().request_repaint();
-            }
-
-            match self.right_tab {
-                RightTab::Changed => {
-                    let mut display_files = self.session_written_files.clone();
-                    if let Some(ref active_file) = writing_file {
-                        if !active_file.is_empty() && !display_files.contains(active_file) {
-                            display_files.push(active_file.clone());
-                        }
-                    }
-
-                    if display_files.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Files the agent creates or edits in this chat show up here, live.",
-                            )
-                            .size(12.5)
-                            .color(p.faint),
-                        );
-                    } else {
-                        let tree = FileTree::build(&display_files);
-                        let mut view = TreeView {
-                            expanded: &mut self.expanded_dirs,
-                            force_open: true,
-                            selected: selected.as_deref(),
-                            decor: &decor,
-                            clicked: None,
-                            p,
-                            time,
-                        };
-                        egui::ScrollArea::vertical()
-                            .id_salt("workspace_file_list")
-                            .max_height(list_h)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                draw_tree(ui, &tree, "", 0, &mut view);
-                            });
-                        file_to_inspect = view.clicked.take();
-                    }
-                }
-                RightTab::All => {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.file_filter)
-                            .hint_text("Filter files")
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.add_space(4.0);
-                    if self.file_tree_dirty || self.file_tree_filter != self.file_filter {
-                        let query = self.file_filter.to_lowercase();
-                        self.file_tree = FileTree::build(
-                            self.workspace_files
-                                .iter()
-                                .filter(|f| query.is_empty() || f.to_lowercase().contains(&query)),
-                        );
-                        self.file_tree_filter = self.file_filter.clone();
-                        self.file_tree_dirty = false;
-                    }
-                    if self.is_loading_files && self.workspace_files.is_empty() {
-                        ui.label(egui::RichText::new("Scanning…").size(12.5).color(p.faint));
-                    } else if self.file_tree.is_empty() {
-                        ui.label(
-                            egui::RichText::new("No matching files")
-                                .size(12.5)
-                                .color(p.faint),
-                        );
-                    } else {
-                        let mut view = TreeView {
-                            expanded: &mut self.expanded_dirs,
-                            force_open: !self.file_filter.is_empty(),
-                            selected: selected.as_deref(),
-                            decor: &decor,
-                            clicked: None,
-                            p,
-                            time,
-                        };
-                        let tree = &self.file_tree;
-                        egui::ScrollArea::vertical()
-                            .id_salt("all_files_list")
-                            .max_height((list_h - 34.0).max(80.0))
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                draw_tree(ui, tree, "", 0, &mut view);
-                            });
-                        file_to_inspect = view.clicked.take();
-                    }
-                }
-            }
-
-            if let Some(filename) = file_to_inspect {
-                self.inspect_file(&filename);
-            }
-
-            if let Some(filename) = self.selected_file.clone() {
                 ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        if style::link_button(ui, "Close", p)
-                            .on_hover_text("Close preview")
-                            .clicked()
-                        {
-                            self.selected_file = None;
-                            self.inspected_file_content.clear();
-                            self.inspector_error = None;
-                        }
-                        if style::link_button(ui, "Open", p)
-                            .on_hover_text("Open in the default app")
-                            .clicked()
-                        {
-                            let _ = open::that(self.settings.project_root.join(&filename));
-                        }
-                        if style::link_button(ui, "Copy path", p).clicked() {
-                            ui.ctx().copy_text(filename.clone());
-                        }
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&filename)
-                                        .font(egui::FontId::monospace(12.0))
-                                        .color(p.text),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(&filename);
-                        });
-                    });
-                });
+                if self.file_tree_dirty || self.file_tree_filter != self.file_filter {
+                    let query = self.file_filter.to_lowercase();
+                    self.file_tree = FileTree::build(
+                        self.workspace_files
+                            .iter()
+                            .filter(|f| query.is_empty() || f.to_lowercase().contains(&query)),
+                    );
+                    self.file_tree_filter = self.file_filter.clone();
+                    self.file_tree_dirty = false;
+                }
+                if self.is_loading_files && self.workspace_files.is_empty() {
+                    empty_hint(ui, "Scanning…", "", p);
+                    return None;
+                }
+                if self.file_tree.is_empty() {
+                    let hint = if self.file_filter.is_empty() {
+                        "This folder has no files yet."
+                    } else {
+                        "Nothing matches that search."
+                    };
+                    empty_hint(ui, "No files", hint, p);
+                    return None;
+                }
 
-                if let Some((ref live_file, added, deleted)) = self.current_writing_file {
-                    if *live_file == filename
-                        && self.current_writing_status.as_deref() == Some("writing")
-                    {
+                let used = ui.cursor().top() - top;
+                let mut view = TreeView {
+                    expanded: &mut self.expanded_dirs,
+                    force_open: !self.file_filter.is_empty(),
+                    selected: selected.as_deref(),
+                    decor: &decor,
+                    clicked: None,
+                    p,
+                    time,
+                };
+                let tree = &self.file_tree;
+                egui::ScrollArea::vertical()
+                    .id_salt("all_files_list")
+                    .max_height((list_h - used).max(60.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        draw_tree(ui, tree, "", 0, &mut view);
+                    });
+                view.clicked.take()
+            }
+        }
+    }
+
+    /// The selected file as a card: name and actions, view options, contents.
+    fn draw_file_preview(&mut self, ui: &mut egui::Ui, p: &Palette, filename: &str) {
+        let (dir, name) = filename.rsplit_once(['/', '\\']).unwrap_or(("", filename));
+        let is_active_writing = self
+            .current_writing_file
+            .as_ref()
+            .is_some_and(|(f, _, _)| f == filename);
+        let writing_counts = self
+            .current_writing_file
+            .as_ref()
+            .filter(|(f, _, _)| {
+                f == filename && self.current_writing_status.as_deref() == Some("writing")
+            })
+            .map(|(_, a, d)| (*a, *d));
+
+        egui::Frame::none()
+            .fill(p.code_bg)
+            .stroke(egui::Stroke::new(1.0_f32, p.border))
+            .rounding(8.0)
+            .show(ui, |ui| {
+                egui::Frame::none()
+                    .inner_margin(egui::Margin {
+                        left: 10.0,
+                        right: 4.0,
+                        top: 6.0,
+                        bottom: 8.0,
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if style::close_button(ui, p)
+                                        .on_hover_text("Close preview")
+                                        .clicked()
+                                    {
+                                        self.selected_file = None;
+                                        self.inspected_file_content.clear();
+                                        self.inspector_error = None;
+                                    }
+                                    if style::link_button(ui, "Open", p)
+                                        .on_hover_text("Open in the default app")
+                                        .clicked()
+                                    {
+                                        let _ =
+                                            open::that(self.settings.project_root.join(filename));
+                                    }
+                                    if style::link_button(ui, "Copy path", p).clicked() {
+                                        ui.ctx().copy_text(filename.to_string());
+                                    }
+                                    if is_raster_image(filename)
+                                        && style::link_button(ui, "Copy image", p)
+                                            .on_hover_text("Copy the picture to paste it elsewhere")
+                                            .clicked()
+                                    {
+                                        let path = self.settings.project_root.join(filename);
+                                        self.status_text = match copy_image_to_clipboard(&path) {
+                                            Ok(()) => "Image copied".to_string(),
+                                            Err(e) => format!("Couldn't copy the image: {e}"),
+                                        };
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(name)
+                                                        .font(style::strong(13.0))
+                                                        .color(p.text),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(filename);
+                                        },
+                                    );
+                                },
+                            );
+                        });
+
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            style::dot(ui, p.accent);
-                            ui.label(
-                                egui::RichText::new("Agent is writing this file")
-                                    .size(12.0)
-                                    .color(p.accent),
-                            );
-                            diff_counts(ui, added, deleted, p);
+                            if let Some((added, deleted)) = writing_counts {
+                                style::dot(ui, p.accent);
+                                ui.label(
+                                    egui::RichText::new("Agent is writing")
+                                        .size(11.5)
+                                        .color(p.accent),
+                                );
+                                diff_counts(ui, added, deleted, p);
+                            } else {
+                                let location = if dir.is_empty() {
+                                    "Project root".to_string()
+                                } else {
+                                    format!("{dir}/")
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(location).size(11.5).color(p.faint),
+                                    )
+                                    .truncate(),
+                                );
+                            }
                         });
-                    }
-                }
-                ui.horizontal_wrapped(|ui| {
-                    let mut filter = self.line_range_enabled;
-                    if ui.checkbox(&mut filter, "Lines").changed() {
-                        self.line_range_enabled = filter;
-                        if filter && self.line_range_end == 0 {
-                            self.line_range_end = self.line_range_total_lines.min(100);
-                        }
-                        self.inspect_file(&filename);
-                    }
-                    if self.line_range_enabled {
-                        let mut start = self.line_range_start;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut start)
-                                    .range(1..=self.line_range_total_lines.max(1)),
-                            )
-                            .changed()
-                        {
-                            self.line_range_start = start;
-                            self.inspect_file(&filename);
-                        }
-                        ui.label(egui::RichText::new("to").color(p.dim));
-                        let mut end = self.line_range_end;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut end)
-                                    .range(1..=self.line_range_total_lines.max(1)),
-                            )
-                            .changed()
-                        {
-                            self.line_range_end = end;
-                            self.inspect_file(&filename);
-                        }
-                    }
-                    ui.add_space(8.0);
-                    let mut edits = self.manual_edits_enabled;
-                    if ui.checkbox(&mut edits, "Edit").changed() {
-                        self.manual_edits_enabled = edits;
-                        if !edits {
-                            self.inspected_file_edited = false;
-                            self.inspect_file(&filename);
-                        }
-                    }
-                    if self.manual_edits_enabled && style::primary_button(ui, "Save", p).clicked() {
-                        if let Err(e) = self.save_inspected_file_changes() {
-                            self.inspector_error = Some(format!("Failed to save: {e}"));
-                        } else {
-                            self.status_text = "Saved!".to_string();
-                        }
-                    }
-                });
-                ui.add_space(4.0);
+                        ui.add_space(4.0);
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if style::chip(ui, "Lines", self.line_range_enabled, p)
+                                .on_hover_text("Show only a range of lines")
+                                .clicked()
+                            {
+                                self.line_range_enabled = !self.line_range_enabled;
+                                if self.line_range_enabled && self.line_range_end == 0 {
+                                    self.line_range_end = self.line_range_total_lines.min(100);
+                                }
+                                self.inspect_file(filename);
+                            }
+                            if self.line_range_enabled {
+                                let max = self.line_range_total_lines.max(1);
+                                let mut start = self.line_range_start;
+                                if ui
+                                    .add(egui::DragValue::new(&mut start).range(1..=max))
+                                    .changed()
+                                {
+                                    self.line_range_start = start;
+                                    self.inspect_file(filename);
+                                }
+                                ui.label(egui::RichText::new("to").size(11.5).color(p.faint));
+                                let mut end = self.line_range_end;
+                                if ui
+                                    .add(egui::DragValue::new(&mut end).range(1..=max))
+                                    .changed()
+                                {
+                                    self.line_range_end = end;
+                                    self.inspect_file(filename);
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "of {}",
+                                        self.line_range_total_lines
+                                    ))
+                                    .size(11.5)
+                                    .color(p.faint),
+                                );
+                            }
+                            if style::chip(ui, "Edit", self.manual_edits_enabled, p)
+                                .on_hover_text("Edit this file by hand")
+                                .clicked()
+                            {
+                                self.manual_edits_enabled = !self.manual_edits_enabled;
+                                if !self.manual_edits_enabled {
+                                    self.inspected_file_edited = false;
+                                    self.inspect_file(filename);
+                                }
+                            }
+                            if self.manual_edits_enabled {
+                                let save = if self.inspected_file_edited {
+                                    style::primary_button(ui, "Save", p)
+                                } else {
+                                    style::secondary_button(ui, "Save", p)
+                                };
+                                if save.clicked() {
+                                    if let Err(e) = self.save_inspected_file_changes() {
+                                        self.inspector_error = Some(format!("Failed to save: {e}"));
+                                    } else {
+                                        self.status_text = "Saved!".to_string();
+                                    }
+                                }
+                            }
+                        });
+                    });
+
+                ui.painter().hline(
+                    ui.max_rect().x_range(),
+                    ui.cursor().top(),
+                    egui::Stroke::new(1.0_f32, p.border),
+                );
 
                 if let Some(error) = &self.inspector_error {
-                    ui.label(egui::RichText::new(error).size(12.0).color(p.danger));
-                } else {
-                    let is_active_writing = self
-                        .current_writing_file
-                        .as_ref()
-                        .is_some_and(|(name, _, _)| Some(name) == self.selected_file.as_ref());
-
-                    let active_range = self.get_active_editing_range();
-                    let is_active_file = self.selected_file.as_ref().is_some()
-                        && self.selected_file.as_ref()
-                            == self.current_writing_file.as_ref().map(|(n, _, _)| n);
-
                     egui::Frame::none()
-                        .fill(p.code_bg)
-                        .stroke(egui::Stroke::new(1.0_f32, p.border))
-                        .rounding(8.0)
-                        .inner_margin(egui::Margin::same(8.0))
+                        .inner_margin(egui::Margin::symmetric(10.0, 10.0))
                         .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                style::dot(ui, p.danger);
+                                ui.label(egui::RichText::new(error).size(12.0).color(p.dim));
+                            });
+                        });
+                    return;
+                }
+
+                egui::Frame::none()
+                    .inner_margin(egui::Margin {
+                        left: 0.0,
+                        right: 4.0,
+                        top: 4.0,
+                        bottom: 4.0,
+                    })
+                    .show(ui, |ui| {
+                        if self.manual_edits_enabled {
                             egui::ScrollArea::both()
                                 .id_salt("inline_file_inspector")
                                 .auto_shrink([false, false])
                                 .stick_to_bottom(is_active_writing)
                                 .show(ui, |ui| {
-                                    if self.manual_edits_enabled {
-                                        let edit_resp = ui.add(
-                                            egui::TextEdit::multiline(
-                                                &mut self.inspected_file_content,
-                                            )
+                                    ui.add_space(2.0);
+                                    let edit = ui.add(
+                                        egui::TextEdit::multiline(&mut self.inspected_file_content)
                                             .font(egui::TextStyle::Monospace)
                                             .frame(false)
+                                            .margin(egui::Margin::symmetric(10.0, 2.0))
                                             .desired_width(f32::INFINITY)
                                             .interactive(true),
-                                        );
-                                        if edit_resp.changed() {
-                                            self.inspected_file_edited = true;
-                                        }
-                                    } else {
-                                        let lines: Vec<&str> =
-                                            self.inspected_file_content.lines().collect();
-                                        ui.vertical(|ui| {
-                                            ui.spacing_mut().item_spacing.y = 1.0;
-                                            let start_line_num = if self.line_range_enabled {
-                                                self.line_range_start
-                                            } else {
-                                                1
-                                            };
-                                            let mono = egui::FontId::monospace(11.5);
-                                            for (idx, line_content) in lines.iter().enumerate() {
-                                                let line_num = start_line_num + idx;
-                                                let is_highlighted = is_active_file
-                                                    && active_range.is_some_and(|(start, end)| {
-                                                        line_num >= start && line_num <= end
-                                                    });
-
-                                                let response = ui
-                                                    .horizontal(|ui| {
-                                                        if is_highlighted {
-                                                            let rect = ui.max_rect();
-                                                            ui.painter().rect_filled(
-                                                                rect,
-                                                                0.0,
-                                                                p.accent_soft,
-                                                            );
-                                                        }
-                                                        ui.label(
-                                                            egui::RichText::new(format!(
-                                                                "{:>4}  ",
-                                                                line_num
-                                                            ))
-                                                            .font(mono.clone())
-                                                            .color(if is_highlighted {
-                                                                p.accent
-                                                            } else {
-                                                                p.faint
-                                                            }),
-                                                        );
-                                                        ui.label(
-                                                            egui::RichText::new(*line_content)
-                                                                .font(mono.clone())
-                                                                .color(p.text),
-                                                        )
-                                                    })
-                                                    .response;
-
-                                                if is_active_file {
-                                                    if let Some((start, _)) = active_range {
-                                                        if self.should_scroll_to_line == Some(start)
-                                                            && line_num == start
-                                                        {
-                                                            response.scroll_to_me(Some(
-                                                                egui::Align::Center,
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        });
+                                    );
+                                    if edit.changed() {
+                                        self.inspected_file_edited = true;
                                     }
                                 });
-                        });
+                        } else {
+                            self.draw_code_lines(ui, p, is_active_writing);
+                        }
+                    });
+            });
+    }
+
+    /// Read-only file contents with a line-number gutter. Only the visible rows
+    /// are laid out, so long files scroll smoothly.
+    fn draw_code_lines(&self, ui: &mut egui::Ui, p: &Palette, stick_to_bottom: bool) {
+        let lines: Vec<&str> = self.inspected_file_content.lines().collect();
+        if lines.is_empty() {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Empty file").size(12.0).color(p.faint));
+            });
+            return;
+        }
+        let first_line = if self.line_range_enabled {
+            self.line_range_start
+        } else {
+            1
+        };
+        let mono = egui::FontId::monospace(11.5);
+        let row_h = ui.fonts(|f| f.row_height(&mono)) + 3.0;
+        let digits = (first_line + lines.len()).to_string().len().max(2);
+        let gutter = digits as f32 * ui.fonts(|f| f.glyph_width(&mono, '0')) + 22.0;
+
+        let active_range = self.get_active_editing_range();
+        let is_active_file = self.selected_file.is_some()
+            && self.selected_file.as_ref() == self.current_writing_file.as_ref().map(|(n, _, _)| n);
+
+        ui.spacing_mut().item_spacing.y = 0.0;
+        // Measured outside: a two-way scroll area reports unlimited width inside.
+        let view_w = ui.available_width();
+        let mut area = egui::ScrollArea::both()
+            .id_salt("inline_file_inspector")
+            .auto_shrink([false, false])
+            .stick_to_bottom(stick_to_bottom);
+        // Bring the range the agent is editing into view, once per change.
+        if let (true, Some((start, _))) = (is_active_file, active_range) {
+            if self.should_scroll_to_line == Some(start)
+                && (first_line..first_line + lines.len()).contains(&start)
+            {
+                let y = (start - first_line) as f32 * row_h - ui.available_height() / 2.0;
+                area = area.vertical_scroll_offset(y.max(0.0));
+            }
+        }
+        area.show_rows(ui, row_h, lines.len(), |ui, rows| {
+            for idx in rows {
+                let line_num = first_line + idx;
+                let highlighted = is_active_file
+                    && active_range
+                        .is_some_and(|(start, end)| line_num >= start && line_num <= end);
+                let galley = ui.painter().layout_no_wrap(
+                    lines[idx].replace('\t', "    "),
+                    mono.clone(),
+                    p.text,
+                );
+                let width = (gutter + galley.size().x + 12.0).max(view_w);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::hover());
+                let painter = ui.painter();
+                if highlighted {
+                    painter.rect_filled(rect, 0.0, p.accent_soft);
                 }
+                painter.text(
+                    egui::pos2(rect.left() + gutter - 12.0, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    line_num.to_string(),
+                    mono.clone(),
+                    if highlighted { p.accent } else { p.faint },
+                );
+                painter.galley(
+                    egui::pos2(
+                        rect.left() + gutter,
+                        rect.center().y - galley.size().y / 2.0,
+                    ),
+                    galley,
+                    p.text,
+                );
             }
         });
-        if !right_animating && self.right_sidebar_open {
-            self.right_sidebar_width = panel_response.response.rect.width();
-        }
     }
 
     fn draw_composer(&mut self, ctx: &egui::Context, p: &Palette) {
@@ -3578,6 +4046,10 @@ impl GuiApp {
         // Tool approval card, right above the message box
         let mut user_response = None;
         if let Some(approval) = &self.approval_pending {
+            let asking_agent = self
+                .approval_agent
+                .as_deref()
+                .map(|id| self.subagent_name(id).unwrap_or(id).to_string());
             let tool_name = approval.tool_name.clone();
             let args_preview = approval.args_preview.clone();
 
@@ -3632,8 +4104,12 @@ impl GuiApp {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         style::dot(ui, p.warn);
+                        let question = match asking_agent.as_deref() {
+                            Some(name) => format!("Sub-agent '{name}' wants to run a tool"),
+                            None => "Allow this tool call?".to_string(),
+                        };
                         ui.label(
-                            egui::RichText::new("Allow this tool call?")
+                            egui::RichText::new(question)
                                 .font(style::strong(13.0))
                                 .color(p.text),
                         );
@@ -3679,38 +4155,47 @@ impl GuiApp {
         }
 
         if let Some(approved) = user_response {
-            if let Some(_approval) = self.approval_pending.take() {
-                let _ = self.approval_tx.send(approved);
-            }
+            self.answer_approval(approved);
         }
 
-        // Attachment chip
-        let mut remove_attachment = false;
-        if let Some(ref path) = self.attached_image {
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-            ui.horizontal(|ui| {
-                egui::Frame::none()
-                    .fill(p.surface)
-                    .stroke(egui::Stroke::new(1.0_f32, p.border))
-                    .rounding(6.0)
-                    .inner_margin(egui::Margin::symmetric(8.0, 2.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.label(egui::RichText::new(filename).size(12.0).color(p.text));
-                            if style::link_button(ui, "×", p)
-                                .on_hover_text("Remove attachment")
-                                .clicked()
-                            {
-                                remove_attachment = true;
-                            }
+        // Attachment chips
+        let mut remove_attachment = None;
+        let mut clear_attachments = false;
+        if !self.attachments.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                for (idx, path) in self.attachments.iter().enumerate() {
+                    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                    egui::Frame::none()
+                        .fill(p.surface)
+                        .stroke(egui::Stroke::new(1.0_f32, p.border))
+                        .rounding(6.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.label(egui::RichText::new(filename).size(12.0).color(p.text))
+                                    .on_hover_text(path.to_string_lossy());
+                                if style::link_button(ui, "×", p)
+                                    .on_hover_text("Remove attachment")
+                                    .clicked()
+                                {
+                                    remove_attachment = Some(idx);
+                                }
+                            });
                         });
-                    });
+                }
+                if self.attachments.len() > 1 && style::link_button(ui, "Remove all", p).clicked() {
+                    clear_attachments = true;
+                }
             });
             ui.add_space(4.0);
         }
-        if remove_attachment {
-            self.attached_image = None;
+        if let Some(idx) = remove_attachment {
+            self.attachments.remove(idx);
+        }
+        if clear_attachments {
+            self.attachments.clear();
         }
 
         // Message box
@@ -3785,12 +4270,18 @@ impl GuiApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.style_mut().spacing.interact_size.y = 24.0;
-                    if attachment_button(ui, p).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            self.attached_image = Some(path);
-                            self.status_text = "File attached!".to_string();
+                    let attach = attachment_button(ui, p);
+                    if attach.clicked() {
+                        if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                            self.add_attachments(paths);
                         }
                     }
+                    attach.context_menu(|ui| {
+                        if ui.button("Paste image or files").clicked() {
+                            self.paste_clipboard_media(true);
+                            ui.close_menu();
+                        }
+                    });
 
                     let registry = build_registry();
                     let mut current_provider_idx = registry
@@ -3957,7 +4448,9 @@ impl GuiApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let has_text = !self.input_text.trim().is_empty();
+                        // Attachments alone are enough to send.
+                        let has_text =
+                            !self.input_text.trim().is_empty() || !self.attachments.is_empty();
                         let send_hint = if self.is_processing {
                             "Queue this message  (Enter)"
                         } else {
@@ -4301,10 +4794,14 @@ impl GuiApp {
                                                 let msg_response = ui
                                                     .with_layout(egui::Layout::top_down(alignment), |ui| {
                                                         if is_user {
-                                                            if let Some(ref img_path) = msg.attached_image {
-                                                                let filename = img_path.file_name().and_then(|n| n.to_str()).unwrap_or("image.png");
+                                                            if !msg.attachments.is_empty() {
+                                                                let names: Vec<&str> = msg
+                                                                    .attachments
+                                                                    .iter()
+                                                                    .map(|f| f.file_name().and_then(|n| n.to_str()).unwrap_or("file"))
+                                                                    .collect();
                                                                 ui.label(
-                                                                    egui::RichText::new(format!("Attached {filename}"))
+                                                                    egui::RichText::new(format!("Attached {}", names.join(" · ")))
                                                                         .size(11.5)
                                                                         .color(p.faint),
                                                                 );
@@ -4413,77 +4910,68 @@ impl GuiApp {
                                                     || msg_response.hovered();
 
                                                 if is_user {
-                                                    ui.allocate_ui_with_layout(
-                                                        egui::vec2(ui.available_width(), 22.0),
-                                                        egui::Layout::top_down(egui::Align::LEFT),
+                                                    message_action_row(
+                                                        ui,
+                                                        egui::Layout::right_to_left(egui::Align::Center),
                                                         |ui| {
-                                                            ui.set_height(22.0);
-                                                            if is_hovered {
-                                                                ui.with_layout(
-                                                                    egui::Layout::right_to_left(egui::Align::Center),
-                                                                    |ui| {
-                                                                        ui.spacing_mut().item_spacing.x = 0.0;
-                                                                        if style::link_button(ui, "Copy", p).clicked() {
-                                                                            ui.ctx().copy_text(msg.content.clone());
-                                                                        }
-                                                                        if style::link_button(ui, "Edit", p)
-                                                                            .on_hover_text("Put this prompt back in the message box")
-                                                                            .clicked()
-                                                                        {
-                                                                            pending_action = Some(PendingAction::Edit(msg.content.clone()));
-                                                                        }
-                                                                        if style::link_button(ui, "Retry", p)
-                                                                            .on_hover_text("Send this prompt again")
-                                                                            .clicked()
-                                                                        {
-                                                                            pending_action = Some(PendingAction::Reroll(msg.content.clone()));
-                                                                        }
-                                                                        if style::link_button(ui, "Undo", p)
-                                                                            .on_hover_text("Undo the last tool change")
-                                                                            .clicked()
-                                                                        {
-                                                                            pending_action = Some(PendingAction::Undo);
-                                                                        }
-                                                                    },
-                                                                );
+                                                            if !is_hovered {
+                                                                return;
+                                                            }
+                                                            if style::link_button(ui, "Copy", p).clicked() {
+                                                                ui.ctx().copy_text(msg.content.clone());
+                                                            }
+                                                            if style::link_button(ui, "Edit", p)
+                                                                .on_hover_text("Put this prompt back in the message box")
+                                                                .clicked()
+                                                            {
+                                                                pending_action = Some(PendingAction::Edit(msg.content.clone()));
+                                                            }
+                                                            if style::link_button(ui, "Retry", p)
+                                                                .on_hover_text("Send this prompt again")
+                                                                .clicked()
+                                                            {
+                                                                pending_action = Some(PendingAction::Reroll(msg.content.clone()));
+                                                            }
+                                                            if style::link_button(ui, "Undo", p)
+                                                                .on_hover_text("Undo the last tool change")
+                                                                .clicked()
+                                                            {
+                                                                pending_action = Some(PendingAction::Undo);
                                                             }
                                                         },
                                                     );
                                                 } else if !continues[msg_idx] {
-                                                    ui.allocate_ui_with_layout(
-                                                        egui::vec2(ui.available_width(), 22.0),
-                                                        egui::Layout::top_down(egui::Align::LEFT),
+                                                    message_action_row(
+                                                        ui,
+                                                        egui::Layout::left_to_right(egui::Align::Center),
                                                         |ui| {
-                                                            ui.set_height(22.0);
-                                                            ui.horizontal(|ui| {
-                                                                ui.spacing_mut().item_spacing.x = 0.0;
-                                                                let is_latest_agent = Some(msg_idx) == last_agent_idx;
-                                                                if is_latest_agent && !self.is_processing {
-                                                                    draw_layered_logo_loader(
-                                                                        ui,
-                                                                        &self.last_layer_tex,
-                                                                        &self.middle_layer_tex,
-                                                                        &self.top_layer_tex,
-                                                                        false,
-                                                                        22.0,
-                                                                    );
-                                                                    ui.add_space(4.0);
+                                                            let is_latest_agent = Some(msg_idx) == last_agent_idx;
+                                                            if is_latest_agent && !self.is_processing {
+                                                                draw_layered_logo_loader(
+                                                                    ui,
+                                                                    &self.last_layer_tex,
+                                                                    &self.middle_layer_tex,
+                                                                    &self.top_layer_tex,
+                                                                    false,
+                                                                    22.0,
+                                                                );
+                                                                ui.add_space(4.0);
+                                                            }
+                                                            let in_progress = is_latest_agent && self.is_processing;
+                                                            if is_hovered && !in_progress {
+                                                                if style::link_button(ui, "Copy", p)
+                                                                    .on_hover_text("Copy this reply")
+                                                                    .clicked()
+                                                                {
+                                                                    ui.ctx().copy_text(reply_text(&self.messages, &shown, msg_idx));
                                                                 }
-                                                                if is_hovered {
-                                                                    if style::link_button(ui, "Copy", p)
-                                                                        .on_hover_text("Copy this reply")
-                                                                        .clicked()
-                                                                    {
-                                                                        ui.ctx().copy_text(reply_text(&self.messages, &shown, msg_idx));
-                                                                    }
-                                                                    if style::link_button(ui, "Undo", p)
-                                                                        .on_hover_text("Undo the last tool change")
-                                                                        .clicked()
-                                                                    {
-                                                                        pending_action = Some(PendingAction::Undo);
-                                                                    }
+                                                                if style::link_button(ui, "Undo", p)
+                                                                    .on_hover_text("Undo the last tool change")
+                                                                    .clicked()
+                                                                {
+                                                                    pending_action = Some(PendingAction::Undo);
                                                                 }
-                                                            });
+                                                            }
                                                         },
                                                     );
                                                 }
@@ -4641,18 +5129,22 @@ impl GuiApp {
     }
 
     fn draw_drop_overlay(&self, ctx: &egui::Context) {
-        let Some(hovered) = ctx.input(|i| {
-            i.raw
-                .hovered_files
-                .first()
-                .map(|f| f.path.as_ref().is_some_and(|p| p.is_dir()))
-        }) else {
+        let (total, dirs) = ctx.input(|i| {
+            let files = &i.raw.hovered_files;
+            let dirs = files
+                .iter()
+                .filter(|f| f.path.as_ref().is_some_and(|p| p.is_dir()))
+                .count();
+            (files.len(), dirs)
+        });
+        if total == 0 {
             return;
-        };
-        let message = if hovered {
-            "Drop to open this folder as the workspace"
-        } else {
-            "Drop to attach"
+        }
+        // Mirrors the drop handling in `update`.
+        let message = match total - dirs {
+            0 => "Drop to open this folder as the workspace".to_string(),
+            1 => "Drop to attach".to_string(),
+            n => format!("Drop to attach {n} files"),
         };
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -4674,6 +5166,21 @@ impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.ctx.is_none() {
             self.ctx = Some(ctx.clone());
+        }
+        // eframe shows the window only after its first frame, and Windows then
+        // leaves it inactive: the first click merely activated it. Take focus
+        // while it appears so it is usable (and movable) straight away.
+        if ctx.cumulative_pass_nr() < 4 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        // Windows sizes (and maximizes) the window after it appears; without a
+        // new frame the old, smaller picture stayed until the first click and
+        // left a strip of the window undrawn. Redraw for the first moments and
+        // on every size change.
+        let size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
+        if ctx.input(|i| i.time) < 2.0 || size != self.last_window_size {
+            self.last_window_size = size;
+            ctx.request_repaint();
         }
         let active_range = self.get_active_editing_range();
         if let Some((start, end)) = active_range {
@@ -4704,20 +5211,30 @@ impl eframe::App for GuiApp {
         self.poll_file_events(ctx);
         self.poll_capabilities();
 
-        // Dropped files are attached; a dropped folder becomes the workspace.
-        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            if path.is_dir() {
+        // Dropped files are all attached; a folder dropped on its own becomes
+        // the workspace.
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            let (dirs, files): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|p| p.is_dir());
+            if files.is_empty() {
+                let path = &dirs[0];
                 self.folder_input = path.to_string_lossy().to_string();
-                self.load_project_folder(&path, ctx.clone());
+                self.load_project_folder(path, ctx.clone());
             } else {
-                self.status_text = format!(
-                    "Attached: {}",
-                    path.file_name().and_then(|n| n.to_str()).unwrap_or("")
-                );
-                self.attached_image = Some(path);
+                self.add_attachments(files);
+                if !dirs.is_empty() {
+                    self.status_text.push_str(" (folders can't be attached)");
+                }
             }
         }
+
+        self.handle_media_paste(ctx);
 
         if self.applied_theme != Some(self.dark_mode) {
             style::apply(ctx, &self.pal(), self.dark_mode);
@@ -4737,7 +5254,13 @@ impl eframe::App for GuiApp {
         if self.show_terminal_panel {
             self.draw_terminal(ctx, &p);
         }
-        self.draw_conversation(ctx, &p);
+        self.draw_agents_strip(ctx, &p);
+        self.draw_subagent_split(ctx, &p);
+        if self.showing_subagent_alone() {
+            self.draw_subagent_central(ctx, &p);
+        } else {
+            self.draw_conversation(ctx, &p);
+        }
 
         if (self.show_settings_modal || self.show_shortcuts) && self.draw_modal_backdrop(ctx) {
             self.show_settings_modal = false;
@@ -4786,6 +5309,7 @@ pub fn run_gui(config: GuiConfig) -> Result<(), eframe::Error> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Norvexum")
+            .with_active(true)
             .with_inner_size([1100.0, 750.0])
             .with_icon(icon_data)
             .with_fullscreen(config.settings.fullscreen)
@@ -5711,6 +6235,22 @@ fn render_reasoning_block(
 }
 
 /// "✔ read main.rs" style row used for finished tool calls.
+/// The row under a message that holds its hover actions (Copy, Edit, ...).
+/// Its size is fixed and its contents are clipped to it, so the actions
+/// appearing on hover never move anything. In the chat, which sticks to the
+/// bottom, a row that grew on hover shifted the view, lost the hover and
+/// shrank again, flickering every frame.
+fn message_action_row(ui: &mut egui::Ui, layout: egui::Layout, add: impl FnOnce(&mut egui::Ui)) {
+    const HEIGHT: f32 = 22.0;
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), HEIGHT));
+    let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    row.set_clip_rect(rect.intersect(ui.clip_rect()));
+    row.spacing_mut().item_spacing.x = 0.0;
+    row.spacing_mut().interact_size.y = HEIGHT;
+    row.spacing_mut().button_padding.y = 2.0;
+    add(&mut row);
+}
+
 fn activity_row(ui: &mut egui::Ui, mark: &str, mark_color: egui::Color32, text: &str, p: &Palette) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
@@ -5855,6 +6395,42 @@ fn render_chronological_activity(
                     });
                 }
             }
+        } else if let Some(payload) = log.strip_prefix("AGENT_EVT|") {
+            // Payload: <started|done|stopped>|<name>|<task or summary>
+            let mut parts = payload.splitn(3, '|');
+            let (state, name, text) = (
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+            );
+            let (mark, color, verb) = match state {
+                "started" => ("◆", p.accent, "started"),
+                "done" => ("✓", p.success, "finished"),
+                _ => ("✕", p.danger, "stopped"),
+            };
+            let text = crate::util::truncate_chars(&text.replace('\n', " "), 160);
+            activity_row(
+                ui,
+                mark,
+                color,
+                &format!("Sub-agent {name} {verb} · {text}"),
+                p,
+            );
+        } else if let Some(payload) = log.strip_prefix("AGENT_MSG|") {
+            // Payload: <from>|<to>|<text>
+            let mut parts = payload.splitn(3, '|');
+            let (from, to, text) = (
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+            );
+            activity_row(
+                ui,
+                "↔",
+                p.accent,
+                &format!("{from} → {to}: {}", text.replace('\n', " ")),
+                p,
+            );
         } else if let Some(warning) = log.strip_prefix("⚠️ ") {
             // Errors are already appended to the message body.
             if !warning.starts_with("Error:") {
@@ -5935,6 +6511,66 @@ fn render_chronological_activity(
     }
 }
 
+/// Whether the V key is held right now (the paste key with Ctrl).
+#[cfg(windows)]
+fn paste_key_down() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
+    const VK_V: i32 = 0x56;
+    // The high bit is set while the key is down.
+    unsafe { GetAsyncKeyState(VK_V) < 0 }
+}
+
+/// Elsewhere media can be pasted from the paperclip's right-click menu.
+#[cfg(not(windows))]
+fn paste_key_down() -> bool {
+    false
+}
+
+/// Images the `image` crate can decode (for copying them to the clipboard).
+fn is_raster_image(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+fn copy_image_to_clipboard(path: &std::path::Path) -> Result<(), String> {
+    let image = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
+    let (width, height) = image.dimensions();
+    arboard::Clipboard::new()
+        .and_then(|mut cb| {
+            cb.set_image(arboard::ImageData {
+                width: width as usize,
+                height: height as usize,
+                bytes: std::borrow::Cow::Owned(image.into_raw()),
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Save a pasted clipboard image as a PNG in `.norvexum/attachments/`.
+fn save_pasted_image(
+    project_root: &std::path::Path,
+    image: &arboard::ImageData,
+) -> Result<std::path::PathBuf, String> {
+    let buffer = image::RgbaImage::from_raw(
+        image.width as u32,
+        image.height as u32,
+        image.bytes.to_vec(),
+    )
+    .ok_or("the clipboard image has an unexpected size")?;
+    let name = format!(
+        "pasted-{}.png",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let path = attachment_destination(project_root, std::path::Path::new(&name));
+    buffer.save(&path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 /// Where an attached file is placed so the sandboxed agent can read it.
 /// Files already inside the project are used in place; others are copied to
 /// `.norvexum/attachments/` under a name that never overwrites anything.
@@ -6007,8 +6643,32 @@ mod tests {
             thinking: None,
             is_thinking_done: true,
             tool_logs: tool_logs.iter().map(|s| s.to_string()).collect(),
-            attached_image: None,
+            attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pasted_images_are_saved_as_attachments() {
+        let root = std::env::temp_dir().join(format!("norvexum_paste_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let pixels = [
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let image = arboard::ImageData {
+            width: 2,
+            height: 2,
+            bytes: std::borrow::Cow::Borrowed(&pixels),
+        };
+        let first = save_pasted_image(&root, &image).unwrap();
+        let second = save_pasted_image(&root, &image).unwrap();
+        assert_ne!(first, second, "a second paste must not overwrite the first");
+        assert!(first.starts_with(root.join(".norvexum").join("attachments")));
+        let decoded = image::open(&first).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.get_pixel(1, 0).0, [0, 255, 0, 255]);
+        assert!(is_raster_image(&first.to_string_lossy()));
+        assert!(!is_raster_image("notes.txt"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

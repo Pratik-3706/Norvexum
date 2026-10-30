@@ -9,7 +9,7 @@
 //   • `events`      — everything the agent reports back
 // ===========================================================================
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -178,6 +178,7 @@ pub async fn run_headless(mut handle: AgentHandle, opts: HeadlessOptions) -> Res
     let mut ctrl_c_armed = false;
     let mut run_failed = false;
     let mut at_line_start = true;
+    let mut subagents: HashMap<String, SubAgentLog> = HashMap::new();
 
     if interactive && !opts.one_shot {
         eprintln!("Norvexum headless chat — type a message, `exit` to quit, Ctrl+C to stop a run.");
@@ -224,8 +225,7 @@ pub async fn run_headless(mut handle: AgentHandle, opts: HeadlessOptions) -> Res
                         eprintln!("\x1b[31merror: {e}\x1b[0m");
                     }
                     AgentEvent::ApprovalRequest { tool_name, args_preview, .. } => {
-                        let approved = opts.auto_approve
-                            || !headless_should_deny(&tool_name, &args_preview);
+                        let approved = headless_approval(&opts, &tool_name, &args_preview);
                         eprintln!(
                             "\x1b[33m{} {tool_name}: {}\x1b[0m",
                             if approved { "auto-approved" } else { "denied (use --yes to allow)" },
@@ -260,6 +260,38 @@ pub async fn run_headless(mut handle: AgentHandle, opts: HeadlessOptions) -> Res
                             prompt();
                         }
                     }
+                    AgentEvent::SubAgentStarted { id, name, .. } => {
+                        if !at_line_start {
+                            println!();
+                            at_line_start = true;
+                        }
+                        eprintln!("\x1b[35m▸ sub-agent {name} started\x1b[0m");
+                        subagents.insert(id, SubAgentLog::new(name));
+                    }
+                    AgentEvent::SubAgent { id, event } => {
+                        let log = subagents
+                            .entry(id.clone())
+                            .or_insert_with(|| SubAgentLog::new(id.clone()));
+                        if let Some(approved) = log.print(*event, &opts) {
+                            crate::agent::subagent::respond_approval(&id, approved);
+                        }
+                    }
+                    AgentEvent::SubAgentFinished { id, success, summary } => {
+                        let (name, took) = subagents
+                            .remove(&id)
+                            .map(|l| (l.name, crate::ui::format_duration(l.started.elapsed())))
+                            .unwrap_or_else(|| (id.clone(), String::new()));
+                        if success {
+                            eprintln!("\x1b[35m▸ sub-agent {name} finished\x1b[0m\x1b[2m {took}\x1b[0m");
+                        } else {
+                            let first = summary.lines().next().unwrap_or_default();
+                            eprintln!(
+                                "\x1b[31m▸ sub-agent {name} failed: {}\x1b[0m",
+                                crate::util::truncate_chars(first, 160)
+                            );
+                        }
+                    }
+                    AgentEvent::AgentMessage { from, to, text } => print_agent_message(&from, &to, &text),
                     AgentEvent::Quit => break,
                     _ => {}
                 }
@@ -306,6 +338,102 @@ pub async fn run_headless(mut handle: AgentHandle, opts: HeadlessOptions) -> Res
         eyre::bail!("the request failed (see the error above)");
     }
     Ok(())
+}
+
+/// One dim line for a message between agents: `tests → main: text`.
+fn print_agent_message(from: &str, to: &str, text: &str) {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    eprintln!(
+        "\x1b[2m{from} → {to}: {}\x1b[0m",
+        crate::util::truncate_chars(&text, 200)
+    );
+}
+
+/// Approve or deny a tool call nobody is there to review.
+fn headless_approval(opts: &HeadlessOptions, tool_name: &str, args_preview: &str) -> bool {
+    opts.auto_approve || !headless_should_deny(tool_name, args_preview)
+}
+
+/// Compact stderr progress for one sub-agent: `[tests] ✓ read_file src/lib.rs`.
+struct SubAgentLog {
+    name: String,
+    started: std::time::Instant,
+    /// Arguments streamed so far, by tool call id.
+    args: HashMap<String, String>,
+}
+
+impl SubAgentLog {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            started: std::time::Instant::now(),
+            args: HashMap::new(),
+        }
+    }
+
+    /// Print one of its events. Returns the answer when it asked for approval.
+    fn print(&mut self, event: AgentEvent, opts: &HeadlessOptions) -> Option<bool> {
+        let tag = format!("\x1b[2m[{}]\x1b[0m", self.name);
+        match event {
+            AgentEvent::ToolStart { id, name } => {
+                if opts.verbose {
+                    eprintln!("{tag} \x1b[33m⚙ {name}\x1b[0m");
+                }
+                self.args.insert(id, String::new());
+            }
+            AgentEvent::ToolArgsDelta { id, delta } => {
+                self.args.entry(id).or_default().push_str(&delta);
+            }
+            AgentEvent::ToolResult {
+                id,
+                name,
+                result,
+                success,
+            } => {
+                let args = self.args.remove(&id).unwrap_or_default();
+                let target = crate::util::truncate_chars(
+                    &crate::ui::summarize_args(&name, &args).replace('\n', " "),
+                    100,
+                );
+                if success {
+                    eprintln!("{tag} \x1b[32m✓\x1b[0m {name} \x1b[2m{target}\x1b[0m");
+                } else {
+                    let first = result.lines().next().unwrap_or_default();
+                    eprintln!(
+                        "{tag} \x1b[31m✗ {name}: {}\x1b[0m",
+                        crate::util::truncate_chars(first, 160)
+                    );
+                }
+            }
+            AgentEvent::FileWrite { path, .. } => eprintln!("{tag} \x1b[36m✎ {path}\x1b[0m"),
+            AgentEvent::Error(e) => eprintln!("{tag} \x1b[31merror: {e}\x1b[0m"),
+            AgentEvent::Warning(w) if opts.verbose => eprintln!("{tag} \x1b[33m{w}\x1b[0m"),
+            AgentEvent::Status(s) if opts.verbose => eprintln!("{tag} \x1b[2m{s}\x1b[0m"),
+            AgentEvent::ApprovalRequest {
+                tool_name,
+                args_preview,
+                ..
+            } => {
+                let approved = headless_approval(opts, &tool_name, &args_preview);
+                eprintln!(
+                    "{tag} \x1b[33m{} {tool_name}: {}\x1b[0m",
+                    if approved {
+                        "auto-approved"
+                    } else {
+                        "denied (use --yes to allow)"
+                    },
+                    crate::util::truncate_chars(&args_preview, 200)
+                );
+                return Some(approved);
+            }
+            AgentEvent::AgentMessage { from, to, text } => print_agent_message(&from, &to, &text),
+            AgentEvent::Done { usage: Some(u) } if opts.verbose => {
+                eprintln!("{tag} \x1b[2m— {} tokens —\x1b[0m", u.total_tokens);
+            }
+            _ => {}
+        }
+        None
+    }
 }
 
 fn prompt() {

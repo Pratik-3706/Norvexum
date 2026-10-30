@@ -20,6 +20,10 @@ pub const HISTORY_DIR: &str = "history";
 /// Python venvs subdirectory
 pub const VENVS_DIR: &str = "venvs";
 
+/// Range of `max_content_chars`; outside it tool output is useless or swamps the context.
+pub const MIN_CONTENT_CHARS: usize = 2_000;
+pub const MAX_CONTENT_CHARS: usize = 40_000;
+
 /// Global application settings, assembled from .env + config.toml + CLI args.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -43,6 +47,7 @@ pub struct Settings {
     pub headless: bool,
     pub browser_timeout_secs: u64,
     pub max_thinking_loops: usize,
+    /// Tool output kept per result, between [`MIN_CONTENT_CHARS`] and [`MAX_CONTENT_CHARS`].
     pub max_content_chars: usize,
 
     // ── Safety / approval ────────────────────────────────────────────────
@@ -420,6 +425,23 @@ fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
         resolved.push(part);
     }
     Some(resolved)
+}
+
+/// Parse a tool-loop limit: a number, or 0 / "unlimited" / "off" / "inf" for no limit.
+pub fn parse_loop_limit(value: &str) -> Option<usize> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "unlimited" | "off" | "none" | "inf" | "infinite" | "∞" => Some(0),
+        v => v.parse().ok(),
+    }
+}
+
+/// How a tool-loop limit reads to the user (0 means no limit).
+pub fn describe_loop_limit(limit: usize) -> String {
+    if limit == 0 {
+        "unlimited".into()
+    } else {
+        limit.to_string()
+    }
 }
 
 #[cfg(test)]

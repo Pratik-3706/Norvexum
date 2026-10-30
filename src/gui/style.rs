@@ -167,8 +167,26 @@ pub fn apply(ctx: &egui::Context, p: &Palette, dark: bool) {
     style.spacing.combo_width = 140.0;
     style.spacing.window_margin = Margin::same(16.0);
     style.spacing.menu_margin = Margin::same(6.0);
-    style.spacing.scroll.bar_width = 6.0;
-    style.spacing.scroll.floating = true;
+    // Scroll bars keep a lane of their own and never change size or show a
+    // track on hover: a floating bar over the chat grew and faded in its track
+    // when the pointer reached it, and on the edge it flickered between that
+    // and the message under it.
+    style.spacing.scroll = egui::style::ScrollStyle {
+        floating: false,
+        bar_width: 6.0,
+        floating_width: 6.0,
+        floating_allocated_width: 0.0,
+        handle_min_length: 24.0,
+        bar_inner_margin: 2.0,
+        bar_outer_margin: 0.0,
+        foreground_color: true,
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.0,
+        interact_background_opacity: 0.0,
+        dormant_handle_opacity: 0.35,
+        active_handle_opacity: 0.55,
+        interact_handle_opacity: 0.8,
+    };
     ctx.set_style(style);
 }
 
@@ -299,7 +317,7 @@ pub fn section_label(ui: &mut Ui, text: &str, p: &Palette) {
 
 /// Frameless text button; `active` marks a toggled-on panel.
 pub fn nav_button(ui: &mut Ui, label: &str, active: bool, p: &Palette) -> Response {
-    ui.add(
+    let resp = ui.add(
         egui::Button::new(RichText::new(label).size(12.5).color(if active {
             p.text
         } else {
@@ -312,17 +330,62 @@ pub fn nav_button(ui: &mut Ui, label: &str, active: bool, p: &Palette) -> Respon
         })
         .stroke(Stroke::NONE)
         .rounding(6.0),
-    )
+    );
+    click_flash(ui, &resp, 6.0, p);
+    resp
 }
 
-/// Small frameless action link (Copy, Edit, …).
+/// How long the glow after a click lasts, in seconds.
+const FLASH_SECS: f64 = 0.6;
+
+/// Seconds since the widget `id` was last clicked, while its glow lasts.
+fn flash_age(ui: &Ui, id: egui::Id) -> Option<f64> {
+    let t0 = ui
+        .ctx()
+        .data(|d| d.get_temp::<f64>(id.with("click_flash")))?;
+    let age = ui.input(|i| i.time) - t0;
+    (age < FLASH_SECS).then_some(age)
+}
+
+/// A short accent glow over a button that was just clicked, so a click
+/// that changes nothing visible (Copy, Undo, …) still shows it landed.
+pub fn click_flash(ui: &Ui, resp: &Response, rounding: f32, p: &Palette) {
+    if resp.clicked() {
+        let now = ui.input(|i| i.time);
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(resp.id.with("click_flash"), now));
+    }
+    if let Some(age) = flash_age(ui, resp.id) {
+        let fade = (1.0 - age / FLASH_SECS) as f32;
+        let painter = ui.painter();
+        painter.rect_filled(resp.rect, rounding, p.accent.gamma_multiply(0.22 * fade));
+        painter.rect_stroke(
+            resp.rect.expand(1.5 * fade),
+            rounding,
+            Stroke::new(1.0, p.accent.gamma_multiply(0.8 * fade)),
+        );
+        ui.ctx().request_repaint();
+    }
+}
+
+/// Small frameless action link (Copy, Edit, …). "Copy" reads "Copied" for a
+/// moment after a click.
 pub fn link_button(ui: &mut Ui, label: &str, p: &Palette) -> Response {
-    ui.add(
-        egui::Button::new(RichText::new(label).size(11.5).color(p.faint))
+    let id = ui.next_auto_id();
+    let flashing = flash_age(ui, id).is_some();
+    let (text, color) = match (label, flashing) {
+        ("Copy", true) => ("Copied", p.accent),
+        (_, true) => (label, p.accent),
+        _ => (label, p.faint),
+    };
+    let resp = ui.add(
+        egui::Button::new(RichText::new(text).size(11.5).color(color))
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::NONE)
             .rounding(4.0),
-    )
+    );
+    click_flash(ui, &resp, 4.0, p);
+    resp
 }
 
 pub fn primary_button(ui: &mut Ui, label: &str, p: &Palette) -> Response {
@@ -341,6 +404,153 @@ pub fn secondary_button(ui: &mut Ui, label: &str, p: &Palette) -> Response {
             .stroke(Stroke::new(1.0_f32, p.border))
             .rounding(6.0),
     )
+}
+
+/// A row of equal-width segments, one selected; `badge` is a small count or
+/// marker drawn after the label. Returns the segment clicked this frame.
+pub fn segmented(
+    ui: &mut Ui,
+    items: &[(&str, Option<String>)],
+    selected: usize,
+    p: &Palette,
+) -> Option<usize> {
+    const HEIGHT: f32 = 30.0;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter().clone();
+    painter.rect(rect, 8.0, p.surface, Stroke::new(1.0_f32, p.border));
+    let width = (rect.width() - 4.0) / items.len().max(1) as f32;
+    let mut clicked = None;
+    for (i, (label, badge)) in items.iter().enumerate() {
+        let seg = egui::Rect::from_min_size(
+            rect.min + egui::vec2(2.0 + i as f32 * width, 2.0),
+            egui::vec2(width, HEIGHT - 4.0),
+        );
+        let resp = ui.interact(seg, ui.id().with(("segment", i)), egui::Sense::click());
+        let active = i == selected;
+        if active {
+            painter.rect_filled(seg, 6.0, p.hover);
+        } else if resp.hovered() {
+            painter.rect_filled(seg, 6.0, p.panel);
+        }
+        let label_g = painter.layout_no_wrap(
+            label.to_string(),
+            if active {
+                strong(12.5)
+            } else {
+                FontId::proportional(12.5)
+            },
+            if active || resp.hovered() {
+                p.text
+            } else {
+                p.dim
+            },
+        );
+        let badge_g = badge
+            .as_ref()
+            .map(|b| painter.layout_no_wrap(b.clone(), FontId::proportional(11.0), p.faint));
+        let total = label_g.size().x + badge_g.as_ref().map_or(0.0, |g| g.size().x + 5.0);
+        let mut x = seg.center().x - total / 2.0;
+        let label_w = label_g.size().x;
+        painter.galley(
+            egui::pos2(x, seg.center().y - label_g.size().y / 2.0),
+            label_g,
+            p.text,
+        );
+        x += label_w + 5.0;
+        if let Some(g) = badge_g {
+            painter.galley(
+                egui::pos2(x, seg.center().y - g.size().y / 2.0 + 0.5),
+                g,
+                p.faint,
+            );
+        }
+        if resp.clicked() {
+            clicked = Some(i);
+        }
+    }
+    clicked
+}
+
+/// Small pill that toggles an option on and off.
+pub fn chip(ui: &mut Ui, label: &str, on: bool, p: &Palette) -> Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .size(11.5)
+                .color(if on { p.accent } else { p.dim }),
+        )
+        .fill(if on {
+            p.accent_soft
+        } else {
+            Color32::TRANSPARENT
+        })
+        .stroke(Stroke::new(
+            1.0_f32,
+            if on {
+                p.accent.gamma_multiply(0.45)
+            } else {
+                p.border
+            },
+        ))
+        .rounding(11.0)
+        .min_size(egui::vec2(0.0, 22.0)),
+    )
+}
+
+/// Square glyph button drawing a ×, for closing a pane.
+pub fn close_button(ui: &mut Ui, p: &Palette) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter().rect_filled(rect, 5.0, p.hover);
+    }
+    let c = rect.center();
+    let stroke = Stroke::new(1.4_f32, if hovered { p.text } else { p.faint });
+    for (a, b) in [
+        (egui::vec2(-3.5, -3.5), egui::vec2(3.5, 3.5)),
+        (egui::vec2(-3.5, 3.5), egui::vec2(3.5, -3.5)),
+    ] {
+        ui.painter().line_segment([c + a, c + b], stroke);
+    }
+    resp
+}
+
+/// Single-line search box with a magnifier and a clear button.
+pub fn search_field(ui: &mut Ui, text: &mut String, hint: &str, p: &Palette) -> Response {
+    let mut response = None;
+    egui::Frame::none()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .rounding(7.0)
+        .inner_margin(Margin::symmetric(8.0, 3.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 20.0), egui::Sense::hover());
+                let c = r.center() - egui::vec2(1.0, 1.0);
+                let stroke = Stroke::new(1.3_f32, p.faint);
+                ui.painter().circle_stroke(c, 4.0, stroke);
+                ui.painter()
+                    .line_segment([c + egui::vec2(3.0, 3.0), c + egui::vec2(6.0, 6.0)], stroke);
+
+                let clear_w = if text.is_empty() { 0.0 } else { 22.0 };
+                let edit = ui.add(
+                    egui::TextEdit::singleline(text)
+                        .hint_text(RichText::new(hint).color(p.faint))
+                        .frame(false)
+                        .margin(Margin::symmetric(0.0, 2.0))
+                        .desired_width((ui.available_width() - clear_w).max(20.0)),
+                );
+                if !text.is_empty() && close_button(ui, p).on_hover_text("Clear").clicked() {
+                    text.clear();
+                }
+                response = Some(edit);
+            });
+        });
+    response.expect("search field row always renders")
 }
 
 /// A small filled status dot, vertically centred in the current row.

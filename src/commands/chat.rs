@@ -4,7 +4,7 @@
 
 use eyre::{Result, WrapErr};
 
-use crate::config::{NORVEXUM_DIR, Settings};
+use crate::config::{HISTORY_DIR, NORVEXUM_DIR, Settings};
 use crate::runtime::{HeadlessOptions, run_headless, spawn_agent};
 use crate::ui::{App, run_tui};
 
@@ -54,7 +54,11 @@ pub async fn run(settings: Settings, opts: ChatOptions) -> Result<()> {
         .await;
     }
 
-    let mut app = App::new(&model_info, project_root);
+    let history_file = project_root
+        .join(NORVEXUM_DIR)
+        .join(HISTORY_DIR)
+        .join("prompts.jsonl");
+    let mut app = App::new(&model_info, project_root).with_history_file(history_file);
     if let Some(message) = opts.initial_message {
         app.add_user_message(message);
     } else if opts.resume {

@@ -280,7 +280,8 @@ impl AiClient for GeminiClient {
         let mut stream = response.bytes_stream();
         let mut lines = SseLineBuffer::new();
         let mut in_thinking = false;
-        let mut finish_reason = String::from("STOP");
+        let mut finish_reason: Option<String> = None;
+        let mut produced_output = false;
         // usageMetadata is cumulative and repeated on every chunk — keep the last.
         let mut usage: Option<UsageStats> = None;
 
@@ -333,6 +334,7 @@ impl AiClient for GeminiClient {
                                 let _ = tx.send(AiStreamEvent::ThinkingDone);
                                 in_thinking = false;
                             }
+                            produced_output = true;
                             let _ = tx.send(AiStreamEvent::ContentDelta(text.to_string()));
                         }
 
@@ -348,13 +350,14 @@ impl AiClient for GeminiClient {
                                 arguments: fc.args.clone().unwrap_or_else(|| json!({})),
                                 thought_signature: part.thought_signature.clone(),
                             };
+                            produced_output = true;
                             let _ = tx.send(AiStreamEvent::ToolCallStart(tc.clone()));
                             let _ = tx.send(AiStreamEvent::ToolCallComplete(tc));
                         }
                     }
 
                     if let Some(reason) = &candidate.finish_reason {
-                        finish_reason = reason.clone();
+                        finish_reason = Some(reason.clone());
                     }
                 }
 
@@ -373,6 +376,17 @@ impl AiClient for GeminiClient {
         if in_thinking {
             let _ = tx.send(AiStreamEvent::ThinkingDone);
         }
+
+        // The last chunk of a finished reply carries finishReason; output without
+        // one means the stream was cut off. (A blocked prompt has neither.)
+        let finish_reason = finish_reason.unwrap_or_else(|| {
+            if produced_output {
+                FINISH_INCOMPLETE
+            } else {
+                "STOP"
+            }
+            .to_string()
+        });
 
         // Blocked/aborted responses would otherwise look like an empty answer.
         if matches!(

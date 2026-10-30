@@ -216,6 +216,77 @@ pub fn guess_reasoning_support_by_name(
     None
 }
 
+/// The longest reply `model` can produce (thinking included), for the families
+/// whose limit is published. `None` means unknown.
+pub fn max_output_tokens(model: &str) -> Option<u32> {
+    let lower = model.to_lowercase();
+    let bare = lower.rsplit('/').next().unwrap_or(&lower);
+
+    if bare.contains("claude") {
+        return Some(claude_max_output_tokens(bare));
+    }
+    if bare.starts_with("gemini") {
+        let legacy = bare.starts_with("gemini-1") || bare.starts_with("gemini-2.0");
+        return Some(if legacy { 8_192 } else { 65_536 });
+    }
+    if bare.starts_with("o1-mini") {
+        return Some(65_536);
+    }
+    if ["o1", "o3", "o4"]
+        .iter()
+        .any(|p| bare == *p || bare.starts_with(&format!("{p}-")))
+    {
+        return Some(100_000);
+    }
+    if bare.starts_with("gpt-5") {
+        return Some(if bare.contains("chat") {
+            16_384
+        } else {
+            128_000
+        });
+    }
+    if bare.starts_with("gpt-4.1") {
+        return Some(32_768);
+    }
+    if bare.starts_with("gpt-4o") {
+        return Some(16_384);
+    }
+    None
+}
+
+fn claude_max_output_tokens(id: &str) -> u32 {
+    // Legacy ids put the version first ("claude-3-5-sonnet"), later ones after
+    // the tier ("claude-sonnet-4-5", "claude-opus-4.1").
+    if id.contains("claude-3-7") || id.contains("claude-3.7") {
+        return 64_000;
+    }
+    if id.contains("claude-3-5") || id.contains("claude-3.5") {
+        return 8_192;
+    }
+    if id.contains("claude-3") {
+        return 4_096;
+    }
+    // Opus 4.0 and 4.1 stop at 32k; every later model allows at least 64k.
+    if let Some(rest) = id.split("opus-4").nth(1) {
+        let minor: String = rest
+            .strip_prefix(['.', '-'])
+            .unwrap_or("")
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        // "claude-opus-4-20250514": an 8-digit date, not a minor version.
+        let minor = if minor.len() <= 2 {
+            minor.parse().unwrap_or(0)
+        } else {
+            0
+        };
+        if minor <= 1 {
+            return 32_000;
+        }
+    }
+    64_000
+}
+
 /// Probe whether a model accepts reasoning parameters by sending a tiny request.
 /// Falls back to the name heuristic when the probe is inconclusive (auth
 /// errors, rate limits, timeouts).
@@ -384,5 +455,25 @@ mod tests {
             guess_reasoning_support_by_name("aicredits", "deepseek/deepseek-r1"),
             Some(OpenAiEffort)
         );
+    }
+
+    #[test]
+    fn output_limits_follow_the_model_family() {
+        assert_eq!(max_output_tokens("claude-opus-4-20250514"), Some(32_000));
+        assert_eq!(max_output_tokens("claude-opus-4-1-20250805"), Some(32_000));
+        assert_eq!(max_output_tokens("anthropic/claude-opus-4.1"), Some(32_000));
+        assert_eq!(max_output_tokens("anthropic/claude-opus-4.6"), Some(64_000));
+        assert_eq!(
+            max_output_tokens("claude-sonnet-4-5-20250929"),
+            Some(64_000)
+        );
+        assert_eq!(max_output_tokens("claude-opus-5-5"), Some(64_000));
+        assert_eq!(max_output_tokens("claude-3-5-haiku-latest"), Some(8_192));
+        assert_eq!(max_output_tokens("anthropic/claude-3-haiku"), Some(4_096));
+        assert_eq!(max_output_tokens("openai/gpt-5.1-codex"), Some(128_000));
+        assert_eq!(max_output_tokens("openai/gpt-5.2-chat"), Some(16_384));
+        assert_eq!(max_output_tokens("o4-mini"), Some(100_000));
+        assert_eq!(max_output_tokens("google/gemini-2.5-pro"), Some(65_536));
+        assert_eq!(max_output_tokens("deepseek/deepseek-v4-pro"), None);
     }
 }

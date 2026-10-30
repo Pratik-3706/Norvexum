@@ -3340,6 +3340,8 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
+ "which",
+ "winreg",
  "winres",
 ]
 

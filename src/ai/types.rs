@@ -271,6 +271,10 @@ impl AiRequest {
 
 // ── Streaming Events ──────────────────────────────────────────────────────
 
+/// Finish reason for a stream that stopped before the provider marked the reply
+/// as finished (dropped connection, proxy timeout).
+pub const FINISH_INCOMPLETE: &str = "incomplete";
+
 /// Events emitted during streaming response.
 /// The TUI listens on these to render tokens live.
 #[derive(Debug, Clone)]
@@ -289,7 +293,8 @@ pub enum AiStreamEvent {
     ToolCallDelta { id: String, arguments_delta: String },
     /// Tool call definition is complete, ready to execute
     ToolCallComplete(ToolCall),
-    /// The full response is done
+    /// The full response is done. `finish_reason` is [`FINISH_INCOMPLETE`] when
+    /// the stream ended without the provider saying the reply was finished.
     Done {
         finish_reason: String,
         usage: Option<UsageStats>,

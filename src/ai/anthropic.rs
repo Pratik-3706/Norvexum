@@ -392,7 +392,8 @@ impl AiClient for AnthropicClient {
         let mut block = OpenBlock::None;
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
-        let mut stop_reason = String::from("end_turn");
+        let mut stop_reason: Option<String> = None;
+        let mut saw_stop = false;
 
         'outer: while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -514,13 +515,16 @@ impl AiClient for AnthropicClient {
                     }
                     "message_delta" => {
                         if let Some(reason) = evt.delta.and_then(|d| d.stop_reason) {
-                            stop_reason = reason;
+                            stop_reason = Some(reason);
                         }
                         if let Some(u) = evt.usage {
                             output_tokens = u.output_tokens.unwrap_or(output_tokens);
                         }
                     }
-                    "message_stop" => break 'outer,
+                    "message_stop" => {
+                        saw_stop = true;
+                        break 'outer;
+                    }
                     "error" => {
                         let (kind, message) = evt
                             .error
@@ -541,6 +545,15 @@ impl AiClient for AnthropicClient {
             }
         }
 
+        // No stop reason and no message_stop: the connection ended mid-reply.
+        let stop_reason = stop_reason.unwrap_or_else(|| {
+            if saw_stop {
+                "end_turn"
+            } else {
+                FINISH_INCOMPLETE
+            }
+            .to_string()
+        });
         if stop_reason == "refusal" {
             let _ = tx.send(AiStreamEvent::ContentDelta(
                 "\n\n⚠️ The model declined to continue this request.".into(),

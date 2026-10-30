@@ -80,6 +80,99 @@ pub fn prune_tool_results(messages: &mut [Message], keep_recent: usize, max_char
     changed
 }
 
+/// Upper bound for the message content of one request. Gateways cap the body
+/// size independently of the context window (AICredits rejects anything over
+/// 5 MiB); this leaves room for the tool schemas and JSON overhead.
+pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Browser screenshots kept per request. Older ones show a page that has
+/// changed since, and each costs ~100–300 KB on every later request.
+const KEEP_SCREENSHOTS: usize = 2;
+
+/// Bytes of message content a request carries (text, images, tool calls).
+pub fn content_bytes(messages: &[Message]) -> usize {
+    messages.iter().map(message_bytes).sum()
+}
+
+fn message_bytes(m: &Message) -> usize {
+    m.content
+        .iter()
+        .map(|p| match p {
+            ContentPart::Text { text } => text.len(),
+            ContentPart::Image { data, .. } => data.len(),
+        })
+        .sum::<usize>()
+        + m.tool_calls
+            .iter()
+            .map(|tc| tc.name.len() + tc.arguments.to_string().len())
+            .sum::<usize>()
+        + m.thinking_blocks
+            .iter()
+            .map(|b| b.thinking.len())
+            .sum::<usize>()
+}
+
+/// Replace a message's images with a short note saying why they are gone.
+fn drop_images(msg: &mut Message, note: &str) -> bool {
+    let before = msg.content.len();
+    msg.strip_images();
+    if msg.content.len() == before {
+        return false;
+    }
+    msg.content.push(ContentPart::Text {
+        text: note.to_string(),
+    });
+    true
+}
+
+/// Fit a request under [`MAX_REQUEST_BYTES`], least useful content first:
+/// browser screenshots beyond the newest few, then images oldest first, then
+/// old tool output. Meant for the copy sent to the provider, not the history.
+pub fn fit_request_size(messages: &mut [Message]) {
+    let mut screenshots = 0;
+    for msg in messages.iter_mut().rev() {
+        let is_screenshot = msg.role == Role::Tool
+            && msg
+                .tool_name
+                .as_deref()
+                .is_some_and(|n| crate::tools::canonical_tool_name(n) == "browser_interact")
+            && msg
+                .content
+                .iter()
+                .any(|p| matches!(p, ContentPart::Image { .. }));
+        if is_screenshot {
+            screenshots += 1;
+            if screenshots > KEEP_SCREENSHOTS {
+                drop_images(
+                    msg,
+                    "[Older screenshot removed; later ones show the current page.]",
+                );
+            }
+        }
+    }
+
+    let mut total = content_bytes(messages);
+    for msg in messages.iter_mut() {
+        if total <= MAX_REQUEST_BYTES {
+            return;
+        }
+        let before = message_bytes(msg);
+        if drop_images(
+            msg,
+            "[Image removed to keep the request under the provider's size limit.]",
+        ) {
+            total = total - before + message_bytes(msg);
+        }
+    }
+
+    if total > MAX_REQUEST_BYTES {
+        prune_tool_results(messages, 6, 1_500);
+    }
+    if content_bytes(messages) > MAX_REQUEST_BYTES {
+        prune_tool_results(messages, 0, 400);
+    }
+}
+
 /// Compact the conversation by summarizing old messages.
 /// Keeps: the system prompt, roughly the last `keep_recent` user exchanges,
 /// and a summary message for everything in between.
@@ -188,6 +281,47 @@ mod tests {
     use super::*;
     use crate::ai::types::ToolCall;
     use serde_json::json;
+
+    fn screenshot(id: &str, kb: usize) -> Message {
+        Message::tool_result(id, "browser_interact", "Action 'click' completed.")
+            .with_image("x".repeat(kb * 1024), "image/jpeg".into())
+    }
+
+    fn image_count(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|p| matches!(p, ContentPart::Image { .. }))
+            .count()
+    }
+
+    #[test]
+    fn requests_keep_only_the_newest_screenshots() {
+        let mut messages = vec![Message::system("sys"), Message::user("test the page")];
+        for i in 0..6 {
+            messages.push(screenshot(&format!("c{i}"), 200));
+        }
+        fit_request_size(&mut messages);
+        assert_eq!(image_count(&messages), KEEP_SCREENSHOTS);
+        // The newest two keep their images; older ones say why theirs went.
+        assert!(matches!(
+            messages[7].content.last(),
+            Some(ContentPart::Image { .. })
+        ));
+        assert!(messages[2].text().contains("Older screenshot removed"));
+    }
+
+    #[test]
+    fn oversized_requests_drop_images_oldest_first() {
+        let big =
+            |kb: usize| Message::user_with_image("look", "x".repeat(kb * 1024), "image/png".into());
+        let mut messages = vec![Message::system("sys"), big(1_800), big(1_800), big(1_800)];
+        assert!(content_bytes(&messages) > MAX_REQUEST_BYTES);
+        fit_request_size(&mut messages);
+        assert!(content_bytes(&messages) <= MAX_REQUEST_BYTES);
+        assert_eq!(image_count(&messages), 2);
+        assert!(messages[1].text().contains("size limit"));
+    }
 
     #[test]
     fn estimate_tokens_basic() {

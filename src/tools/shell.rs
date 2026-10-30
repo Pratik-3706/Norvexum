@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 /// Foreground commands are stopped after this long unless the call asks for more.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
-const MAX_TIMEOUT_SECS: u64 = 1800;
+const MAX_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Clone, Debug)]
 pub struct ProcessInfo {
@@ -27,6 +27,43 @@ pub struct ProcessInfo {
 
 pub static BACKGROUND_PROCESSES: Lazy<Mutex<HashMap<u32, ProcessInfo>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// A background command that has exited; kept so its log can still be read.
+#[derive(Clone, Debug)]
+pub struct FinishedProcess {
+    pub info: ProcessInfo,
+    /// Exit code, or `None` when it was stopped or killed by a signal.
+    pub exit_code: Option<i32>,
+    pub ran_for: std::time::Duration,
+}
+
+/// How many exited background commands are remembered.
+const KEEP_FINISHED: usize = 20;
+
+static FINISHED_PROCESSES: Lazy<Mutex<Vec<FinishedProcess>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Background commands that have exited, oldest first.
+pub fn get_finished_processes() -> Vec<FinishedProcess> {
+    FINISHED_PROCESSES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn remember_finished(info: ProcessInfo, exit_code: Option<i32>) {
+    let mut finished = FINISHED_PROCESSES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    finished.retain(|f| f.info.pid != info.pid);
+    let ran_for = info.started.elapsed();
+    finished.push(FinishedProcess {
+        info,
+        exit_code,
+        ran_for,
+    });
+    let excess = finished.len().saturating_sub(KEEP_FINISHED);
+    finished.drain(..excess);
+}
 
 fn processes() -> std::sync::MutexGuard<'static, HashMap<u32, ProcessInfo>> {
     // A panic while holding the lock must not disable process management.
@@ -45,6 +82,7 @@ pub fn kill_background_process(pid: u32) {
     // Remove the process and send the kill signal to the background task
     if let Some(info) = processes().remove(&pid) {
         let _ = info.kill_tx.try_send(());
+        remember_finished(info, None);
     }
 }
 
@@ -114,15 +152,35 @@ fn spawn_background(
     );
 
     tokio::spawn(async move {
-        tokio::select! {
-            _ = child.wait() => {}
-            _ = kill_rx.recv() => kill_tree(&mut child).await,
+        let exit_code = tokio::select! {
+            status = child.wait() => status.ok().and_then(|s| s.code()),
+            _ = kill_rx.recv() => {
+                kill_tree(&mut child).await;
+                None
+            }
+        };
+        // Stopped processes were already removed by `kill_background_process`.
+        let info = processes().remove(&pid);
+        if let Some(info) = info.or_else(|| {
+            get_finished_processes()
+                .into_iter()
+                .find(|f| f.info.pid == pid)
+                .map(|f| f.info)
+        }) {
+            remember_finished(info, exit_code);
         }
-        processes().remove(&pid);
     });
 
+    let log = log_path
+        .strip_prefix(&ctx.settings.project_root)
+        .unwrap_or(&log_path)
+        .display()
+        .to_string()
+        .replace('\\', "/");
     ToolResult::ok(format!(
-        "Started in background with PID {pid}. Output is logged; check it with          manage_processes(action=\"logs\", pid={pid}) and stop it with manage_processes(action=\"stop\", pid={pid})."
+        "Started in background with PID {pid}; stdout and stderr go to {log}. Read them with \
+         manage_processes(action=\"logs\", pid={pid}) (works after it exits too) and stop it with \
+         manage_processes(action=\"stop\", pid={pid})."
     ))
 }
 
@@ -334,13 +392,6 @@ fn is_denylisted(cmd_name: &str) -> bool {
     ) || cmd_name.starts_with("mkfs")
 }
 
-fn is_chmod_mode(arg: &str) -> bool {
-    arg.chars().all(|c| c.is_ascii_digit())
-        || arg.contains('+')
-        || arg.contains('-')
-        || arg.contains('=')
-}
-
 fn handle_output(output_res: std::io::Result<std::process::Output>) -> ToolResult {
     match output_res {
         Ok(output) => {
@@ -370,15 +421,229 @@ fn handle_output(output_res: std::io::Result<std::process::Output>) -> ToolResul
     }
 }
 
-fn check_raw_command_paths(command_str: &str, ctx: &ToolContext) -> Result<(), String> {
-    let words = command_str.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '=');
-    for word in words {
-        let clean = clean_path_string(word.trim());
-        if !clean.is_empty() && looks_like_path(&clean) {
-            super::filesystem::resolve_path(&clean, ctx)?;
+/// Split a command line into the commands chained by `&&`, `||`, `&`, `;`,
+/// `|` or newlines, ignoring separators inside quotes.
+fn split_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match (quote, c) {
+            (Some(q), _) if c == q => {
+                quote = None;
+                current.push(c);
+            }
+            (Some(_), _) => current.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                current.push(c);
+            }
+            (None, '&' | '|' | ';' | '\n') => {
+                if !current.trim().is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+                current.clear();
+            }
+            (None, _) => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Whitespace-separated words with quotes removed. Backslashes are kept as
+/// they are: on Windows they separate path components, not escape characters.
+fn split_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut in_word = false;
+    for c in segment.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            None => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    words
+}
+
+/// Words the shell expands at run time (`$VAR`, `%VAR%`, `%%f`), which can't
+/// be checked as written.
+fn has_variable(word: &str) -> bool {
+    word.contains('$') || (cfg!(windows) && word.contains('%'))
+}
+
+/// A Windows command switch such as `/C:"text"`, `/s` or `/fo:csv`, not a path.
+fn is_windows_switch(word: &str) -> bool {
+    static RE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"^/[A-Za-z?][A-Za-z0-9-]*(:.*)?$").expect("valid regex"));
+    cfg!(windows) && RE.is_match(word)
+}
+
+/// Options after which interpreters take a program as text, not a file.
+fn inline_code_flags(cmd_name: &str) -> &'static [&'static str] {
+    match cmd_name {
+        "python" | "python3" | "py" | "pythonw" => &["-c"],
+        "php" => &["-r"],
+        "node" | "deno" | "bun" => &["-e", "--eval", "-p", "--print"],
+        "ruby" | "perl" => &["-e", "-E"],
+        _ => &[],
+    }
+}
+
+/// Resolve `path` relative to `cwd` inside the sandbox.
+fn resolve_from(cwd: &Path, path: &str, ctx: &ToolContext) -> Result<std::path::PathBuf, String> {
+    let joined = if Path::new(path).is_absolute() || path.starts_with('~') {
+        path.to_string()
+    } else {
+        cwd.join(path).to_string_lossy().into_owned()
+    };
+    super::filesystem::resolve_path(&joined, ctx)
+}
+
+/// Every path a command line mentions must stay inside the project. Each
+/// chained command is checked from the directory the earlier `cd`s left it
+/// in, so `cd sub && … && cd ..` is fine. Inline interpreter code, shell
+/// variables and Windows switches can't be paths and are left alone.
+pub(super) fn check_command_paths(command: &str, ctx: &ToolContext) -> Result<(), String> {
+    let mut cwd = ctx.cwd.clone();
+    for segment in split_segments(command) {
+        let words = split_words(&segment);
+        let Some(first) = words.first() else {
+            continue;
+        };
+        // Leading `@` only silences echo in batch syntax.
+        let first = first.trim_start_matches('@');
+        let cmd_name = get_command_name(first);
+
+        if matches!(cmd_name.as_str(), "cd" | "chdir" | "pushd") {
+            let target = words.iter().skip(1).find(|w| !w.eq_ignore_ascii_case("/d"));
+            match target {
+                Some(t) if has_variable(t) => {}
+                Some(t) => cwd = resolve_from(&cwd, &clean_path_string(t), ctx)?,
+                // Plain `cd` prints (Windows) or goes home (Unix); neither moves us here.
+                None => {}
+            }
+            continue;
+        }
+        if cmd_name == "popd" {
+            cwd = ctx.cwd.clone();
+            continue;
+        }
+        // PowerShell's arguments are a script; a path check can't parse it.
+        if matches!(cmd_name.as_str(), "powershell" | "pwsh") {
+            continue;
+        }
+        // `cmd /c <command>` runs a command line of its own.
+        if cmd_name == "cmd" {
+            if let Some(i) = words
+                .iter()
+                .position(|w| w.eq_ignore_ascii_case("/c") || w.eq_ignore_ascii_case("/k"))
+            {
+                check_command_paths(&words[i + 1..].join(" "), ctx)?;
+            }
+            continue;
+        }
+
+        let first_clean = clean_path_string(first);
+        if !has_variable(&first_clean) && looks_like_path(&first_clean) {
+            resolve_from(&cwd, &first_clean, ctx)?;
+        }
+        let code_flags = inline_code_flags(&cmd_name);
+        let mut skip_next = false;
+        for word in words.iter().skip(1) {
+            if std::mem::take(&mut skip_next) {
+                continue;
+            }
+            if code_flags.contains(&word.as_str()) {
+                skip_next = true;
+                continue;
+            }
+            if has_variable(word) || is_windows_switch(word) {
+                continue;
+            }
+            for path in extract_paths(word) {
+                let path = clean_path_string(&path);
+                if !path.is_empty() && looks_like_path(&path) {
+                    resolve_from(&cwd, &path, ctx)?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Folder with the Unix tools that ship with Git for Windows (grep, tail, …).
+#[cfg(windows)]
+fn unix_tools_dir() -> Option<&'static std::path::PathBuf> {
+    static DIR: Lazy<Option<std::path::PathBuf>> = Lazy::new(|| {
+        // …\Git\cmd\git.exe → …\Git\usr\bin
+        let from_git = which::which("git")
+            .ok()
+            .and_then(|git| Some(git.parent()?.parent()?.join("usr").join("bin")));
+        let standard = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .map(|root| {
+                let root = std::path::PathBuf::from(root);
+                if root.ends_with("Local") {
+                    root.join("Programs").join("Git").join("usr").join("bin")
+                } else {
+                    root.join("Git").join("usr").join("bin")
+                }
+            });
+        from_git
+            .into_iter()
+            .chain(standard)
+            .find(|dir| dir.join("tail.exe").is_file())
+    });
+    DIR.as_ref()
+}
+
+#[cfg(not(windows))]
+fn unix_tools_dir() -> Option<&'static std::path::PathBuf> {
+    None
+}
+
+/// Settings every command gets: no console window on Windows, the Unix tools
+/// on PATH (after the system's own, so `find`/`sort` keep their Windows
+/// meaning), and unbuffered Python output so background logs fill as it runs.
+fn prepare_command(cmd: &mut tokio::process::Command) {
+    cmd.env("PYTHONUNBUFFERED", "1");
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+        if let Some(dir) = unix_tools_dir() {
+            let mut paths: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+                .map(|p| std::env::split_paths(&p).collect())
+                .unwrap_or_default();
+            if !paths.contains(dir) {
+                paths.push(dir.clone());
+            }
+            if let Ok(joined) = std::env::join_paths(paths) {
+                cmd.env("PATH", joined);
+            }
+        }
+    }
 }
 
 pub struct ShellCommandTool;
@@ -390,10 +655,29 @@ impl Tool for ShellCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in the project directory (stdin is closed, so interactive prompts fail). \
-         Use non-interactive flags (e.g. `npm init -y`). Use edit_file instead of sed/awk. \
-         Servers and watchers need background=true (manage them with manage_processes). \
-         Foreground commands time out after 300s by default. Paths outside the project are blocked."
+        static DESCRIPTION: Lazy<String> = Lazy::new(|| {
+            let shell = if cfg!(windows) {
+                match unix_tools_dir() {
+                    Some(_) => "Commands run in cmd.exe; pipes (|), && and redirects work, and the Unix \
+                                tools from Git for Windows (grep, head, tail, sed, awk, ls, wc, …) are on PATH. "
+                        .to_string(),
+                    None => "Commands run in cmd.exe; pipes (|), && and redirects work. There are no Unix \
+                             tools (use findstr, dir, type, more). "
+                        .to_string(),
+                }
+            } else {
+                "Commands run in sh; pipes, && and redirects work. ".to_string()
+            };
+            format!(
+                "Run a shell command in the project directory (stdin is closed, so interactive prompts fail). \
+                 {shell}Inline code (python -c, php -r, node -e, powershell) is fine. \
+                 Use non-interactive flags (e.g. `npm init -y`). Use edit_file instead of sed/awk for edits. \
+                 Servers, watchers and long jobs need background=true (manage them with manage_processes). \
+                 Foreground commands time out after {DEFAULT_TIMEOUT_SECS}s by default (max {MAX_TIMEOUT_SECS}s). \
+                 Paths outside the project are blocked."
+            )
+        });
+        &DESCRIPTION
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -402,7 +686,7 @@ impl Tool for ShellCommandTool {
             "properties": {
                 "command": { "type": "string", "description": "The command line string to run (must be non-interactive)" },
                 "background": { "type": "boolean", "description": "Run detached (servers, watchers). Returns a PID." },
-                "timeout_secs": { "type": "integer", "description": "Foreground timeout in seconds (default 300, max 1800)" }
+                "timeout_secs": { "type": "integer", "description": "Foreground timeout in seconds (default 300, max 3600)" }
             },
             "required": ["command"]
         })
@@ -436,11 +720,10 @@ impl Tool for ShellCommandTool {
             }
         }
 
-        // 2. Check raw command strings for Windows path escapes (catches shlex stripping backslashes)
-        if let Err(e) = check_raw_command_paths(command_str, ctx) {
+        // 2. Paths in every part of the command line must stay inside the project.
+        if let Err(e) = check_command_paths(command_str, ctx) {
             return ToolResult::err(format!(
-                "⚠️ Command blocked: directory escape attempt detected.\n{}",
-                e
+                "⚠️ Command blocked: it refers to a path outside the project.\n{e}"
             ));
         }
 
@@ -456,7 +739,8 @@ impl Tool for ShellCommandTool {
                 let cmd_name = get_command_name(&argv[0]);
 
                 // 2. Standalone cd interception
-                if cmd_name == "cd" {
+                // A lone `cd` changes nothing for later calls; say so instead of running it.
+                if cmd_name == "cd" && !fallback {
                     if argv.len() > 1 {
                         let target_dir = clean_path_string(&argv[1]);
                         match super::filesystem::resolve_path(&target_dir, ctx) {
@@ -489,47 +773,6 @@ impl Tool for ShellCommandTool {
                         }
                     }
                 }
-
-                // 3. Path checking on argv[0]
-                let argv0_clean = clean_path_string(&argv[0]);
-                if looks_like_path(&argv0_clean) {
-                    if let Err(e) = super::filesystem::resolve_path(&argv0_clean, ctx) {
-                        return ToolResult::err(format!(
-                            "⚠️ Command blocked: directory escape attempt detected in command name.\n{}",
-                            e
-                        ));
-                    }
-                }
-
-                // 4. Path checking on other arguments
-                let is_chmod = cmd_name == "chmod";
-                for token in argv.iter().skip(1) {
-                    if is_chmod
-                        && !token.starts_with('-')
-                        && !token.starts_with('+')
-                        && !is_chmod_mode(token)
-                    {
-                        let clean_token = clean_path_string(token);
-                        if let Err(e) = super::filesystem::resolve_path(&clean_token, ctx) {
-                            return ToolResult::err(format!(
-                                "⚠️ Command blocked: directory escape attempt detected in chmod argument.\n{}",
-                                e
-                            ));
-                        }
-                    }
-
-                    for path_str in extract_paths(token) {
-                        let path_clean = clean_path_string(&path_str);
-                        if looks_like_path(&path_clean) {
-                            if let Err(e) = super::filesystem::resolve_path(&path_clean, ctx) {
-                                return ToolResult::err(format!(
-                                    "⚠️ Command blocked: directory escape attempt detected.\n{}",
-                                    e
-                                ));
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -549,11 +792,7 @@ impl Tool for ShellCommandTool {
             };
 
             cmd.current_dir(&ctx.cwd);
-
-            #[cfg(windows)]
-            {
-                cmd.creation_flags(0x08000000);
-            }
+            prepare_command(&mut cmd);
 
             if background {
                 return spawn_background(cmd, command_str, ctx);
@@ -569,11 +808,7 @@ impl Tool for ShellCommandTool {
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]).current_dir(&ctx.cwd);
-
-        #[cfg(windows)]
-        {
-            cmd.creation_flags(0x08000000);
-        }
+        prepare_command(&mut cmd);
 
         if background {
             return spawn_background(cmd, command_str, ctx);
