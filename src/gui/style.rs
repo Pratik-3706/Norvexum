@@ -23,7 +23,6 @@ pub struct Palette {
     pub panel: Color32,
     pub surface: Color32,
     pub hover: Color32,
-    pub bubble: Color32,
     pub border: Color32,
     pub text: Color32,
     pub dim: Color32,
@@ -47,7 +46,6 @@ impl Palette {
                 panel: rgb(21, 22, 25),
                 surface: rgb(27, 28, 32),
                 hover: rgb(36, 38, 43),
-                bubble: rgb(33, 35, 40),
                 border: rgb(42, 44, 49),
                 text: rgb(228, 229, 231),
                 dim: rgb(154, 157, 164),
@@ -67,7 +65,6 @@ impl Palette {
                 panel: rgb(244, 244, 245),
                 surface: rgb(255, 255, 255),
                 hover: rgb(234, 234, 237),
-                bubble: rgb(238, 239, 242),
                 border: rgb(222, 223, 226),
                 text: rgb(24, 25, 28),
                 dim: rgb(92, 96, 104),
@@ -315,26 +312,6 @@ pub fn section_label(ui: &mut Ui, text: &str, p: &Palette) {
     );
 }
 
-/// Frameless text button; `active` marks a toggled-on panel.
-pub fn nav_button(ui: &mut Ui, label: &str, active: bool, p: &Palette) -> Response {
-    let resp = ui.add(
-        egui::Button::new(RichText::new(label).size(12.5).color(if active {
-            p.text
-        } else {
-            p.dim
-        }))
-        .fill(if active {
-            p.hover
-        } else {
-            Color32::TRANSPARENT
-        })
-        .stroke(Stroke::NONE)
-        .rounding(6.0),
-    );
-    click_flash(ui, &resp, 6.0, p);
-    resp
-}
-
 /// How long the glow after a click lasts, in seconds.
 const FLASH_SECS: f64 = 0.6;
 
@@ -575,6 +552,365 @@ pub fn one_line(
         overflow_character: Some('…'),
     };
     ui.fonts(|f| f.layout_job(job))
+}
+
+// ---------------------------------------------------------------------------
+// Icons — drawn with the painter so they look the same with every font.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Icon {
+    Chats,
+    Plus,
+    Search,
+    Agents,
+    Terminal,
+    Globe,
+    Files,
+    Gear,
+    Sun,
+    Moon,
+    Panel,
+    Plug,
+    Chevron,
+    Check,
+    Cross,
+    Copy,
+    Stop,
+    Refresh,
+    Undo,
+    Edit,
+    Clip,
+}
+
+/// Draw `icon` centred in `rect` (designed on a 16×16 grid).
+pub fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
+    use egui::{Pos2, vec2};
+    let s = rect.width().min(rect.height()) / 16.0;
+    let o = rect.center() - vec2(8.0, 8.0) * s;
+    let p = |x: f32, y: f32| -> Pos2 { o + vec2(x, y) * s };
+    let stroke = Stroke::new(1.4 * s.max(0.8), color);
+    let line = |a: Pos2, b: Pos2| painter.line_segment([a, b], stroke);
+    let poly = |pts: Vec<Pos2>| painter.add(egui::Shape::line(pts, stroke));
+    match icon {
+        Icon::Chats => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(2.0, 3.0), p(14.0, 11.5)),
+                2.5 * s,
+                stroke,
+            );
+            poly(vec![p(5.0, 11.5), p(4.5, 14.0), p(8.0, 11.5)]);
+        }
+        Icon::Plus => {
+            line(p(8.0, 3.0), p(8.0, 13.0));
+            line(p(3.0, 8.0), p(13.0, 8.0));
+        }
+        Icon::Search => {
+            painter.circle_stroke(p(7.0, 7.0), 4.2 * s, stroke);
+            line(p(10.2, 10.2), p(13.5, 13.5));
+        }
+        Icon::Agents => {
+            line(p(8.0, 5.0), p(4.0, 11.0));
+            line(p(8.0, 5.0), p(12.0, 11.0));
+            painter.circle_filled(p(8.0, 4.5), 2.2 * s, color);
+            painter.circle_filled(p(4.0, 11.5), 2.0 * s, color);
+            painter.circle_filled(p(12.0, 11.5), 2.0 * s, color);
+        }
+        Icon::Terminal => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(1.5, 2.5), p(14.5, 13.5)),
+                2.0 * s,
+                stroke,
+            );
+            poly(vec![p(4.5, 6.0), p(7.0, 8.0), p(4.5, 10.0)]);
+            line(p(8.5, 10.5), p(11.5, 10.5));
+        }
+        Icon::Globe => {
+            painter.circle_stroke(p(8.0, 8.0), 6.0 * s, stroke);
+            line(p(2.0, 8.0), p(14.0, 8.0));
+            painter.add(egui::Shape::ellipse_stroke(
+                p(8.0, 8.0),
+                vec2(2.6, 6.0) * s,
+                stroke,
+            ));
+        }
+        Icon::Files => {
+            poly(vec![
+                p(2.0, 4.0),
+                p(6.0, 4.0),
+                p(7.5, 5.5),
+                p(14.0, 5.5),
+                p(14.0, 13.0),
+                p(2.0, 13.0),
+                p(2.0, 4.0),
+            ]);
+        }
+        Icon::Gear => {
+            painter.circle_stroke(p(8.0, 8.0), 2.2 * s, stroke);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.0;
+                let (sin, cos) = a.sin_cos();
+                line(
+                    p(8.0 + cos * 4.4, 8.0 + sin * 4.4),
+                    p(8.0 + cos * 6.2, 8.0 + sin * 6.2),
+                );
+            }
+            painter.circle_stroke(p(8.0, 8.0), 4.4 * s, stroke);
+        }
+        Icon::Sun => {
+            painter.circle_stroke(p(8.0, 8.0), 3.0 * s, stroke);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.0;
+                let (sin, cos) = a.sin_cos();
+                line(
+                    p(8.0 + cos * 5.0, 8.0 + sin * 5.0),
+                    p(8.0 + cos * 6.6, 8.0 + sin * 6.6),
+                );
+            }
+        }
+        Icon::Moon => {
+            let pts: Vec<Pos2> = (0..=24)
+                .map(|i| {
+                    let a = -1.9 + i as f32 * (3.8 / 24.0);
+                    p(8.0 - a.cos() * 6.0, 8.0 + a.sin() * 6.0)
+                })
+                .chain((0..=24).map(|i| {
+                    let a = 1.4 - i as f32 * (2.8 / 24.0);
+                    p(6.5 - a.cos() * 4.6, 8.0 + a.sin() * 4.6)
+                }))
+                .collect();
+            poly(pts);
+        }
+        Icon::Panel => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(1.5, 2.5), p(14.5, 13.5)),
+                2.0 * s,
+                stroke,
+            );
+            line(p(10.0, 2.5), p(10.0, 13.5));
+        }
+        Icon::Plug => {
+            line(p(6.0, 2.0), p(6.0, 5.0));
+            line(p(10.0, 2.0), p(10.0, 5.0));
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(3.5, 5.0), p(12.5, 9.5)),
+                2.0 * s,
+                stroke,
+            );
+            poly(vec![p(8.0, 9.5), p(8.0, 12.0), p(10.0, 14.0)]);
+        }
+        Icon::Chevron => {
+            poly(vec![p(6.0, 4.0), p(10.0, 8.0), p(6.0, 12.0)]);
+        }
+        Icon::Check => {
+            poly(vec![p(3.5, 8.5), p(6.5, 11.5), p(12.5, 4.5)]);
+        }
+        Icon::Cross => {
+            line(p(4.0, 4.0), p(12.0, 12.0));
+            line(p(4.0, 12.0), p(12.0, 4.0));
+        }
+        Icon::Copy => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(5.5, 5.5), p(13.5, 13.5)),
+                1.8 * s,
+                stroke,
+            );
+            poly(vec![p(10.5, 3.0), p(2.5, 3.0), p(2.5, 10.5)]);
+        }
+        Icon::Stop => {
+            painter.rect_filled(
+                egui::Rect::from_min_max(p(4.5, 4.5), p(11.5, 11.5)),
+                1.5 * s,
+                color,
+            );
+        }
+        Icon::Refresh => {
+            let pts: Vec<Pos2> = (0..=20)
+                .map(|i| {
+                    let a = -0.6 + i as f32 * (4.9 / 20.0);
+                    p(8.0 + a.cos() * 5.0, 8.0 + a.sin() * 5.0)
+                })
+                .collect();
+            poly(pts);
+            poly(vec![p(13.6, 2.4), p(13.2, 5.6), p(10.0, 5.2)]);
+        }
+        Icon::Undo => {
+            poly(vec![p(5.5, 3.5), p(2.5, 6.5), p(5.5, 9.5)]);
+            let mut pts = vec![p(2.5, 6.5)];
+            pts.extend((0..=12).map(|i| {
+                let a = -std::f32::consts::FRAC_PI_2 + i as f32 * (std::f32::consts::PI / 12.0);
+                p(9.0 + a.cos() * 4.0, 10.5 + a.sin() * 4.0)
+            }));
+            pts.push(p(6.0, 14.5));
+            poly(pts);
+        }
+        Icon::Edit => {
+            poly(vec![
+                p(3.0, 13.0),
+                p(3.5, 10.0),
+                p(11.0, 2.5),
+                p(13.5, 5.0),
+                p(6.0, 12.5),
+                p(3.0, 13.0),
+            ]);
+        }
+        Icon::Clip => {
+            let pts: Vec<Pos2> = [
+                (10.5, 6.0),
+                (6.0, 10.5),
+                (6.0, 12.0),
+                (7.5, 12.5),
+                (13.0, 7.0),
+                (13.0, 4.0),
+                (11.0, 2.5),
+                (8.5, 2.5),
+                (3.0, 8.0),
+                (3.0, 12.5),
+                (5.5, 14.5),
+                (8.5, 14.0),
+                (12.5, 10.0),
+            ]
+            .iter()
+            .map(|&(x, y)| p(x, y))
+            .collect();
+            poly(pts);
+        }
+    }
+}
+
+/// A square button showing `icon`; `active` marks a toggled-on panel.
+pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, active: bool, p: &Palette) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let hovered = resp.hovered();
+    if active {
+        ui.painter().rect_filled(rect, 8.0, p.accent_soft);
+    } else if hovered {
+        ui.painter().rect_filled(rect, 8.0, p.hover);
+    }
+    let color = if active {
+        p.accent
+    } else if hovered {
+        p.text
+    } else {
+        p.dim
+    };
+    let glyph = egui::Rect::from_center_size(rect.center(), egui::vec2(size * 0.5, size * 0.5));
+    paint_icon(ui.painter(), glyph, icon, color);
+    click_flash(ui, &resp, 8.0, p);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A small inline action: icon plus optional label, frameless.
+pub fn icon_link(ui: &mut Ui, icon: Icon, label: &str, p: &Palette) -> Response {
+    let id = ui.next_auto_id();
+    let flashing = flash_age(ui, id).is_some();
+    let text = match (label, flashing) {
+        ("Copy", true) => "Copied",
+        _ => label,
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), FontId::proportional(11.5), p.faint);
+    let width = 22.0
+        + if text.is_empty() {
+            0.0
+        } else {
+            galley.size().x + 4.0
+        };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter().rect_filled(rect, 5.0, p.hover);
+    }
+    let color = if flashing {
+        p.accent
+    } else if hovered {
+        p.text
+    } else {
+        p.faint
+    };
+    let glyph = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 11.0, rect.center().y),
+        egui::vec2(12.0, 12.0),
+    );
+    paint_icon(ui.painter(), glyph, icon, color);
+    if !text.is_empty() {
+        ui.painter().galley_with_override_text_color(
+            egui::pos2(rect.left() + 21.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
+    }
+    click_flash(ui, &resp, 5.0, p);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A spinning arc, for work in progress.
+pub fn spinner(ui: &mut Ui, size: f32, color: Color32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    paint_spinner(ui, rect, color);
+    resp
+}
+
+pub fn paint_spinner(ui: &Ui, rect: egui::Rect, color: Color32) {
+    let t = ui.input(|i| i.time) as f32;
+    let r = rect.width().min(rect.height()) / 2.0 - 1.5;
+    let start = t * 5.0;
+    let pts: Vec<egui::Pos2> = (0..=20)
+        .map(|i| {
+            let a = start + i as f32 * (4.2 / 20.0);
+            rect.center() + egui::vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    ui.painter()
+        .add(egui::Shape::line(pts, Stroke::new(1.6, color)));
+    ui.ctx().request_repaint();
+}
+
+/// A rounded label with a soft tint of `color`.
+pub fn pill(ui: &mut Ui, text: &str, color: Color32) -> Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), FontId::proportional(11.0), color);
+    let size = egui::vec2(galley.size().x + 14.0, 19.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 9.5, color.gamma_multiply(0.16));
+    ui.painter().galley(
+        egui::pos2(rect.left() + 7.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    resp
+}
+
+/// A stable colour for a name (sub-agents in the terminal and agent views).
+pub fn name_color(name: &str, p: &Palette) -> Color32 {
+    if name == "main" {
+        return p.accent;
+    }
+    const HUES: [(u8, u8, u8); 6] = [
+        (94, 194, 135),
+        (224, 175, 84),
+        (196, 132, 236),
+        (86, 190, 214),
+        (236, 128, 160),
+        (170, 196, 90),
+    ];
+    let hash = name
+        .bytes()
+        .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+    let (r, g, b) = HUES[(hash as usize) % HUES.len()];
+    Color32::from_rgb(r, g, b)
+}
+
+/// The frame of a raised card.
+pub fn card(p: &Palette) -> egui::Frame {
+    egui::Frame::none()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .rounding(10.0)
+        .inner_margin(Margin::symmetric(12.0, 10.0))
 }
 
 /// Strip emoji and decorative symbols from agent-provided labels

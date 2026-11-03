@@ -369,6 +369,7 @@ Another agent gave you one task. Work on it independently with your tools; the u
                         "  `/session resume|list|load <id>|clear`",
                         "  `/provider [id]`        List providers or switch",
                         "  `/model [id]`           List models or switch",
+                        "  `/mcp`                  MCP servers: list, add, remove, reconnect",
                         "  `/exit`                 Quit",
                         "",
                         "**Terminal UI only**",
@@ -405,6 +406,61 @@ Another agent gave you one task. Work on it independently with your tools; the u
                     ));
                 }
             },
+            "/mcp" => {
+                use crate::tools::mcp;
+                mcp::start();
+                let name = parts.get(2).copied().unwrap_or("");
+                let outcome = match arg {
+                    None | Some("list") => Ok(()),
+                    Some("add") if parts.len() >= 4 => {
+                        let target = parts[3];
+                        let config = if target.starts_with("http://") || target.starts_with("https://") {
+                            mcp::ServerConfig {
+                                url: Some(target.to_string()),
+                                ..Default::default()
+                            }
+                        } else {
+                            mcp::ServerConfig {
+                                command: Some(target.to_string()),
+                                args: parts[4..].iter().map(|a| a.to_string()).collect(),
+                                ..Default::default()
+                            }
+                        };
+                        mcp::add(name, config)
+                    }
+                    Some("remove") if !name.is_empty() => mcp::remove(name),
+                    Some("reconnect") if !name.is_empty() => mcp::reconnect(name),
+                    Some("enable") if !name.is_empty() => mcp::set_enabled(name, true),
+                    Some("disable") if !name.is_empty() => mcp::set_enabled(name, false),
+                    Some(_) => Err("Usage: `/mcp`, `/mcp add <name> <command> [args…]`, \
+                                    `/mcp add <name> <url>`, `/mcp remove|reconnect|enable|disable <name>`"
+                        .into()),
+                };
+                match outcome {
+                    Ok(()) => {
+                        if matches!(arg, Some("add" | "reconnect" | "enable")) {
+                            // Let the connection settle so the list says how it went.
+                            for _ in 0..120 {
+                                let connecting = mcp::list()
+                                    .iter()
+                                    .any(|s| s.name == name && s.status == mcp::Status::Connecting);
+                                if !connecting {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            }
+                        }
+                        self.reply(format!(
+                            "🔌 **MCP servers** ({})\n{}",
+                            mcp::config_path().display(),
+                            mcp::describe_servers()
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = self.event_tx.send(AgentEvent::Error(e));
+                    }
+                }
+            }
             "/loops" => match arg.map(crate::config::parse_loop_limit) {
                 Some(Some(num)) => {
                     self.max_loops = num;
@@ -1363,16 +1419,22 @@ Another agent gave you one task. Work on it independently with your tools; the u
 
         let mut approvals = Vec::with_capacity(calls.len());
         for tc in calls {
-            if self.approval_disabled || !tool_needs_approval(&self.settings, &tc.name) {
-                approvals.push(true);
-                continue;
-            }
             // Unparseable arguments never execute (the model gets an error back),
             // so there is nothing meaningful to approve.
             let Some(args) = parse_tool_args(&tc.arguments) else {
                 approvals.push(true);
                 continue;
             };
+            // Adding an MCP server runs a program of the model's choosing.
+            let changes_mcp = crate::tools::canonical_tool_name(&tc.name)
+                == crate::tools::mcp::MANAGE_TOOL_NAME
+                && crate::tools::mcp::changes_setup(&args);
+            if self.approval_disabled
+                || !(changes_mcp || tool_needs_approval(&self.settings, &tc.name))
+            {
+                approvals.push(true);
+                continue;
+            }
             let _ = self.event_tx.send(AgentEvent::ApprovalRequest {
                 id: tc.id.clone(),
                 tool_name: tc.name.clone(),
@@ -1428,7 +1490,19 @@ Another agent gave you one task. Work on it independently with your tools; the u
                         }
                     }
 
-                    let result = tools.execute(&tc.name, args, &ctx).await;
+                    // No tool may hold the agent forever (a hung network call,
+                    // a stuck child process): past its limit it fails instead.
+                    let limit = tool_time_limit(name, &args);
+                    let result = match tokio::time::timeout(limit, tools.execute(&tc.name, args, &ctx))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => ToolResult::err(format!(
+                            "`{name}` did not finish within {}s and was abandoned. Try a smaller step, \
+                             or for commands give expected_secs / run them in the background.",
+                            limit.as_secs()
+                        )),
+                    };
 
                     if result.success && writes_file {
                         if let Some(path) = target {
@@ -1728,6 +1802,16 @@ fn retry_delay(error: &str, attempt: u32) -> Option<std::time::Duration> {
         "error sending request",
         "stream error",
         "temporarily unavailable",
+        // Gateways answer 400 when the request body got cut off in transit
+        // ("Error reading body"): a network hiccup, not a bad request.
+        "error reading body",
+        "error reading request",
+        "unexpected eof",
+        "incomplete message",
+        "broken pipe",
+        "connection aborted",
+        "bad gateway",
+        "service unavailable",
     ]
     .iter()
     .any(|marker| lower.contains(marker));
@@ -1849,6 +1933,19 @@ fn is_truncated(finish_reason: &str) -> bool {
     matches!(finish_reason, "length" | "max_tokens" | "MAX_TOKENS")
 }
 
+/// Longest a tool call may take before the agent gives up on it. Tools that
+/// wait on purpose get what they asked for plus a margin; the rest get a
+/// generous fixed ceiling (their own timeouts normally fire first).
+fn tool_time_limit(name: &str, args: &serde_json::Value) -> std::time::Duration {
+    let secs = |key: &str, default: u64| args[key].as_u64().unwrap_or(default);
+    std::time::Duration::from_secs(match name {
+        "run_command" => secs("timeout_secs", 300).min(3600) + 30,
+        "manage_processes" => secs("secs", 30).min(600) + 30,
+        subagent::WAIT_TOOL_NAME => secs("timeout_secs", 1800) + 30,
+        _ => 15 * 60,
+    })
+}
+
 /// A sub-agent's tools: everything except starting or waiting for sub-agents.
 fn subagent_tools(tools: ToolRegistry) -> ToolRegistry {
     tools
@@ -1905,7 +2002,8 @@ fn build_system_prompt(settings: &Settings) -> String {
          - Keep replies concise.\n\
          - Web: web_search finds pages, web_fetch reads them; use browser_interact only when fetching is blocked.\n\
          - Check packages with check_package before installing. Python dependencies always go in a project-local virtual environment: create `.venv` if it's missing and call its executables directly (`.venv\\\\Scripts\\\\pip` on Windows, `.venv/bin/pip` elsewhere). Never run `pip install` globally.\n\
-         - Long-running servers: start them with run_command and background=true, and stop them with stop_process using the PID it returned. Never kill processes by name (e.g. `taskkill /IM python.exe`).\n\
+         - Long-running servers: start them with run_command and background=true, and stop them with manage_processes(action=\"stop\") using the PID it returned. Never kill processes by name (e.g. `taskkill /IM python.exe`). For slow commands (builds, test suites, installs) give run_command expected_secs; if it is still running then, do other work and check it later with manage_processes(action=\"wait\").\n\
+         - Sub-agents: only use spawn_agent when the user explicitly asks for agents, sub-agents or parallel workers. Otherwise do all the work yourself, however large the task.\n\
          - Images: generate_image creates new ones; image_search finds real-world photos and graphics; zerochan_search finds existing anime / gacha-game characters (comma-separated tags, e.g. 'Genshin Impact, Furina'). Save them where the user asks, otherwise in the current directory (media/ or static/ subfolders are good practice).\n\
          - When a page or app you built shows images, check them with view_image / batch_view_images (alignment, cropping, aspect ratio) and fix problems, e.g. with a Pillow script.\n\
          - Version control: git_status, git_diff, git_log, git_commit. Commit only when the user asks.\n\
@@ -2130,6 +2228,21 @@ mod tests {
             None
         );
         assert_eq!(retry_delay("429 Please retry in 3600s", 0), None);
+        // A gateway that lost the body in transit: worth another try.
+        assert_eq!(
+            retry_delay(
+                "OpenAI-compatible API error 400 Bad Request: Error reading body",
+                0
+            ),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_delay(
+                "OpenAI-compatible API error 400 Bad Request: invalid tools",
+                0
+            ),
+            None
+        );
     }
 
     #[test]

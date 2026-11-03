@@ -16,6 +16,7 @@ pub mod image_gen;
 pub mod image_inspect;
 pub mod image_search;
 pub mod manage_tasks;
+pub mod mcp;
 pub mod memory;
 pub mod package_safety;
 pub mod processes;
@@ -226,6 +227,8 @@ impl ToolRegistry {
         registry.register(Arc::new(crate::agent::subagent::SpawnAgentTool));
         registry.register(Arc::new(crate::agent::subagent::MessageAgentTool));
         registry.register(Arc::new(crate::agent::subagent::WaitForAgentsTool));
+        registry.register(Arc::new(mcp::McpManageTool));
+        mcp::start();
 
         // ── Git tools ────────────────────────────────────────────────────
         registry.register(Arc::new(git::GitStatusTool));
@@ -260,6 +263,7 @@ impl ToolRegistry {
     ) -> ToolResult {
         match self.get(name) {
             Some(tool) => tool.execute(args, ctx).await,
+            None if name.starts_with(mcp::PREFIX) => mcp::call(name, args).await,
             None => ToolResult::err(format!(
                 "Unknown tool: {name}. Available tools: {}",
                 self.tool_names().join(", ")
@@ -267,9 +271,14 @@ impl ToolRegistry {
         }
     }
 
-    /// Get all tool definitions for the AI API.
+    /// Get all tool definitions for the AI API, with the tools of the MCP
+    /// servers connected right now.
     pub fn tool_defs(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|t| t.to_tool_def()).collect()
+        let mut defs: Vec<ToolDef> = self.tools.values().map(|t| t.to_tool_def()).collect();
+        if self.tools.contains_key(mcp::MANAGE_TOOL_NAME) {
+            defs.extend(mcp::tool_defs());
+        }
+        defs
     }
 
     /// List all registered tool names.

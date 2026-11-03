@@ -18,18 +18,20 @@ impl Tool for ManageProcessesTool {
     }
 
     fn description(&self) -> &str {
-        "Manage background commands started with run_command(background=true): \
-         'list' shows running and recently finished ones, 'logs' shows recent output of one (by pid, \
-         also after it exited), 'stop' terminates it and its child processes."
+        "Manage commands running in the background (started with background=true, or still running \
+         when run_command stopped waiting): 'list' shows running and recently finished ones, 'wait' \
+         waits up to `secs` for one to finish and returns its status and latest output, 'logs' shows \
+         recent output (also after it exited), 'stop' terminates it and its child processes."
     }
 
     fn parameters(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["list", "logs", "stop"], "description": "What to do" },
-                "pid": { "type": "integer", "description": "Process id (required for logs/stop)" },
-                "lines": { "type": "integer", "description": "For logs: how many trailing lines to show (default 60)" }
+                "action": { "type": "string", "enum": ["list", "wait", "logs", "stop"], "description": "What to do" },
+                "pid": { "type": "integer", "description": "Process id (required for wait/logs/stop)" },
+                "secs": { "type": "integer", "description": "For wait: how long to wait at most (default 30, max 600)" },
+                "lines": { "type": "integer", "description": "For logs/wait: how many trailing lines to show (default 60)" }
             },
             "required": ["action"]
         })
@@ -38,6 +40,32 @@ impl Tool for ManageProcessesTool {
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
         let action = args["action"].as_str().unwrap_or("list");
         let pid = args["pid"].as_u64().map(|p| p as u32);
+        if action == "wait" {
+            let Some(pid) = pid else {
+                return ToolResult::err("'pid' is required for wait");
+            };
+            let secs = args["secs"].as_u64().unwrap_or(30).clamp(1, 600);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            while get_background_processes().iter().any(|p| p.pid == pid)
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let still = get_background_processes().iter().any(|p| p.pid == pid);
+            let mut logs = self
+                .execute(
+                    json!({"action": "logs", "pid": pid, "lines": args["lines"]}),
+                    _ctx,
+                )
+                .await;
+            if still {
+                logs.output = format!(
+                    "pid {pid} is still running after waiting {secs}s.\n{}",
+                    logs.output
+                );
+            }
+            return logs;
+        }
         let processes = get_background_processes();
 
         match action {

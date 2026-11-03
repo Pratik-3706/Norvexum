@@ -77,6 +77,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/session resume", "continue the last session"),
     ("/session list", "list saved sessions"),
     ("/loops", "set the tool-loop limit (number or unlimited)"),
+    (
+        "/mcp",
+        "MCP servers: list, add <name> <command|url>, remove",
+    ),
     ("/ask_perms", "toggle tool approval prompts"),
     ("/msg", "note to a sub-agent: /msg tests use nextest"),
     ("/keys", "show key bindings"),

@@ -102,11 +102,114 @@ async fn kill_tree(child: &mut tokio::process::Child) {
     let _ = child.kill().await;
 }
 
-/// Start `cmd` detached from the agent, logging its output to `.norvexum/logs/`.
-fn spawn_background(
+// ---------------------------------------------------------------------------
+// The command feed: every command any agent runs, for the shared terminal.
+// ---------------------------------------------------------------------------
+
+/// One command an agent ran.
+#[derive(Clone, Debug)]
+pub struct CommandRun {
+    pub id: u64,
+    /// "main" or the sub-agent's name.
+    pub agent: String,
+    pub command: String,
+    pub pid: Option<u32>,
+    pub started: std::time::Instant,
+    /// stdout + stderr.
+    pub log_path: std::path::PathBuf,
+    /// When it ended: the exit code (`None`: stopped) and how long it ran.
+    pub ended: Option<(Option<i32>, std::time::Duration)>,
+    /// Left running in the background.
+    pub background: bool,
+    kill_tx: tokio::sync::mpsc::Sender<()>,
+}
+
+/// Stop a command from the feed (and everything it started).
+pub fn stop_command(id: u64) {
+    if let Some(run) = feed().iter().find(|r| r.id == id && r.ended.is_none()) {
+        let _ = run.kill_tx.try_send(());
+    }
+}
+
+/// How many commands the feed keeps.
+const KEEP_FEED: usize = 200;
+
+static FEED: Lazy<Mutex<Vec<CommandRun>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static FEED_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn feed() -> std::sync::MutexGuard<'static, Vec<CommandRun>> {
+    FEED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Every recent command, oldest first.
+pub fn command_feed() -> Vec<CommandRun> {
+    feed().clone()
+}
+
+/// Forget finished commands (the terminal's Clear).
+pub fn clear_command_feed() {
+    feed().retain(|run| run.ended.is_none());
+}
+
+fn feed_update(id: u64, change: impl FnOnce(&mut CommandRun)) {
+    if let Some(run) = feed().iter_mut().find(|r| r.id == id) {
+        change(run);
+    }
+}
+
+fn feed_ended(id: u64) -> bool {
+    feed().iter().any(|r| r.id == id && r.ended.is_some())
+}
+
+/// The last `max_bytes` of a log, starting at a line boundary.
+pub fn read_log_tail(path: &Path, max_bytes: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(max_bytes);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    let _ = file.read_to_end(&mut bytes);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    match (start > 0, text.find('\n')) {
+        (true, Some(cut)) => text[cut + 1..].to_string(),
+        _ => text,
+    }
+}
+
+/// How long a foreground command may run before it is left in the background
+/// and the agent gets control back, when the agent gave no estimate.
+const DEFAULT_WAIT_SECS: u64 = 90;
+
+/// How long to wait for a command the agent expects to take `expected` seconds.
+fn wait_budget(expected: Option<u64>, timeout_secs: u64) -> u64 {
+    match expected {
+        Some(e) => (e + e / 2 + 5).min(timeout_secs),
+        None => DEFAULT_WAIT_SECS.min(timeout_secs),
+    }
+    .max(1)
+}
+
+/// Largest command output handed back to the model.
+const MAX_OUTPUT_BYTES: usize = 30_000;
+
+/// Run `cmd` with its output logged to `.norvexum/logs/`.
+///
+/// `background` returns at once. Otherwise the call waits up to `budget`; a
+/// command still running then keeps going in the background and the agent
+/// gets its output so far, instead of being blocked (or the command killed).
+/// `hard_limit` stops the command for good.
+async fn run_logged(
     mut cmd: tokio::process::Command,
     command_str: &str,
     ctx: &ToolContext,
+    background: bool,
+    budget: std::time::Duration,
+    hard_limit: Option<std::time::Duration>,
 ) -> ToolResult {
     let log_dir = ctx
         .settings
@@ -114,9 +217,10 @@ fn spawn_background(
         .join(crate::config::NORVEXUM_DIR)
         .join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
+    let id = FEED_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let log_path = log_dir.join(format!(
-        "bg-{}.log",
-        chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
+        "cmd-{}-{id}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
     ));
     let (stdout, stderr) =
         match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
@@ -126,6 +230,7 @@ fn spawn_background(
             ),
             Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
         };
+    // A child reading stdin would hang forever (and steal the TUI's keystrokes).
     cmd.stdin(std::process::Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
@@ -133,102 +238,149 @@ fn spawn_background(
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(e) => return ToolResult::err(format!("Failed to spawn background command: {e}")),
+        Err(e) => return ToolResult::err(format!("Failed to execute command: {e}")),
     };
-    let Some(pid) = child.id() else {
-        return ToolResult::ok("Command started in background (no PID available)");
-    };
-
+    let pid = child.id();
+    let started = std::time::Instant::now();
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
-    processes().insert(
-        pid,
-        ProcessInfo {
-            pid,
+    {
+        let mut runs = feed();
+        runs.push(CommandRun {
+            id,
+            agent: ctx.agent_name.clone().unwrap_or_else(|| "main".into()),
             command: command_str.to_string(),
-            kill_tx,
-            started: std::time::Instant::now(),
+            pid,
+            started,
             log_path: log_path.clone(),
-        },
-    );
+            ended: None,
+            background,
+            kill_tx: kill_tx.clone(),
+        });
+        let excess = runs.len().saturating_sub(KEEP_FEED);
+        runs.drain(..excess);
+    }
 
+    let info = pid.map(|pid| ProcessInfo {
+        pid,
+        command: command_str.to_string(),
+        kill_tx,
+        started,
+        log_path: log_path.clone(),
+    });
+    if background {
+        if let Some(info) = &info {
+            processes().insert(info.pid, info.clone());
+        }
+    }
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Option<i32>>();
     tokio::spawn(async move {
+        let limit = async {
+            match hard_limit {
+                Some(limit) => tokio::time::sleep(limit).await,
+                None => std::future::pending().await,
+            }
+        };
         let exit_code = tokio::select! {
             status = child.wait() => status.ok().and_then(|s| s.code()),
             _ = kill_rx.recv() => {
                 kill_tree(&mut child).await;
                 None
             }
+            _ = limit => {
+                kill_tree(&mut child).await;
+                None
+            }
         };
-        // Stopped processes were already removed by `kill_background_process`.
-        let info = processes().remove(&pid);
-        if let Some(info) = info.or_else(|| {
-            get_finished_processes()
-                .into_iter()
-                .find(|f| f.info.pid == pid)
-                .map(|f| f.info)
-        }) {
-            remember_finished(info, exit_code);
+        feed_update(id, |run| run.ended = Some((exit_code, started.elapsed())));
+        if let Some(pid) = pid {
+            // Stopped processes were already moved to the finished list.
+            if let Some(info) = processes().remove(&pid) {
+                remember_finished(info, exit_code);
+            }
         }
+        let _ = done_tx.send(exit_code);
     });
 
-    let log = log_path
+    let shown_log = log_path
         .strip_prefix(&ctx.settings.project_root)
         .unwrap_or(&log_path)
         .display()
         .to_string()
         .replace('\\', "/");
-    ToolResult::ok(format!(
-        "Started in background with PID {pid}; stdout and stderr go to {log}. Read them with \
-         manage_processes(action=\"logs\", pid={pid}) (works after it exits too) and stop it with \
-         manage_processes(action=\"stop\", pid={pid})."
-    ))
-}
+    if background {
+        return match pid {
+            Some(pid) => ToolResult::ok(format!(
+                "Started in background with PID {pid}; stdout and stderr go to {shown_log}. Check it \
+                 with manage_processes(action=\"wait\", pid={pid}, secs=N) or action=\"logs\" (works \
+                 after it exits too) and stop it with manage_processes(action=\"stop\", pid={pid})."
+            )),
+            None => ToolResult::ok("Command started in background (no PID available)"),
+        };
+    }
 
-/// Run `cmd` to completion with a timeout; the process tree is killed on timeout.
-async fn run_foreground(mut cmd: tokio::process::Command, timeout_secs: u64) -> ToolResult {
-    // A child reading stdin would hang forever (and steal the TUI's keystrokes).
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => return ToolResult::err(format!("Failed to execute command: {e}")),
-    };
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let read_all = |pipe: Option<tokio::process::ChildStdout>| async move {
-        let mut buf = Vec::new();
-        if let Some(mut p) = pipe {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut p, &mut buf).await;
-        }
-        buf
-    };
-    let read_err = |pipe: Option<tokio::process::ChildStderr>| async move {
-        let mut buf = Vec::new();
-        if let Some(mut p) = pipe {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut p, &mut buf).await;
-        }
-        buf
-    };
-
-    let run = async {
-        let (out, err, status) = tokio::join!(read_all(stdout), read_err(stderr), child.wait());
-        (out, err, status)
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run).await {
-        Ok((out, err, status)) => handle_output(status.map(|status| std::process::Output {
-            status,
-            stdout: out,
-            stderr: err,
-        })),
+    match tokio::time::timeout(budget, done_rx).await {
+        Ok(exit) => finished_result(exit.ok().flatten(), &log_path, started.elapsed()),
         Err(_) => {
-            kill_tree(&mut child).await;
-            ToolResult::err(format!(
-                "Command timed out after {timeout_secs}s and was stopped. If it is a server or watcher,                  run it with background=true; if it waits for input, use non-interactive flags;                  otherwise pass a larger timeout_secs (max {MAX_TIMEOUT_SECS})."
+            // Still running: leave it in the background unless it ended just now.
+            {
+                let mut procs = processes();
+                if feed_ended(id) {
+                    drop(procs);
+                    let exit = feed()
+                        .iter()
+                        .find(|r| r.id == id)
+                        .and_then(|r| r.ended.and_then(|(code, _)| code));
+                    return finished_result(exit, &log_path, started.elapsed());
+                }
+                if let Some(info) = info {
+                    procs.insert(info.pid, info);
+                }
+            }
+            feed_update(id, |run| run.background = true);
+            let tail = read_log_tail(&log_path, 4_000);
+            let so_far = if tail.trim().is_empty() {
+                "It has printed nothing so far.".to_string()
+            } else {
+                format!("Output so far:\n{}", tail.trim_end())
+            };
+            let pid_text = pid.map_or("?".to_string(), |p| p.to_string());
+            ToolResult::ok(format!(
+                "Still running after {}s, so it continues in the background (PID {pid_text}, log \
+                 {shown_log}). {so_far}\n\nDo other work meanwhile, then check it with \
+                 manage_processes(action=\"wait\", pid={pid_text}, secs=<how long it should still \
+                 take>), or stop it with action=\"stop\".",
+                budget.as_secs()
             ))
         }
+    }
+}
+
+/// The tool result for a command that has ended.
+fn finished_result(exit: Option<i32>, log_path: &Path, ran_for: std::time::Duration) -> ToolResult {
+    let output = std::fs::read(log_path)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let output = crate::util::truncate_middle(output.trim_end(), MAX_OUTPUT_BYTES);
+    let took = if ran_for.as_secs() >= 2 {
+        format!(" after {}s", ran_for.as_secs())
+    } else {
+        String::new()
+    };
+    // Empty sections are omitted — they'd cost tokens on every later request.
+    let mut summary = match exit {
+        Some(code) => format!("Exit code: {code}{took}"),
+        None => format!("The command was stopped{took}"),
+    };
+    if output.trim().is_empty() {
+        summary.push_str(" (no output)");
+    } else {
+        summary.push_str(&format!("\n\nOUTPUT:\n{output}"));
+    }
+    if exit == Some(0) {
+        ToolResult::ok(summary)
+    } else {
+        ToolResult::err(summary)
     }
 }
 
@@ -390,35 +542,6 @@ fn is_denylisted(cmd_name: &str) -> bool {
             | "userdel"
             | "systemctl"
     ) || cmd_name.starts_with("mkfs")
-}
-
-fn handle_output(output_res: std::io::Result<std::process::Output>) -> ToolResult {
-    match output_res {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let code = output.status.code().unwrap_or(-1);
-
-            // Empty sections are omitted — they'd cost tokens on every later request.
-            let mut summary = format!("Exit code: {code}");
-            if !stdout.trim().is_empty() {
-                summary.push_str(&format!("\n\nSTDOUT:\n{}", stdout.trim_end()));
-            }
-            if !stderr.trim().is_empty() {
-                summary.push_str(&format!("\n\nSTDERR:\n{}", stderr.trim_end()));
-            }
-            if stdout.trim().is_empty() && stderr.trim().is_empty() {
-                summary.push_str(" (no output)");
-            }
-
-            if output.status.success() {
-                ToolResult::ok(summary)
-            } else {
-                ToolResult::err(summary)
-            }
-        }
-        Err(e) => ToolResult::err(format!("Failed to execute command: {}", e)),
-    }
 }
 
 /// Split a command line into the commands chained by `&&`, `||`, `&`, `;`,
@@ -672,9 +795,12 @@ impl Tool for ShellCommandTool {
                 "Run a shell command in the project directory (stdin is closed, so interactive prompts fail). \
                  {shell}Inline code (python -c, php -r, node -e, powershell) is fine. \
                  Use non-interactive flags (e.g. `npm init -y`). Use edit_file instead of sed/awk for edits. \
-                 Servers, watchers and long jobs need background=true (manage them with manage_processes). \
-                 Foreground commands time out after {DEFAULT_TIMEOUT_SECS}s by default (max {MAX_TIMEOUT_SECS}s). \
-                 Paths outside the project are blocked."
+                 Servers and watchers need background=true (manage them with manage_processes). \
+                 Give expected_secs, your guess of how long the command takes: the call waits about \
+                 that long (default {DEFAULT_WAIT_SECS}s); a command still running then continues in the \
+                 background and you get its output so far, so you are never blocked; check it later \
+                 with manage_processes(action=\"wait\"). timeout_secs stops it for good (default \
+                 {DEFAULT_TIMEOUT_SECS}s, max {MAX_TIMEOUT_SECS}s). Paths outside the project are blocked."
             )
         });
         &DESCRIPTION
@@ -686,7 +812,8 @@ impl Tool for ShellCommandTool {
             "properties": {
                 "command": { "type": "string", "description": "The command line string to run (must be non-interactive)" },
                 "background": { "type": "boolean", "description": "Run detached (servers, watchers). Returns a PID." },
-                "timeout_secs": { "type": "integer", "description": "Foreground timeout in seconds (default 300, max 3600)" }
+                "expected_secs": { "type": "integer", "description": "Your estimate of how long it takes (e.g. 5 for a quick build step, 120 for a full test suite)" },
+                "timeout_secs": { "type": "integer", "description": "Stop it after this many seconds (default 300, max 3600)" }
             },
             "required": ["command"]
         })
@@ -701,6 +828,12 @@ impl Tool for ShellCommandTool {
             .as_u64()
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
+        let budget = std::time::Duration::from_secs(wait_budget(
+            args["expected_secs"].as_u64(),
+            timeout_secs,
+        ));
+        // Background commands run until stopped; others until timeout_secs.
+        let hard_limit = (!background).then(|| std::time::Duration::from_secs(timeout_secs));
         if command_str.is_empty() {
             return ToolResult::err("Command string cannot be empty");
         }
@@ -793,11 +926,7 @@ impl Tool for ShellCommandTool {
 
             cmd.current_dir(&ctx.cwd);
             prepare_command(&mut cmd);
-
-            if background {
-                return spawn_background(cmd, command_str, ctx);
-            }
-            return run_foreground(cmd, timeout_secs).await;
+            return run_logged(cmd, command_str, ctx, background, budget, hard_limit).await;
         }
 
         // Direct execution path
@@ -809,17 +938,92 @@ impl Tool for ShellCommandTool {
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]).current_dir(&ctx.cwd);
         prepare_command(&mut cmd);
-
-        if background {
-            return spawn_background(cmd, command_str, ctx);
-        }
-        run_foreground(cmd, timeout_secs).await
+        run_logged(cmd, command_str, ctx, background, budget, hard_limit).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context() -> ToolContext {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("shell-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        ToolContext {
+            settings: std::sync::Arc::new(crate::config::Settings {
+                project_root: root.clone(),
+                ..crate::config::Settings::default()
+            }),
+            cwd: root,
+            client: None,
+            temp_memory: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::tools::memory::TempMemory::new(),
+            )),
+            events: None,
+            approvals_off: true,
+            agent_name: Some("tester".into()),
+            inbox: None,
+        }
+    }
+
+    // Longer than the shortest wait (an estimate of 0 still waits 5s).
+    #[cfg(windows)]
+    const SLEEP_LONG: &str = "ping -n 10 127.0.0.1";
+    #[cfg(not(windows))]
+    const SLEEP_LONG: &str = "sleep 9";
+
+    #[tokio::test]
+    async fn quick_commands_return_their_output_and_join_the_feed() {
+        let ctx = context();
+        let result = ShellCommandTool
+            .execute(json!({"command": "echo feed-check"}), &ctx)
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("feed-check"));
+        let run = command_feed()
+            .into_iter()
+            .rfind(|r| r.command == "echo feed-check")
+            .expect("in the feed");
+        assert_eq!(run.agent, "tester");
+        assert!(run.ended.is_some());
+    }
+
+    #[tokio::test]
+    async fn slow_commands_continue_in_the_background_and_can_be_stopped() {
+        let ctx = context();
+        let started = std::time::Instant::now();
+        let result = ShellCommandTool
+            .execute(json!({"command": SLEEP_LONG, "expected_secs": 0}), &ctx)
+            .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+        assert!(result.output.contains("Still running"), "{}", result.output);
+        let run = command_feed()
+            .into_iter()
+            .rfind(|r| r.command == SLEEP_LONG && r.ended.is_none())
+            .expect("still running");
+        assert!(run.background);
+        stop_command(run.id);
+        for _ in 0..40 {
+            if feed_ended(run.id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(feed_ended(run.id));
+        let pid = run.pid.unwrap();
+        assert!(!get_background_processes().iter().any(|p| p.pid == pid));
+    }
+
+    #[test]
+    fn wait_budget_follows_the_estimate() {
+        assert_eq!(wait_budget(Some(10), 300), 20);
+        assert_eq!(wait_budget(Some(1000), 300), 300);
+        assert_eq!(wait_budget(None, 300), DEFAULT_WAIT_SECS);
+        assert_eq!(wait_budget(None, 30), 30);
+    }
 
     #[test]
     fn long_running_detection_uses_word_boundaries() {

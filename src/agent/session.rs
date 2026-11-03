@@ -33,6 +33,26 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub message_count: usize,
     pub model: String,
+    /// The first line of the first prompt ("" when there is none).
+    pub title: String,
+}
+
+/// A chat's title: the first line of its first prompt, without the notes the
+/// agent appends to it.
+fn session_title(messages: &[Message]) -> String {
+    let Some(first) = messages
+        .iter()
+        .find(|m| m.role == crate::ai::types::Role::User)
+    else {
+        return String::new();
+    };
+    let text = first.text();
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('['))
+        .unwrap_or("");
+    crate::util::truncate_chars(line, 80)
 }
 
 impl Session {
@@ -135,6 +155,7 @@ impl Session {
                     if let Ok(content) = std::fs::read_to_string(entry.path()) {
                         if let Ok(session) = serde_json::from_str::<Session>(&content) {
                             summaries.push(SessionSummary {
+                                title: session_title(&session.messages),
                                 id: session.id,
                                 updated_at: session.updated_at,
                                 message_count: session.messages.len(),

@@ -200,10 +200,10 @@ impl Tool for SpawnAgentTool {
     fn description(&self) -> &str {
         "Start a sub-agent: a separate agent with the same tools that works on one self-contained \
          task in this project. It returns at once and the sub-agent runs in the background, so you \
-         keep working at the same time (take a part of the job yourself, or coordinate). Use it when \
-         the user asks for agents or sub-agents (\"use 3 agents\" means you orchestrate 3 sub-agents), \
-         or for independent parts of a big job that can proceed in parallel (research, a separate \
-         module, tests, a review). Its report arrives as a \"[Sub-agent ... finished]\" note; call \
+         keep working at the same time (take a part of the job yourself, or coordinate). ONLY use it \
+         when the user explicitly asks for agents, sub-agents or parallel workers (\"use 3 agents\" \
+         means you orchestrate 3 sub-agents). Never start sub-agents on your own initiative, however \
+         big the job: do the work yourself. Its report arrives as a \"[Sub-agent ... finished]\" note; call \
          wait_for_agents when you need results before going on. Before your final answer you receive \
          every outstanding report: then give the user a summary of what each agent did and the \
          overall result. The sub-agent cannot see this conversation: give it everything it needs in \

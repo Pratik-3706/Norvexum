@@ -40,11 +40,14 @@ pub trait AiClient: Send + Sync {
 /// HTTP client for streaming model APIs.
 ///
 /// A total-request `timeout` would abort long answers mid-stream, so only the
-/// connection and the gap between received chunks are bounded.
+/// connection and the gap between received chunks are bounded. A stream that
+/// goes quiet for two minutes has stalled; the agent then resumes the reply
+/// instead of sitting there (it used to wait five minutes, which looked like
+/// a hang).
 pub fn streaming_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
-        .read_timeout(std::time::Duration::from_secs(300))
+        .read_timeout(std::time::Duration::from_secs(120))
         .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
         .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
         .build()
