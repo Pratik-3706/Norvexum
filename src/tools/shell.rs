@@ -717,7 +717,7 @@ pub(super) fn check_command_paths(command: &str, ctx: &ToolContext) -> Result<()
 
 /// Folder with the Unix tools that ship with Git for Windows (grep, tail, …).
 #[cfg(windows)]
-fn unix_tools_dir() -> Option<&'static std::path::PathBuf> {
+pub(crate) fn unix_tools_dir() -> Option<&'static std::path::PathBuf> {
     static DIR: Lazy<Option<std::path::PathBuf>> = Lazy::new(|| {
         // …\Git\cmd\git.exe → …\Git\usr\bin
         let from_git = which::which("git")
@@ -743,7 +743,7 @@ fn unix_tools_dir() -> Option<&'static std::path::PathBuf> {
 }
 
 #[cfg(not(windows))]
-fn unix_tools_dir() -> Option<&'static std::path::PathBuf> {
+pub(crate) fn unix_tools_dir() -> Option<&'static std::path::PathBuf> {
     None
 }
 

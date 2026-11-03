@@ -339,7 +339,7 @@ pub fn click_flash(ui: &Ui, resp: &Response, rounding: f32, p: &Palette) {
         painter.rect_stroke(
             resp.rect.expand(1.5 * fade),
             rounding,
-            Stroke::new(1.0, p.accent.gamma_multiply(0.8 * fade)),
+            Stroke::new(1.0_f32, p.accent.gamma_multiply(0.8 * fade)),
         );
         ui.ctx().request_repaint();
     }
@@ -863,7 +863,7 @@ pub fn paint_spinner(ui: &Ui, rect: egui::Rect, color: Color32) {
         })
         .collect();
     ui.painter()
-        .add(egui::Shape::line(pts, Stroke::new(1.6, color)));
+        .add(egui::Shape::line(pts, Stroke::new(1.6_f32, color)));
     ui.ctx().request_repaint();
 }
 

@@ -444,7 +444,7 @@ fn step_card(
                                         c + egui::vec2(0.0, 2.0),
                                         c + egui::vec2(4.0, -2.0),
                                     ],
-                                    egui::Stroke::new(1.4, p.faint),
+                                    egui::Stroke::new(1.4_f32, p.faint),
                                 ));
                             } else {
                                 style::paint_icon(ui.painter(), r, Icon::Chevron, p.faint);

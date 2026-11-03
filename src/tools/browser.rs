@@ -290,7 +290,7 @@ fn pin_viewport(tab: &Tab) -> Result<(), String> {
 }
 
 /// Start a browser: the preferred installed one that launches, else the one
-/// headless_chrome finds (or downloads) itself.
+/// headless_chrome finds itself (no download: an installed browser is used).
 fn launch(timeout: Duration) -> Result<Session, String> {
     let headless = IN_APP.load(Ordering::SeqCst);
     let mut last_error = String::new();

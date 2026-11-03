@@ -492,8 +492,7 @@ mod tests {
                 &context,
             )
             .await;
-        if cfg!(windows) && !std::path::Path::new(r"C:\Program Files\Git\usr\bin\tail.exe").exists()
-        {
+        if cfg!(windows) && crate::tools::shell::unix_tools_dir().is_none() {
             return;
         }
         assert!(result.success, "{:?}", result.error);

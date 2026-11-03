@@ -61,7 +61,7 @@ urlencoding = "2.1"
 regex = "1"
 
 # ── Headless Browser ───────────────────────────────────────────────────────
-headless_chrome = { version = "1.0", features = ["fetch"] }
+headless_chrome = "1.0"
 
 # ── Encoding ──────────────────────────────────────────────────────────────
 base64 = "0.22"
