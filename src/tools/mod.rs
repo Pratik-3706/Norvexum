@@ -454,27 +454,36 @@ mod tests {
         std::fs::create_dir_all(root.join("src").join("go-srp")).unwrap();
         let check = |cmd: &str| super::shell::check_command_paths(cmd, &context);
         // False positives reported by the agent: none of these leave the project.
-        for safe in [
+        let mut safe = vec![
             r#"php -r "echo strlen($bin);""#,
-            r#"findstr /C:"pkg/mime" composer.lock"#,
-            r#"powershell Get-Content reports\fuzz.log -Tail 5"#,
-            r#"for %f in (*.log) do @(type %f)"#,
             r#"python -c "print(open('/src/TNEFDecoder/x.php').read())""#,
-            r#"cd src\go-srp && git log -1 & cd ..\.."#,
             r#"cd src/go-srp && cd ../.. && dir"#,
-            r"type reports\fuzz.log | tail -5",
             "echo $HOME",
-        ] {
+        ];
+        // Windows syntax: `/C:` switches and `\` separators. Elsewhere `/C:x`
+        // really is an absolute path, so these only hold on Windows.
+        if cfg!(windows) {
+            safe.extend([
+                r#"findstr /C:"pkg/mime" composer.lock"#,
+                r#"powershell Get-Content reports\fuzz.log -Tail 5"#,
+                r#"for %f in (*.log) do @(type %f)"#,
+                r#"cd src\go-srp && git log -1 & cd ..\.."#,
+                r"type reports\fuzz.log | tail -5",
+            ]);
+        }
+        for safe in safe {
             assert!(check(safe).is_ok(), "{safe}: {:?}", check(safe));
         }
         // Real escapes are still caught, including through a chained cd.
-        for escape in [
-            r"type ..\secrets.txt",
+        let mut escapes = vec![
             "cat ../secrets.txt",
             "cd .. && dir",
             "cd src && cd ../.. && dir",
-            r"cmd /c type ..\x.txt",
-        ] {
+        ];
+        if cfg!(windows) {
+            escapes.extend([r"type ..\secrets.txt", r"cmd /c type ..\x.txt"]);
+        }
+        for escape in escapes {
             assert!(check(escape).is_err(), "{escape} should be blocked");
         }
         std::fs::remove_dir_all(root).unwrap();
