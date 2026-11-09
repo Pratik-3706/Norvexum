@@ -7,16 +7,21 @@
 //
 // The main agent and every sub-agent it starts have their own `Transcript`.
 // Events are routed into the right one and all of them render through the
-// same code: the chat area shows the focused transcript, or the main one and
-// a sub-agent side by side in split view.
+// same code. The screen is one timeline with tool calls inline; agents are
+// tabs, shown one at a time, side by side, or as a grid (`view`). Everything
+// else opens over it: model search, commands, sessions, processes, MCP
+// servers and the tool inspector (`overlay`).
 // ===========================================================================
 
+mod overlay;
 pub mod theme;
+mod view;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -28,22 +33,25 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
-    Frame, Terminal,
+    Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{
-        Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Wrap,
-    },
+    text::{Line, Span},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::AgentEvent;
+use crate::agent::session::SessionSummary;
+use overlay::Overlay;
 use theme::Theme;
+pub use view::draw;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Chat panes the screen can show at once (the grid's largest page).
+const MAX_PANES: usize = 6;
+/// Marks a queued command whose reply is not shown (model and session pickers).
+const QUIET_PREFIX: char = '\u{1}';
 /// Minimum time between redraws while events stream in.
 const FRAME: Duration = Duration::from_millis(33);
 const SPINNER_TICK: Duration = Duration::from_millis(90);
@@ -56,11 +64,10 @@ const PASTE_GAP: Duration = Duration::from_millis(12);
 const LONG_RUN: Duration = Duration::from_secs(20);
 /// Prompts kept in the persistent history.
 const HISTORY_LIMIT: usize = 500;
-/// Sub-agent rows in the agents strip before it scrolls.
-const STRIP_ROWS: usize = 4;
 
 /// Slash commands offered as completions. Most are run by the agent (see its
-/// `/help`); `/agents`, `/copy code` and `/keys` are handled by the TUI.
+/// `/help`); the pickers, `/agents`, `/msg`, `/copy code` and `/keys` are
+/// handled by the TUI.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show all commands"),
     ("/clear", "clear chat and memory"),
@@ -69,17 +76,22 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/copy chat", "copy whole chat"),
     ("/copy code", "copy the last code block"),
     ("/undo", "restore files changed by the last edit"),
-    ("/model", "list or switch models"),
-    ("/provider", "list or switch providers"),
+    ("/model", "search every model, or switch: /model <id>"),
+    (
+        "/provider",
+        "search models by provider, or switch: /provider <id>",
+    ),
     ("/agents", "list sub-agents, or show one: /agents 2"),
     ("/agents split", "main and a sub-agent side by side"),
+    ("/agents grid", "every agent at once"),
     ("/agents stop", "stop the sub-agent being viewed"),
     ("/session resume", "continue the last session"),
-    ("/session list", "list saved sessions"),
+    ("/session list", "search saved sessions"),
+    ("/processes", "commands the agents ran: watch or stop them"),
     ("/loops", "set the tool-loop limit (number or unlimited)"),
     (
         "/mcp",
-        "MCP servers: list, add <name> <command|url>, remove",
+        "MCP servers: manage, or add <name> <command|url>, remove",
     ),
     ("/ask_perms", "toggle tool approval prompts"),
     ("/msg", "note to a sub-agent: /msg tests use nextest"),
@@ -87,40 +99,65 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/exit", "quit"),
 ];
 
-/// Every key binding, shown by the F1 help overlay.
+/// Every key binding, shown by the F1 help overlay. An empty action starts a section.
 const KEY_HELP: &[(&str, &str)] = &[
+    ("OPEN", ""),
+    ("Ctrl+K or Ctrl+P", "command palette: search everything"),
+    ("Ctrl+O", "model search"),
+    ("Ctrl+G", "saved sessions"),
+    ("Ctrl+B", "process monitor"),
+    ("Tab", "tool inspector (completes a / command first)"),
+    ("Alt+M", "MCP servers"),
     ("F1 or ?", "toggle this help"),
+    ("WRITE", ""),
     ("Enter", "send (queues while a run is active)"),
     ("Alt+Enter / Ctrl+J", "new line"),
+    ("@agent text", "note to a running sub-agent"),
     ("Up / Down", "move between lines, then browse history"),
     ("Ctrl+R", "search prompt history (again: older match)"),
-    ("Tab", "complete a / command, or switch to Activity"),
     ("Up / Down in / menu", "pick a command, Enter runs it"),
-    ("PgUp / PgDn", "scroll the chat"),
+    ("Ctrl+V / right click", "paste"),
+    ("Ctrl+W / Ctrl+U", "delete word / to line start"),
+    ("Ctrl+L", "clear the input"),
+    ("READ", ""),
+    ("PgUp / PgDn", "scroll (stays put while replies stream)"),
     ("Shift+Up / Shift+Down", "scroll one line"),
     (
         "Ctrl+Home / Ctrl+End",
         "jump to top / latest (Home / End if empty)",
     ),
     ("Alt+Up / Alt+Down", "jump to the previous / next message"),
+    ("Ctrl+T", "expand or collapse reasoning"),
+    ("Click a tool row", "open it in the tool inspector"),
+    ("AGENTS", ""),
     ("Alt+Left / Alt+Right", "switch between main and sub-agents"),
     ("Alt+0 … Alt+9", "show main / sub-agent N"),
-    ("Ctrl+S or F2", "split view: main beside a sub-agent"),
+    ("Click a tab or card", "focus that agent"),
+    ("Ctrl+S or F2", "split: main beside a sub-agent"),
+    ("Alt+G or F3", "grid: every agent at once"),
+    ("Enter in the grid", "open the focused agent"),
     ("Ctrl+X", "stop the sub-agent being viewed"),
+    ("COPY", ""),
     ("Mouse drag", "select text (copied on release)"),
-    ("Click", "move the cursor, focus a pane or agent"),
-    ("Right click", "paste"),
-    ("Esc", "stop the run, clear selection or input"),
-    ("Ctrl+T", "expand or collapse reasoning"),
     ("Ctrl+Y / Alt+Y", "copy the last reply / last code block"),
     ("Ctrl+A", "copy the whole chat"),
-    ("c (Activity)", "copy the selected tool's output"),
-    ("Ctrl+V", "paste"),
-    ("Ctrl+W / Ctrl+U", "delete word / to line start"),
-    ("Ctrl+L", "clear the input"),
+    ("STOP", ""),
+    ("Esc", "stop the run, clear selection or input"),
     ("Ctrl+C", "copy selection, clear, stop, or quit"),
     ("Ctrl+D", "quit (empty input)"),
 ];
+
+/// How the agents share the screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentLayout {
+    /// One agent, full width.
+    #[default]
+    Focus,
+    /// Main beside a sub-agent.
+    Split,
+    /// Every agent as a card (paged when they don't all fit).
+    Grid,
+}
 
 pub struct App {
     /// The main agent's conversation.
@@ -129,8 +166,8 @@ pub struct App {
     pub subagents: Vec<SubAgentView>,
     /// Transcript the keyboard works on: None for main, else an index into `subagents`.
     pub focus: Option<usize>,
-    /// Main beside a sub-agent (the last one focused).
-    pub split: bool,
+    pub layout: AgentLayout,
+    /// The sub-agent shown beside main in split view (the last one focused).
     split_agent: usize,
     pub input: String,
     /// Cursor position in Unicode scalar values, never raw bytes.
@@ -152,19 +189,26 @@ pub struct App {
     pub is_selecting: bool,
     /// Tool approvals waiting for an answer, oldest first.
     pub approvals: VecDeque<PendingApproval>,
-    // ── Interactive Activity panel state ─────────────────────────────────
-    pub active_panel: ActivePanel,
-    pub selected_tool_index: usize,
-    pub show_tool_details: bool,
-    pub tool_details_scroll: u16,
+    /// What is open over the timeline: model search, palette, help, …
+    overlay: Option<Overlay>,
     pub active_skill: Option<String>,
     pub project_root: PathBuf,
     pub user_backlog: VecDeque<String>,
     /// Show full reasoning text instead of a two-line preview.
     pub show_reasoning: bool,
-    /// Key binding overlay (F1).
-    pub show_help: bool,
-    help_scroll: u16,
+    /// Commands for the agent that didn't come from the composer.
+    outbox: Vec<String>,
+    /// A picker's command is running: its chat reply is not shown.
+    quiet_run: bool,
+    /// Saved sessions, newest first (loaded in the background).
+    recent_sessions: Vec<SessionSummary>,
+    pending_sessions: Option<Receiver<Vec<SessionSummary>>>,
+    /// Local models found after the model search opened.
+    pending_models: Option<Receiver<Vec<crate::config::providers::ModelInfo>>>,
+    /// Per-1K prices of the active model, for the running cost.
+    model_cost: Option<(f64, f64)>,
+    /// Commands still running, as of the last timer tick.
+    running_commands: usize,
     run_started: Option<Instant>,
     spinner_frame: usize,
     notice: Option<(String, Instant)>,
@@ -180,16 +224,23 @@ pub struct App {
     /// Highlighted entry of the `/` menu, and whether the user moved it.
     palette_index: usize,
     palette_moved: bool,
-    /// Chat panes (the second is only used in split view).
-    panes: [Pane; 2],
+    /// Chat panes: one in focus view, two in split view, a page in the grid.
+    panes: [Pane; MAX_PANES],
     /// Pane the current text selection is in.
     selection_pane: usize,
     // Geometry from the last draw, used for mouse hit-testing.
-    tools_area: Cell<Rect>,
-    strip_area: Cell<Rect>,
-    /// First sub-agent shown in the agents strip.
-    strip_first: Cell<usize>,
-    /// Input box (with border) and its text area, plus the first visible row.
+    /// Agent tabs and the agent each one shows.
+    tabs: RefCell<Vec<(Rect, Option<usize>)>>,
+    /// Cards that fit on one grid page.
+    grid_capacity: Cell<usize>,
+    /// The model name in the status line.
+    model_chip: Cell<Rect>,
+    /// Recent-session rows on the start screen, with the session each opens.
+    start_rows: RefCell<Vec<(Rect, usize)>>,
+    /// The open overlay's card, and which list entry each row shows.
+    overlay_area: Cell<Rect>,
+    overlay_rows: RefCell<Vec<(u16, usize)>>,
+    /// Composer (with its top rule) and its text area, plus the first visible row.
     input_box: Cell<Rect>,
     input_area: Cell<Rect>,
     input_scroll: Cell<usize>,
@@ -199,7 +250,12 @@ pub struct App {
 /// scrolling, message jumps, mouse hit-testing and copy.
 #[derive(Default)]
 struct Pane {
+    /// The whole pane, with its card border or header.
+    outer: Cell<Rect>,
+    /// Where the text is.
     area: Cell<Rect>,
+    /// The "↓ N more" pill, which jumps to the latest row when clicked.
+    pill: Cell<Rect>,
     max_scroll: Cell<usize>,
     total_lines: Cell<usize>,
     view_height: Cell<usize>,
@@ -207,6 +263,8 @@ struct Pane {
     message_starts: RefCell<Vec<usize>>,
     visible_plain: RefCell<Vec<String>>,
     visible_meta: RefCell<Vec<RowMeta>>,
+    /// The tool call each visible row belongs to, for click-to-inspect.
+    visible_tools: RefCell<Vec<Option<String>>>,
 }
 
 /// Ctrl+R state: the query, how many older matches were skipped, and the
@@ -222,6 +280,8 @@ struct CachedRender {
     rev: u64,
     width: usize,
     expanded: bool,
+    /// Changes when a live row must redraw without its text changing.
+    stamp: u64,
     lines: Vec<Line<'static>>,
     meta: Vec<RowMeta>,
 }
@@ -290,10 +350,13 @@ impl Rows {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivePanel {
-    Chat,
-    Activity,
+/// What a message needs to know to render.
+struct RenderCtx<'a> {
+    width: usize,
+    theme: &'a Theme,
+    expanded: bool,
+    frame: usize,
+    root: &'a Path,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +399,8 @@ pub enum LineStyle {
     Error,
     Warning,
     FileWrite,
+    /// A tool call, drawn from its entry in the tool log.
+    Tool,
     Status,
     /// A note one agent sent another (message_agent, or the user's /msg).
     Message,
@@ -373,9 +438,14 @@ fn is_file_tool(name: &str) -> bool {
 pub struct Transcript {
     pub lines: Vec<ChatLine>,
     pub tool_log: Vec<ToolLogEntry>,
+    /// Latest tool log position of each call id.
+    tool_index: HashMap<String, usize>,
     pub is_thinking: bool,
-    /// Lines scrolled up from the bottom.
-    pub scroll: usize,
+    /// Rows scrolled up from the bottom. While it is above zero the view holds
+    /// still as new rows arrive, so a streaming reply doesn't move what's being read.
+    pub scroll: Cell<usize>,
+    /// Width and row count at the last draw, for holding the view still.
+    drawn: Cell<(usize, usize)>,
     /// Who signs the replies (a sub-agent's name); None for the main agent.
     agent_name: Option<String>,
     next_rev: u64,
@@ -387,8 +457,10 @@ impl Transcript {
         Self {
             lines: Vec::new(),
             tool_log: Vec::new(),
+            tool_index: HashMap::new(),
             is_thinking: false,
-            scroll: 0,
+            scroll: Cell::new(0),
+            drawn: Cell::new((0, 0)),
             agent_name,
             next_rev: 0,
             render_cache: RefCell::new(Vec::new()),
@@ -403,7 +475,26 @@ impl Transcript {
             tool_call_id,
             rev: self.next_rev,
         });
-        self.scroll = 0;
+        // Sending something always shows it; replies leave a scrolled view alone.
+        if matches!(style, LineStyle::User | LineStyle::Task) {
+            self.scroll.set(0);
+        }
+    }
+
+    fn push_tool(&mut self, entry: ToolLogEntry) {
+        self.tool_index
+            .insert(entry.id.clone(), self.tool_log.len());
+        self.tool_log.push(entry);
+    }
+
+    fn tool(&self, id: &str) -> Option<&ToolLogEntry> {
+        self.tool_index.get(id).and_then(|&i| self.tool_log.get(i))
+    }
+
+    fn tool_mut(&mut self, id: &str) -> Option<&mut ToolLogEntry> {
+        self.tool_index
+            .get(id)
+            .and_then(|&i| self.tool_log.get_mut(i))
     }
 
     /// Mutable access to a chat line that invalidates its render cache.
@@ -417,9 +508,10 @@ impl Transcript {
     fn clear(&mut self) {
         self.lines.clear();
         self.tool_log.clear();
+        self.tool_index.clear();
         self.render_cache.borrow_mut().clear();
         self.is_thinking = false;
-        self.scroll = 0;
+        self.scroll.set(0);
     }
 
     /// Tools cut off by a stop never report back; mark them so they don't spin forever.
@@ -466,7 +558,6 @@ impl Transcript {
                     }
                 }
                 self.is_thinking = true;
-                self.scroll = 0;
                 Ok(Some("Thinking".into()))
             }
             AgentEvent::ThinkingDone => {
@@ -483,7 +574,6 @@ impl Transcript {
                 match self.lines.len().checked_sub(1) {
                     Some(idx) if self.lines[idx].style == LineStyle::Assistant => {
                         self.line_mut(idx).content.push_str(&text);
-                        self.scroll = 0;
                     }
                     _ if !text.trim().is_empty() => {
                         self.push_line(text.trim_start().to_string(), LineStyle::Assistant, None)
@@ -494,7 +584,7 @@ impl Transcript {
             }
             AgentEvent::ToolStart { name, id } => {
                 let status = format!("Running {name}");
-                self.tool_log.push(ToolLogEntry {
+                self.push_tool(ToolLogEntry {
                     id: id.clone(),
                     name: name.clone(),
                     status: ToolStatus::Running,
@@ -509,11 +599,13 @@ impl Transcript {
                         LineStyle::FileWrite,
                         Some(id),
                     );
+                } else {
+                    self.push_line(String::new(), LineStyle::Tool, Some(id));
                 }
                 Ok(Some(status))
             }
             AgentEvent::ToolArgsDelta { id, delta } => {
-                let Some(entry) = self.tool_log.iter_mut().rev().find(|e| e.id == id) else {
+                let Some(entry) = self.tool_mut(&id) else {
                     return Ok(None);
                 };
                 entry.args.push_str(&delta);
@@ -555,21 +647,26 @@ impl Transcript {
                 } else {
                     ToolStatus::Failed
                 };
-                match self.tool_log.iter_mut().rev().find(|e| e.id == id) {
+                match self.tool_mut(&id) {
                     Some(entry) => {
                         entry.status = status;
                         entry.output = result.clone();
                         entry.duration = Some(entry.started.elapsed());
                     }
-                    None => self.tool_log.push(ToolLogEntry {
-                        id: id.clone(),
-                        name: name.clone(),
-                        status,
-                        args: String::new(),
-                        output: result.clone(),
-                        started: Instant::now(),
-                        duration: Some(Duration::ZERO),
-                    }),
+                    None => {
+                        self.push_tool(ToolLogEntry {
+                            id: id.clone(),
+                            name: name.clone(),
+                            status,
+                            args: String::new(),
+                            output: result.clone(),
+                            started: Instant::now(),
+                            duration: Some(Duration::ZERO),
+                        });
+                        if !is_file_tool(&name) {
+                            self.push_line(String::new(), LineStyle::Tool, Some(id.clone()));
+                        }
+                    }
                 }
                 if is_file_tool(&name) {
                     if let Some(idx) = self
@@ -605,80 +702,263 @@ impl Transcript {
         }
     }
 
-    /// Rendered height of one message (cached by revision and width).
-    fn message_height(&self, idx: usize, width: usize, theme: &Theme, expanded: bool) -> usize {
-        self.message_rows(idx, width, theme, expanded).0.len()
+    /// What, besides its text, makes a message's rows out of date.
+    fn render_stamp(&self, idx: usize, frame: usize) -> u64 {
+        let line = &self.lines[idx];
+        match line.style {
+            LineStyle::Thinking if self.is_thinking && idx + 1 == self.lines.len() => 1,
+            LineStyle::Tool | LineStyle::FileWrite => line
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| self.tool(id))
+                .filter(|entry| entry.status == ToolStatus::Running)
+                .map_or(0, |_| frame as u64 + 1),
+            _ => 0,
+        }
     }
 
-    /// Lines plus per-row copy metadata for one message.
-    fn message_rows(
-        &self,
-        idx: usize,
-        width: usize,
-        theme: &Theme,
-        expanded: bool,
-    ) -> (Vec<Line<'static>>, Vec<RowMeta>) {
+    /// Make sure message `idx` has up-to-date rows in the cache.
+    fn ensure_rendered(&self, idx: usize, ctx: &RenderCtx) {
         let line = &self.lines[idx];
-        let live =
-            line.style == LineStyle::Thinking && self.is_thinking && idx + 1 == self.lines.len();
+        let stamp = self.render_stamp(idx, ctx.frame);
         {
             let cache = self.render_cache.borrow();
             if let Some(Some(c)) = cache.get(idx) {
-                if c.rev == line.rev && c.width == width && c.expanded == expanded && !live {
-                    return (c.lines.clone(), c.meta.clone());
+                if c.rev == line.rev
+                    && c.width == ctx.width
+                    && c.expanded == ctx.expanded
+                    && c.stamp == stamp
+                {
+                    return;
                 }
             }
         }
-
-        let (color, label) = label_for(line.style);
-        let color = theme.color(color);
-        let label = match (&self.agent_name, line.style) {
-            _ if live => "∴ Reasoning…  (streaming)".to_string(),
-            (Some(name), LineStyle::Assistant) => format!("◆ {name}"),
-            _ => label.to_string(),
-        };
-        let mut rows = Rows::default();
-        rows.push(
-            Line::from(Span::styled(
-                label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )),
-            RowMeta::default(),
-        );
-        let body_color = match line.style {
-            LineStyle::User | LineStyle::Task => theme.fg,
-            LineStyle::Assistant => theme.assistant_color,
-            LineStyle::Status | LineStyle::Message => theme.dim_color,
-            _ => color,
-        };
-        let mut body = render_markdown(&line.content, width, body_color, line.style, theme);
-        if line.style == LineStyle::Thinking && !expanded && !live && body.lines.len() > 2 {
-            let hidden = body.lines.len() - 2;
-            body.truncate(2);
-            body.push(
-                Line::from(Span::styled(
-                    format!("  … {hidden} more lines (Ctrl+T to expand)"),
-                    Style::default().fg(theme.dim_color),
-                )),
-                RowMeta::copy_as(""),
-            );
-        }
-        rows.append(body);
-        rows.push(Line::default(), RowMeta::default());
-
+        let rows = self.build_rows(idx, ctx);
         let mut cache = self.render_cache.borrow_mut();
         if cache.len() < self.lines.len() {
             cache.resize_with(self.lines.len(), || None);
         }
         cache[idx] = Some(CachedRender {
             rev: line.rev,
-            width,
-            expanded,
-            lines: rows.lines.clone(),
-            meta: rows.meta.clone(),
+            width: ctx.width,
+            expanded: ctx.expanded,
+            stamp,
+            lines: rows.lines,
+            meta: rows.meta,
         });
-        (rows.lines, rows.meta)
     }
+
+    /// Rendered height of one message.
+    fn message_height(&self, idx: usize, ctx: &RenderCtx) -> usize {
+        self.ensure_rendered(idx, ctx);
+        self.render_cache.borrow()[idx]
+            .as_ref()
+            .map_or(0, |c| c.lines.len())
+    }
+
+    /// Rows `from..to` of one message, with their copy metadata.
+    fn message_slice(
+        &self,
+        idx: usize,
+        from: usize,
+        to: usize,
+        ctx: &RenderCtx,
+    ) -> (Vec<Line<'static>>, Vec<RowMeta>) {
+        self.ensure_rendered(idx, ctx);
+        let cache = self.render_cache.borrow();
+        let Some(c) = cache[idx].as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        (c.lines[from..to].to_vec(), c.meta[from..to].to_vec())
+    }
+
+    fn build_rows(&self, idx: usize, ctx: &RenderCtx) -> Rows {
+        let line = &self.lines[idx];
+        let theme = ctx.theme;
+        let width = ctx.width;
+        let compact = |s: LineStyle| matches!(s, LineStyle::Tool | LineStyle::FileWrite);
+        let mut rows = Rows::default();
+        // Tool rows stack tightly; the message after a run of them gets air.
+        if !compact(line.style) && idx > 0 && compact(self.lines[idx - 1].style) {
+            rows.push(Line::default(), RowMeta::default());
+        }
+        let (color, _) = label_for(line.style);
+        let color = theme.color(color);
+        match line.style {
+            LineStyle::Tool => rows.append(self.tool_rows(line, ctx)),
+            LineStyle::FileWrite => {
+                rows.append(self.tool_rows(line, ctx));
+                let failed = line
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| self.tool(id))
+                    .is_some_and(|entry| entry.status == ToolStatus::Failed);
+                if !failed && !line.content.starts_with("Preparing") {
+                    let body =
+                        render_markdown(&line.content, width, theme.dim_color, line.style, theme);
+                    rows.append(body);
+                }
+            }
+            LineStyle::User | LineStyle::Task => {
+                let mut body = render_markdown(&line.content, width, theme.fg, line.style, theme);
+                if line.style == LineStyle::Task {
+                    rows.push(
+                        band(
+                            Line::from(Span::styled(
+                                "  task",
+                                Style::default()
+                                    .fg(theme.dim_color)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            width,
+                            theme,
+                        ),
+                        RowMeta::copy_as(""),
+                    );
+                }
+                body.lines = std::mem::take(&mut body.lines)
+                    .into_iter()
+                    .map(|l| band(l, width, theme))
+                    .collect();
+                rows.append(body);
+                rows.push(Line::default(), RowMeta::default());
+            }
+            LineStyle::Thinking => {
+                let live = self.is_thinking && idx + 1 == self.lines.len();
+                rows.push(
+                    Line::from(Span::styled(
+                        if live {
+                            "∴ Reasoning…  (streaming)"
+                        } else {
+                            "∴ Reasoning"
+                        },
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )),
+                    RowMeta::default(),
+                );
+                let mut body = render_markdown(&line.content, width, color, line.style, theme);
+                if !ctx.expanded && !live && body.lines.len() > 2 {
+                    let hidden = body.lines.len() - 2;
+                    body.truncate(2);
+                    body.push(
+                        Line::from(Span::styled(
+                            format!("  … {hidden} more lines (Ctrl+T to expand)"),
+                            Style::default().fg(theme.dim_color),
+                        )),
+                        RowMeta::copy_as(""),
+                    );
+                }
+                rows.append(body);
+                rows.push(Line::default(), RowMeta::default());
+            }
+            style => {
+                let (glyph, body_color) = match style {
+                    LineStyle::Assistant => ("◆", theme.assistant_color),
+                    LineStyle::Error => ("✗", color),
+                    LineStyle::Warning => ("!", color),
+                    LineStyle::Message => ("⇄", theme.dim_color),
+                    _ => ("•", theme.dim_color),
+                };
+                let mut body = render_markdown(&line.content, width, body_color, style, theme);
+                if let Some(first) = body.lines.first_mut() {
+                    set_gutter(first, glyph, color);
+                }
+                rows.append(body);
+                rows.push(Line::default(), RowMeta::default());
+            }
+        }
+        rows
+    }
+
+    /// One tool call: its state, name, target and time, plus why it failed.
+    fn tool_rows(&self, line: &ChatLine, ctx: &RenderCtx) -> Rows {
+        let theme = ctx.theme;
+        let mut rows = Rows::default();
+        let Some(entry) = line.tool_call_id.as_deref().and_then(|id| self.tool(id)) else {
+            return rows;
+        };
+        let (mark, color) = match entry.status {
+            ToolStatus::Running => (SPINNER[ctx.frame % SPINNER.len()], theme.tool_color),
+            ToolStatus::Success => ("✓", theme.success_color),
+            ToolStatus::Failed => ("✗", theme.error_color),
+        };
+        let duration = format_duration(entry.duration.unwrap_or_else(|| entry.started.elapsed()));
+        let summary = compact_detail(
+            &clean_paths(&summarize_args(&entry.name, &entry.args), ctx.root),
+            400,
+        );
+        let name_w = entry.name.width();
+        let room = ctx
+            .width
+            .saturating_sub(2 + name_w + 2 + 2 + duration.width());
+        let summary = view::fit(&summary, room);
+        let gap = ctx
+            .width
+            .saturating_sub(2 + name_w + 2 + summary.width() + duration.width());
+        rows.push(
+            Line::from(vec![
+                Span::styled(format!("{mark} "), Style::default().fg(color)),
+                Span::styled(
+                    entry.name.clone(),
+                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(summary, Style::default().fg(theme.dim_color)),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(duration, Style::default().fg(theme.dim_color)),
+            ]),
+            RowMeta::text(2, Join::NewLine),
+        );
+        if entry.status == ToolStatus::Failed {
+            let first = entry
+                .output
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or_default()
+                .trim_start_matches("ERROR: ");
+            rows.push(
+                Line::from(Span::styled(
+                    format!("  {}", view::fit(first, ctx.width.saturating_sub(2))),
+                    Style::default().fg(theme.error_color),
+                )),
+                RowMeta::text(2, Join::NewLine),
+            );
+        }
+        rows
+    }
+}
+
+/// Put a marker in the two blank columns markdown rows start with.
+fn set_gutter(line: &mut Line<'static>, glyph: &str, color: Color) {
+    let marker = Span::styled(
+        format!("{glyph} "),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    );
+    match line.spans.first_mut() {
+        Some(first) if first.content.starts_with("  ") => {
+            let rest = first.content[2..].to_string();
+            first.content = rest.into();
+            line.spans.insert(0, marker);
+        }
+        _ => line.spans.insert(0, marker),
+    }
+}
+
+/// A row of the raised band behind the user's messages: a bar on the left and
+/// the background filled to the full width.
+fn band(mut line: Line<'static>, width: usize, theme: &Theme) -> Line<'static> {
+    set_gutter(&mut line, "▌", theme.accent_color);
+    let gap = width.saturating_sub(line.width());
+    for span in &mut line.spans {
+        if span.style.bg.is_none() {
+            span.style = span.style.bg(theme.surface);
+        }
+    }
+    line.spans.push(Span::styled(
+        " ".repeat(gap),
+        Style::default().bg(theme.surface),
+    ));
+    line
 }
 
 /// The last fenced code block in `text` (an unclosed one at the end counts).
@@ -782,7 +1062,7 @@ impl App {
             main: Transcript::new(None),
             subagents: Vec::new(),
             focus: None,
-            split: false,
+            layout: AgentLayout::Focus,
             split_agent: 0,
             input: String::new(),
             cursor_pos: 0,
@@ -800,16 +1080,18 @@ impl App {
             selection_end: None,
             is_selecting: false,
             approvals: VecDeque::new(),
-            active_panel: ActivePanel::Chat,
-            selected_tool_index: 0,
-            show_tool_details: false,
-            tool_details_scroll: 0,
+            overlay: None,
             active_skill: None,
             project_root,
             user_backlog: VecDeque::new(),
             show_reasoning: false,
-            show_help: false,
-            help_scroll: 0,
+            outbox: Vec::new(),
+            quiet_run: false,
+            recent_sessions: Vec::new(),
+            pending_sessions: None,
+            pending_models: None,
+            model_cost: None,
+            running_commands: 0,
             run_started: None,
             spinner_frame: 0,
             notice: None,
@@ -822,24 +1104,121 @@ impl App {
             history_search: None,
             palette_index: 0,
             palette_moved: false,
-            panes: [Pane::default(), Pane::default()],
+            panes: Default::default(),
             selection_pane: 0,
-            tools_area: Cell::new(Rect::default()),
-            strip_area: Cell::new(Rect::default()),
-            strip_first: Cell::new(0),
+            tabs: RefCell::new(Vec::new()),
+            grid_capacity: Cell::new(1),
+            model_chip: Cell::new(Rect::default()),
+            start_rows: RefCell::new(Vec::new()),
+            overlay_area: Cell::new(Rect::default()),
+            overlay_rows: RefCell::new(Vec::new()),
             input_box: Cell::new(Rect::default()),
             input_area: Cell::new(Rect::default()),
             input_scroll: Cell::new(0),
         };
-        app.main.push_line(
-            format!(
-                "Working in `{}`. Ask a question, request a change, or type `/` for commands.",
-                app.project_root.display()
-            ),
-            LineStyle::Status,
-            None,
-        );
+        app.refresh_model_cost();
         app
+    }
+
+    /// The prices of the active model, if the registry knows them.
+    fn refresh_model_cost(&mut self) {
+        self.model_cost = self
+            .model_info
+            .rsplit_once(" / ")
+            .and_then(|(model, provider)| {
+                crate::config::providers::find_provider(provider)?
+                    .models
+                    .into_iter()
+                    .find(|m| m.id == model)
+                    .map(|m| (m.cost_per_1k_input, m.cost_per_1k_output))
+            });
+    }
+
+    /// Reload the saved sessions in the background.
+    fn refresh_sessions(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = self.project_root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::agent::session::Session::list(&root));
+        });
+        self.pending_sessions = Some(rx);
+    }
+
+    /// Pick up results from background work. Returns true if the screen changed.
+    fn poll_background(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(rx) = &self.pending_sessions {
+            if let Ok(sessions) = rx.try_recv() {
+                self.recent_sessions = sessions;
+                self.pending_sessions = None;
+                changed = true;
+            }
+        }
+        if let Some(rx) = &self.pending_models {
+            if let Ok(models) = rx.try_recv() {
+                self.pending_models = None;
+                self.add_local_models(models);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The first screen: nothing has been said yet and nothing is running.
+    fn show_start_screen(&self) -> bool {
+        self.main.lines.is_empty()
+            && self.subagents.is_empty()
+            && (!self.is_processing || self.quiet_run)
+    }
+
+    /// Show a saved conversation in the main transcript.
+    pub fn replay_messages(&mut self, messages: &[crate::ai::types::Message]) {
+        use crate::ai::types::Role;
+        self.main.clear();
+        for message in messages {
+            let style = match message.role {
+                Role::User => LineStyle::User,
+                Role::Assistant => LineStyle::Assistant,
+                Role::System | Role::Tool => continue,
+            };
+            let text = message.text();
+            // The agent's own notes to the model aren't part of the chat.
+            let is_note = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .all(|l| l.starts_with('['));
+            if !is_note {
+                self.main.push_line(text.trim().to_string(), style, None);
+            }
+        }
+    }
+
+    /// Send a command whose chat reply shouldn't be shown; it waits for the
+    /// current run, like any queued message.
+    fn send_quiet(&mut self, command: String) {
+        if self.is_processing {
+            self.user_backlog
+                .push_back(format!("{QUIET_PREFIX}{command}"));
+            self.notify("Will switch when the current run finishes");
+        } else {
+            self.quiet_run = true;
+            self.start_run();
+            self.outbox.push(command);
+        }
+    }
+
+    /// Start the next queued message and return the text to send.
+    fn start_queued(&mut self, next: String) -> String {
+        self.start_run();
+        self.status = "Starting next message".into();
+        match next.strip_prefix(QUIET_PREFIX) {
+            Some(command) => {
+                self.quiet_run = true;
+                command.to_string()
+            }
+            None => next,
+        }
     }
 
     /// Load and keep the prompt history in `path` (one JSON string per line).
@@ -872,6 +1251,9 @@ impl App {
         if !self.is_selecting && self.selection_start.is_some() {
             self.clear_selection();
         }
+        if self.quiet_run && matches!(event, AgentEvent::Content(_)) {
+            return;
+        }
         let event = match self.main.apply(event) {
             Ok(status) => {
                 if let Some(status) = status {
@@ -903,6 +1285,7 @@ impl App {
                     self.add_usage(u);
                 }
                 self.status = match (usage, elapsed) {
+                    _ if std::mem::take(&mut self.quiet_run) => "Ready".into(),
                     (Some(u), Some(t)) if u.total_tokens > 0 => format!(
                         "Done in {} · {} tokens",
                         format_duration(t),
@@ -917,15 +1300,18 @@ impl App {
                 }
             }
             AgentEvent::ModelSwitched { model, provider } => {
+                self.notify(format!("Now using {model}"));
                 self.model_info = format!("{model} / {provider}");
+                self.refresh_model_cost();
             }
             AgentEvent::ClearChat => {
                 self.main.clear();
                 self.subagents.retain(SubAgentView::is_running);
                 self.focus = None;
                 self.split_agent = 0;
-                self.selected_tool_index = 0;
+                self.overlay = None;
                 self.notify("Chat cleared");
+                self.refresh_sessions();
             }
             AgentEvent::Quit => self.should_quit = true,
             AgentEvent::ApprovalRequest {
@@ -1141,22 +1527,41 @@ impl App {
         self.transcript(self.focus)
     }
 
-    fn split_active(&self) -> bool {
-        self.split && !self.subagents.is_empty()
+    /// The layout in effect: split and grid need a sub-agent to show.
+    fn effective_layout(&self) -> AgentLayout {
+        if self.subagents.is_empty() {
+            AgentLayout::Focus
+        } else {
+            self.layout
+        }
+    }
+
+    /// The first agent slot (0 is main) on the grid page holding the focused agent.
+    fn grid_page_first(&self) -> usize {
+        let capacity = self.grid_capacity.get().max(1);
+        let slot = self.focus.map_or(0, |i| i + 1);
+        slot / capacity * capacity
     }
 
     /// Which transcript a chat pane shows.
     fn pane_view(&self, pane: usize) -> Option<usize> {
-        match (pane, self.split_active()) {
-            (0, true) => None,
-            (0, false) => self.focus,
-            _ => Some(self.split_agent.min(self.subagents.len().saturating_sub(1))),
+        match self.effective_layout() {
+            AgentLayout::Focus => self.focus,
+            AgentLayout::Split if pane == 0 => None,
+            AgentLayout::Split => {
+                Some(self.split_agent.min(self.subagents.len().saturating_sub(1)))
+            }
+            AgentLayout::Grid => (self.grid_page_first() + pane).checked_sub(1),
         }
     }
 
     /// The pane showing the focused transcript.
     fn focused_pane(&self) -> usize {
-        usize::from(self.split_active() && self.focus.is_some())
+        match self.effective_layout() {
+            AgentLayout::Focus => 0,
+            AgentLayout::Split => usize::from(self.focus.is_some()),
+            AgentLayout::Grid => self.focus.map_or(0, |i| i + 1) - self.grid_page_first(),
+        }
     }
 
     fn view_busy(&self, view: Option<usize>) -> bool {
@@ -1173,8 +1578,6 @@ impl App {
         }
         if focus != self.focus {
             self.focus = focus;
-            self.selected_tool_index = 0;
-            self.show_tool_details = false;
             self.clear_selection();
         }
     }
@@ -1211,15 +1614,39 @@ impl App {
             self.notify("Split view shows a sub-agent beside main — none started yet");
             return;
         }
-        self.split = !self.split;
-        if self.split && self.focus.is_none() {
+        let on = self.layout != AgentLayout::Split;
+        self.layout = if on {
+            AgentLayout::Split
+        } else {
+            AgentLayout::Focus
+        };
+        if on && self.focus.is_none() {
             self.split_agent = self.subagents.len() - 1;
         }
         self.clear_selection();
-        self.notify(if self.split {
+        self.notify(if on {
             "Split view on (Ctrl+S to turn off)"
         } else {
             "Split view off"
+        });
+    }
+
+    fn toggle_grid(&mut self) {
+        if self.subagents.is_empty() {
+            self.notify("The grid shows every agent at once — no sub-agents yet");
+            return;
+        }
+        let on = self.layout != AgentLayout::Grid;
+        self.layout = if on {
+            AgentLayout::Grid
+        } else {
+            AgentLayout::Focus
+        };
+        self.clear_selection();
+        self.notify(if on {
+            "Grid view on (Enter opens the focused agent, Alt+G turns it off)"
+        } else {
+            "Grid view off"
         });
     }
 
@@ -1273,7 +1700,7 @@ impl App {
                 ));
             }
             text.push_str(
-                "\n`Alt+1…9` or `/agents N` to watch one, `Ctrl+S` to split, `Ctrl+X` to stop one.",
+                "\n`Alt+1…9` or `/agents N` to watch one, `Ctrl+S` to split, `Alt+G` for the grid, `Ctrl+X` to stop one.",
             );
             text
         };
@@ -1295,13 +1722,32 @@ impl App {
                     .trim();
                 self.send_note(to, text);
             }
-            ["/keys"] => {
-                self.show_help = true;
-                self.help_scroll = 0;
+            ["/keys"] => self.overlay = Some(Overlay::Help { scroll: 0 }),
+            ["/model"] => self.open_models(None),
+            ["/provider"] => {
+                let provider = self
+                    .model_info
+                    .rsplit_once(" / ")
+                    .map(|(_, p)| p.to_string());
+                self.open_models(provider);
+            }
+            ["/mcp"] => self.open_mcp(),
+            ["/processes" | "/ps"] => self.open_processes(),
+            ["/sessions"] | ["/session", "list"] => self.open_sessions(),
+            ["/session", "resume"] => {
+                let latest = crate::agent::session::Session::load_latest(&self.project_root);
+                if let Some(session) = &latest {
+                    self.replay_messages(&session.messages);
+                }
+                self.send_quiet("/session resume".to_string());
+                if latest.is_none() {
+                    self.notify("No saved sessions yet");
+                }
             }
             ["/copy", "code"] => self.copy_last_code_block(),
             ["/agents"] => self.list_agents(),
             ["/agents", "split"] => self.toggle_split(),
+            ["/agents", "grid"] => self.toggle_grid(),
             ["/agents", "stop"] => self.cancel_subagent(self.focus),
             ["/agents", "stop", which] => self.cancel_subagent(self.resolve_agent(which)),
             ["/agents", "main" | "0"] => self.set_focus(None),
@@ -1318,9 +1764,9 @@ impl App {
 
     fn scroll_pane(&mut self, pane: usize, delta: isize) {
         let max = self.panes[pane].max_scroll.get();
-        let view = self.pane_view(pane);
-        let t = self.transcript_mut(view);
-        t.scroll = (t.scroll as isize + delta).clamp(0, max as isize) as usize;
+        let t = self.transcript(self.pane_view(pane));
+        t.scroll
+            .set((t.scroll.get() as isize + delta).clamp(0, max as isize) as usize);
     }
 
     fn scroll_chat(&mut self, delta: isize) {
@@ -1329,8 +1775,7 @@ impl App {
 
     fn scroll_to(&mut self, top: bool) {
         let max = self.panes[self.focused_pane()].max_scroll.get();
-        let focus = self.focus;
-        self.transcript_mut(focus).scroll = if top { max } else { 0 };
+        self.focused().scroll.set(if top { max } else { 0 });
     }
 
     fn page(&self) -> isize {
@@ -1416,14 +1861,9 @@ impl App {
         self.copy_text(text, "Copied — Esc clears the highlight")
     }
 
-    fn copy_tool_output(&mut self) {
-        let Some(entry) = self
-            .focused()
-            .tool_log
-            .iter()
-            .rev()
-            .nth(self.selected_tool_index)
-        else {
+    /// Copy the output of the tool call `newest_first` places back.
+    fn copy_tool_output(&mut self, newest_first: usize) {
+        let Some(entry) = self.focused().tool_log.iter().rev().nth(newest_first) else {
             return;
         };
         let text = clean_paths(&entry.output, &self.project_root);
@@ -1452,6 +1892,9 @@ impl App {
 
     /// Text from the clipboard or a bracketed paste.
     fn paste_text(&mut self, text: &str) {
+        if self.overlay_paste(text) {
+            return;
+        }
         self.history_search = None;
         self.insert_text(&text.replace("\r\n", "\n"));
     }
@@ -1459,7 +1902,9 @@ impl App {
     /// A key that arrived as part of a paste burst. Returns false for keys
     /// that should keep their normal meaning.
     fn paste_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
-        if modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) {
+        if self.overlay.is_some()
+            || (modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT))
+        {
             return false;
         }
         match key {
@@ -1468,7 +1913,6 @@ impl App {
             KeyCode::Char(c) => self.paste_text(&c.to_string()),
             _ => return false,
         }
-        self.active_panel = ActivePanel::Chat;
         self.history_pos = None;
         self.clear_selection();
         true
@@ -1485,7 +1929,6 @@ impl App {
         let target_row = (row - area.y) as usize + self.input_scroll.get();
         let target_col = (column - area.x) as usize;
         self.cursor_pos = cursor_at(&self.input, area.width as usize, target_row, target_col);
-        self.active_panel = ActivePanel::Chat;
         self.clear_selection();
     }
 
@@ -1497,32 +1940,40 @@ impl App {
                 && row >= r.y
                 && row < r.y + r.height
         };
-        let over_tools = inside(self.tools_area.get());
-        // Include the chat's left padding so a drag can start at the margin.
-        let pane_at = (0..2).find(|&p| {
-            let a = self.panes[p].area.get();
-            a.width > 0 && inside(Rect::new(a.x.saturating_sub(2), a.y, a.width + 2, a.height))
-        });
+        if self.overlay.is_some() {
+            self.overlay_mouse(kind, column, row);
+            return;
+        }
+        let pane_at = (0..MAX_PANES).find(|&p| inside(self.panes[p].outer.get()));
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let strip = self.strip_area.get();
-                if over_tools {
-                    self.active_panel = ActivePanel::Activity;
-                    self.clear_selection();
+                let tab = self
+                    .tabs
+                    .borrow()
+                    .iter()
+                    .find(|(rect, _)| inside(*rect))
+                    .map(|(_, view)| *view);
+                let session = self
+                    .start_rows
+                    .borrow()
+                    .iter()
+                    .find(|(rect, _)| inside(*rect))
+                    .map(|(_, i)| *i);
+                let pill = pane_at.filter(|&p| inside(self.panes[p].pill.get()));
+                if let Some(view) = tab {
+                    self.set_focus(view);
+                } else if inside(self.model_chip.get()) {
+                    self.open_models(None);
+                } else if let Some(i) = session {
+                    self.load_session(i);
                 } else if inside(self.input_box.get()) {
                     self.click_input(column, row);
-                } else if inside(strip) {
-                    let r = (row - strip.y) as usize;
-                    if r == 0 {
-                        self.set_focus(None);
-                    } else {
-                        self.set_focus(Some(self.strip_first.get() + r - 1));
-                    }
+                } else if let Some(p) = pill {
+                    self.transcript(self.pane_view(p)).scroll.set(0);
                 } else if let Some(p) = pane_at {
                     let view = self.pane_view(p);
                     self.set_focus(view);
-                    self.active_panel = ActivePanel::Chat;
-                    self.selection_pane = p;
+                    self.selection_pane = self.focused_pane();
                     self.selection_start = Some((column, row));
                     self.selection_end = Some((column, row));
                     self.is_selecting = true;
@@ -1546,21 +1997,19 @@ impl App {
                     self.copy_selection(false);
                 } else {
                     self.clear_selection();
+                    // A plain click on a tool row opens it.
+                    let pane = &self.panes[self.selection_pane];
+                    let index = row.saturating_sub(pane.area.get().y) as usize;
+                    let tool = pane.visible_tools.borrow().get(index).cloned().flatten();
+                    if let Some(id) = tool {
+                        self.open_inspector(Some(&id));
+                    }
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = kind == MouseEventKind::ScrollUp;
-                if over_tools {
-                    let last = self.focused().tool_log.len().saturating_sub(1);
-                    self.selected_tool_index = if up {
-                        self.selected_tool_index.saturating_sub(1)
-                    } else {
-                        (self.selected_tool_index + 1).min(last)
-                    };
-                } else {
-                    let pane = pane_at.unwrap_or_else(|| self.focused_pane());
-                    self.scroll_pane(pane, if up { 3 } else { -3 });
-                }
+                let pane = pane_at.unwrap_or_else(|| self.focused_pane());
+                self.scroll_pane(pane, if up { 3 } else { -3 });
             }
             _ => {}
         }
@@ -1573,9 +2022,8 @@ impl App {
         let total = pane.total_lines.get();
         let view = pane.view_height.get();
         let max = pane.max_scroll.get();
-        let focus = self.focus;
-        let t = self.transcript_mut(focus);
-        let top = total.saturating_sub(view + t.scroll.min(max));
+        let t = self.focused();
+        let top = total.saturating_sub(view + t.scroll.get().min(max));
         let target = if dir < 0 {
             starts
                 .iter()
@@ -1587,12 +2035,12 @@ impl App {
             match starts.iter().find(|&&s| s > top) {
                 Some(&s) => s,
                 None => {
-                    t.scroll = 0;
+                    t.scroll.set(0);
                     return;
                 }
             }
         };
-        t.scroll = total.saturating_sub(view + target).min(max);
+        t.scroll.set(total.saturating_sub(view + target).min(max));
     }
 
     fn copy_transcript(&mut self) {
@@ -1600,7 +2048,12 @@ impl App {
         let text = t
             .lines
             .iter()
-            .filter(|l| !matches!(l.style, LineStyle::Status | LineStyle::Thinking))
+            .filter(|l| {
+                !matches!(
+                    l.style,
+                    LineStyle::Status | LineStyle::Thinking | LineStyle::Tool
+                )
+            })
             .map(|l| {
                 let label = match (&t.agent_name, l.style) {
                     (Some(name), LineStyle::Assistant) => format!("◆ {name}"),
@@ -1772,46 +2225,12 @@ impl App {
             self.clear_selection();
         }
 
-        if self.show_help {
-            match key {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) | KeyCode::Char('q' | '?') => {
-                    self.show_help = false
-                }
-                KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
-                KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1),
-                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
-                KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(10),
-                _ => {}
-            }
+        if self.overlay.is_some() {
+            self.overlay_key(key, modifiers);
             return None;
         }
         if key == KeyCode::F(1) || (key == KeyCode::Char('?') && self.input.is_empty()) {
-            self.show_help = true;
-            self.help_scroll = 0;
-            return None;
-        }
-
-        // Tool details overlay
-        if self.show_tool_details {
-            match key {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                    self.show_tool_details = false
-                }
-                KeyCode::Char('c') => self.copy_tool_output(),
-                KeyCode::Up => {
-                    self.tool_details_scroll = self.tool_details_scroll.saturating_sub(1)
-                }
-                KeyCode::Down => {
-                    self.tool_details_scroll = self.tool_details_scroll.saturating_add(1)
-                }
-                KeyCode::PageUp => {
-                    self.tool_details_scroll = self.tool_details_scroll.saturating_sub(10)
-                }
-                KeyCode::PageDown => {
-                    self.tool_details_scroll = self.tool_details_scroll.saturating_add(10)
-                }
-                _ => {}
-            }
+            self.overlay = Some(Overlay::Help { scroll: 0 });
             return None;
         }
 
@@ -1819,45 +2238,13 @@ impl App {
             return self.history_search_key(key, modifiers);
         }
 
-        // Agent views work from both panels.
-        if self.agent_view_key(key, ctrl, alt) {
+        if self.agent_view_key(key, ctrl, alt) || self.overlay_shortcut(key, ctrl, alt) {
             return None;
         }
 
         let suggestions = self.command_suggestions().len();
         if key == KeyCode::Tab && suggestions == 0 {
-            self.active_panel = match self.active_panel {
-                ActivePanel::Chat => ActivePanel::Activity,
-                ActivePanel::Activity => ActivePanel::Chat,
-            };
-            return None;
-        }
-
-        if self.active_panel == ActivePanel::Activity {
-            let last = self.focused().tool_log.len().saturating_sub(1);
-            match key {
-                KeyCode::Esc => self.active_panel = ActivePanel::Chat,
-                KeyCode::Up => {
-                    self.selected_tool_index = self.selected_tool_index.saturating_sub(1)
-                }
-                KeyCode::Down => {
-                    self.selected_tool_index = (self.selected_tool_index + 1).min(last)
-                }
-                KeyCode::PageUp => {
-                    self.selected_tool_index = self.selected_tool_index.saturating_sub(5)
-                }
-                KeyCode::PageDown => {
-                    self.selected_tool_index = (self.selected_tool_index + 5).min(last)
-                }
-                KeyCode::Home => self.selected_tool_index = 0,
-                KeyCode::End => self.selected_tool_index = last,
-                KeyCode::Char('c') => self.copy_tool_output(),
-                KeyCode::Enter if !self.focused().tool_log.is_empty() => {
-                    self.show_tool_details = true;
-                    self.tool_details_scroll = 0;
-                }
-                _ => {}
-            }
+            self.open_inspector(None);
             return None;
         }
 
@@ -1886,14 +2273,7 @@ impl App {
             KeyCode::Char('y') if ctrl => self.copy_last_reply(),
             KeyCode::Char('y') if alt => self.copy_last_code_block(),
             KeyCode::Char('r') if ctrl => self.start_history_search(),
-            KeyCode::Char('t') if ctrl => {
-                self.show_reasoning = !self.show_reasoning;
-                self.notify(if self.show_reasoning {
-                    "Showing full reasoning"
-                } else {
-                    "Reasoning collapsed"
-                });
-            }
+            KeyCode::Char('t') if ctrl => self.toggle_reasoning(),
             KeyCode::Char('v') if ctrl => {
                 if let Ok(text) = arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     self.paste_text(&text);
@@ -1927,29 +2307,7 @@ impl App {
                     Some(cmd) => cmd.to_string(),
                     None => self.input.trim().to_string(),
                 };
-                if message.is_empty() {
-                    return None;
-                }
-                self.remember(&message);
-                self.history_pos = None;
-                self.set_input(String::new());
-                self.clear_selection();
-
-                if message.starts_with('/') && self.local_command(&message) {
-                    return None;
-                }
-                // The reply comes from the main agent: show it.
-                if !self.split_active() {
-                    self.set_focus(None);
-                }
-                if self.is_processing {
-                    self.main.push_line(message.clone(), LineStyle::User, None);
-                    self.user_backlog.push_back(message);
-                    self.notify(format!("Queued — {} waiting", self.user_backlog.len()));
-                    return None;
-                }
-                self.add_user_message(message.clone());
-                return Some(message);
+                return self.submit(message);
             }
             KeyCode::Tab => {
                 let suggestions = self.command_suggestions();
@@ -1971,7 +2329,9 @@ impl App {
                     self.cancel_requested = true;
                 } else if !self.input.is_empty() {
                     self.set_input(String::new());
-                } else if self.focus.is_some() && !self.split_active() {
+                } else if self.effective_layout() == AgentLayout::Grid {
+                    self.layout = AgentLayout::Focus;
+                } else if self.focus.is_some() && self.effective_layout() != AgentLayout::Split {
                     self.set_focus(None);
                 }
             }
@@ -2038,10 +2398,59 @@ impl App {
             }
             KeyCode::Char('s') if ctrl => self.toggle_split(),
             KeyCode::F(2) => self.toggle_split(),
+            KeyCode::Char('g') if alt && !ctrl => self.toggle_grid(),
+            KeyCode::F(3) => self.toggle_grid(),
             KeyCode::Char('x') if ctrl => self.cancel_subagent(self.focus),
             _ => return false,
         }
         true
+    }
+
+    /// Send what's in the composer: a local command, a note to an agent, or a
+    /// message to the main agent (returned for the event loop to deliver).
+    fn submit(&mut self, message: String) -> Option<String> {
+        if message.is_empty() {
+            // In the grid, Enter opens the focused agent.
+            if self.effective_layout() == AgentLayout::Grid {
+                self.layout = AgentLayout::Focus;
+            }
+            return None;
+        }
+        self.remember(&message);
+        self.history_pos = None;
+        self.set_input(String::new());
+        self.clear_selection();
+
+        if message.starts_with('/') && self.local_command(&message) {
+            return None;
+        }
+        // `@tests use nextest` is a note to that sub-agent. Anything else that
+        // starts with @ (a file reference, say) goes to the main agent.
+        if let Some((who, text)) = message
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once(char::is_whitespace))
+        {
+            let known = self
+                .subagents
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(who));
+            if known && !text.trim().is_empty() {
+                self.send_note(who, text.trim());
+                return None;
+            }
+        }
+        // The reply comes from the main agent: show it.
+        if self.effective_layout() == AgentLayout::Focus {
+            self.set_focus(None);
+        }
+        if self.is_processing {
+            self.main.push_line(message.clone(), LineStyle::User, None);
+            self.user_backlog.push_back(message);
+            self.notify(format!("Queued — {} waiting", self.user_backlog.len()));
+            return None;
+        }
+        self.add_user_message(message.clone());
+        Some(message)
     }
 
     fn set_input(&mut self, text: String) {
@@ -2225,6 +2634,7 @@ fn label_for(style: LineStyle) -> (ThemeColor, &'static str) {
         LineStyle::Error => (ThemeColor::Error, "✗ Error"),
         LineStyle::Warning => (ThemeColor::Tool, "! Notice"),
         LineStyle::FileWrite => (ThemeColor::File, "✎ File"),
+        LineStyle::Tool => (ThemeColor::Tool, "⚙ Tool"),
         LineStyle::Status => (ThemeColor::Dim, "• Norvexum"),
         LineStyle::Message => (ThemeColor::Thinking, "⇄ Message"),
     }
@@ -2255,657 +2665,19 @@ impl Theme {
     }
 }
 
-// ── Drawing ───────────────────────────────────────────────────────────────
-
-pub fn draw(frame: &mut Frame, app: &App) {
-    let theme = &app.theme;
-    let area = frame.area();
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme.bg).fg(theme.fg)),
-        area,
-    );
-
-    let input_width = area.width.saturating_sub(4).max(1) as usize;
-    let input_rows = (input_line_count(&app.input, input_width) as u16).clamp(1, MAX_INPUT_ROWS);
-    let strip_rows = agents_strip_height(app, area.height, input_rows);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(strip_rows),
-            Constraint::Min(4),
-            Constraint::Length(input_rows + 2),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    draw_header(frame, rows[0], app);
-    if strip_rows > 0 {
-        draw_agents(frame, rows[1], app);
-    } else {
-        app.strip_area.set(Rect::default());
-    }
-
-    app.panes[1].area.set(Rect::default());
-    app.tools_area.set(Rect::default());
-    let body = rows[2];
-    if app.split_active() {
-        let widths: &[u16] = if area.width >= 140 {
-            &[36, 36, 28]
-        } else {
-            &[50, 50]
-        };
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(widths.iter().map(|&w| Constraint::Percentage(w)))
-            .split(body);
-        draw_chat(frame, columns[0], app, 0);
-        draw_chat(frame, columns[1], app, 1);
-        if let Some(&tools) = columns.get(2) {
-            draw_tools(frame, tools, app);
-        }
-    } else if area.width >= 100 {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
-            .split(body);
-        draw_chat(frame, columns[0], app, 0);
-        draw_tools(frame, columns[1], app);
-    } else {
-        draw_chat(frame, body, app, 0);
-    }
-
-    draw_input(frame, rows[3], app);
-    draw_footer(frame, rows[4], app);
-    draw_suggestions(frame, rows[3], app);
-
-    if let Some(pending) = app.approvals.front() {
-        draw_approval(frame, area, app, pending);
-    }
-    if app.show_tool_details {
-        draw_tool_details(frame, area, app);
-    }
-    if app.show_help {
-        draw_help(frame, area, app);
-    }
-    if let (Some(start), Some(end)) = (app.selection_start, app.selection_end) {
-        highlight_selection(frame, start, end, app.panes[app.selection_pane].area.get());
-    }
-}
-
-fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let mut lines: Vec<Line> = KEY_HELP
-        .iter()
-        .map(|(keys, action)| {
-            Line::from(vec![
-                Span::styled(format!("{keys:<24}"), Style::default().fg(theme.fg)),
-                Span::styled(*action, Style::default().fg(theme.dim_color)),
-            ])
-        })
-        .collect();
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "COMMANDS",
-        Style::default()
-            .fg(theme.accent_color)
-            .add_modifier(Modifier::BOLD),
-    )));
-    for (cmd, action) in SLASH_COMMANDS {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{cmd:<24}"), Style::default().fg(theme.fg)),
-            Span::styled(*action, Style::default().fg(theme.dim_color)),
-        ]));
-    }
-
-    let height = (lines.len() as u16 + 4).min(area.height);
-    let width = 72.min(area.width);
-    let modal = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    let visible = height.saturating_sub(4);
-    let scroll = app
-        .help_scroll
-        .min((lines.len() as u16).saturating_sub(visible));
-    let hint = if (lines.len() as u16) > visible {
-        " ↑↓ scroll · Esc to close "
-    } else {
-        " Esc to close "
-    };
-    frame.render_widget(Clear, modal);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .scroll((scroll, 0))
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        " Keys ",
-                        Style::default()
-                            .fg(theme.accent_color)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .title_bottom(Span::styled(hint, Style::default().fg(theme.dim_color)))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.border_color))
-                    .padding(Padding::new(2, 2, 1, 0)),
-            )
-            .style(Style::default().fg(theme.fg).bg(theme.bg)),
-        modal,
-    );
-}
-
-/// "Enter send · Esc stop" with the keys brighter than their actions.
-fn hint_line(pairs: &[(&str, &str)], theme: &Theme) -> Line<'static> {
-    let mut spans = vec![Span::raw(" ")];
-    for (i, (key, action)) in pairs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(
-                "  ·  ",
-                Style::default().fg(theme.border_color),
-            ));
-        }
-        spans.push(Span::styled(key.to_string(), Style::default().fg(theme.fg)));
-        spans.push(Span::styled(
-            format!(" {action}"),
-            Style::default().fg(theme.dim_color),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn highlight_selection(frame: &mut Frame, start: (u16, u16), end: (u16, u16), bounds: Rect) {
-    let (p1, p2) = if (start.1, start.0) <= (end.1, end.0) {
-        (start, end)
-    } else {
-        (end, start)
-    };
-    let style = Style::default()
-        .bg(Color::Rgb(46, 56, 92))
-        .fg(Color::Rgb(240, 242, 248));
-    let buffer = frame.buffer_mut();
-    let right = bounds.x + bounds.width.saturating_sub(1);
-    for row in p1.1.max(bounds.y)..=p2.1.min(bounds.y + bounds.height.saturating_sub(1)) {
-        let from = if row == p1.1 {
-            p1.0.max(bounds.x)
-        } else {
-            bounds.x
-        };
-        let to = if row == p2.1 { p2.0.min(right) } else { right };
-        for col in from..=to {
-            if let Some(cell) = buffer.cell_mut((col, row)) {
-                cell.set_style(style);
-            }
-        }
-    }
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let mut title = vec![
-        Span::styled(
-            " NORVEXUM ",
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.accent_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  {}", app.model_info),
-            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(skill) = &app.active_skill {
-        title.push(Span::styled(
-            format!("  ✦ {skill}"),
-            Style::default().fg(theme.accent_color),
-        ));
-    }
-    if app.total_tokens_used > 0 {
-        let mut tokens = format!("  · {} tokens", format_tokens(app.total_tokens_used));
-        if area.width >= 120 && app.prompt_tokens_used + app.completion_tokens_used > 0 {
-            tokens.push_str(&format!(
-                " ({} in · {} out)",
-                format_tokens(app.prompt_tokens_used),
-                format_tokens(app.completion_tokens_used)
-            ));
-        }
-        title.push(Span::styled(tokens, Style::default().fg(theme.dim_color)));
-    }
-    let running = app.subagents.iter().filter(|s| s.is_running()).count();
-    if running > 0 {
-        title.push(Span::styled(
-            format!(
-                "  · {running} sub-agent{} running",
-                if running == 1 { "" } else { "s" }
-            ),
-            Style::default().fg(theme.tool_color),
-        ));
-    }
-    if crate::tools::browser::is_open() {
-        let busy = crate::tools::browser::agent_busy();
-        title.push(Span::styled(
-            if busy {
-                "  · browser in use"
-            } else {
-                "  · browser open"
-            },
-            Style::default().fg(if busy {
-                theme.tool_color
-            } else {
-                theme.dim_color
-            }),
-        ));
-    }
-
-    let (indicator, color) = if app.is_processing {
-        (SPINNER[app.spinner_frame % SPINNER.len()], theme.tool_color)
-    } else if app.status == "Error" {
-        ("✗", theme.error_color)
-    } else {
-        ("●", theme.success_color)
-    };
-    let mut status = vec![
-        Span::styled(format!("{indicator} "), Style::default().fg(color)),
-        Span::styled(app.status.clone(), Style::default().fg(theme.fg)),
-    ];
-    if let Some(started) = app.run_started.filter(|_| app.is_processing) {
-        status.push(Span::styled(
-            format!("  {}", format_duration(started.elapsed())),
-            Style::default().fg(theme.dim_color),
-        ));
-    }
-
-    let block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(theme.border_color));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let status = Line::from(status);
-    let status_w = (status.width() as u16 + 1).min(inner.width / 2);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(10), Constraint::Length(status_w)])
-        .split(inner);
-    frame.render_widget(Paragraph::new(Line::from(title)), cols[0]);
-    frame.render_widget(Paragraph::new(status).alignment(Alignment::Right), cols[1]);
-}
-
-/// Rows for the agents strip (0 when there are no sub-agents or no room).
-fn agents_strip_height(app: &App, height: u16, input_rows: u16) -> u16 {
-    if app.subagents.is_empty() {
-        return 0;
-    }
-    // Main row, one row per sub-agent and the bottom border.
-    let wanted = (app.subagents.len().min(STRIP_ROWS) + 2) as u16;
-    // Header, input box, footer and at least six chat rows come first.
-    let room = height.saturating_sub(2 + input_rows + 2 + 1 + 6);
-    if room < 3 { 0 } else { wanted.min(room) }
-}
-
-/// One row of the agents strip.
-struct AgentRow<'a> {
-    focused: bool,
-    number: String,
-    name: &'a str,
-    icon: &'a str,
-    icon_color: Color,
-    activity: String,
-    right: String,
-}
-
-fn agent_row(row: AgentRow, name_w: usize, width: usize, theme: &Theme) -> Line<'static> {
-    let name = if row.name.width() > name_w {
-        crate::util::truncate_chars(row.name, name_w.saturating_sub(1))
-    } else {
-        row.name.to_string()
-    };
-    let name = format!("{name}{}", " ".repeat(name_w.saturating_sub(name.width())));
-    let left_w = 2 + row.number.width() + 1 + name_w + 2 + row.icon.width() + 1;
-    let room = width.saturating_sub(left_w + row.right.width() + 2);
-    let mut activity = compact_detail(&row.activity, 300);
-    if activity.width() > room {
-        activity = crate::util::truncate_chars(&activity, room.saturating_sub(1));
-    }
-    let gap = width.saturating_sub(left_w + activity.width() + row.right.width());
-    let (marker, name_style) = if row.focused {
-        (
-            "▸ ",
-            Style::default()
-                .fg(theme.accent_color)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        ("  ", Style::default().fg(theme.fg))
-    };
-    Line::from(vec![
-        Span::styled(marker, Style::default().fg(theme.accent_color)),
-        Span::styled(
-            format!("{} ", row.number),
-            Style::default().fg(theme.dim_color),
-        ),
-        Span::styled(name, name_style),
-        Span::raw("  "),
-        Span::styled(row.icon.to_string(), Style::default().fg(row.icon_color)),
-        Span::raw(" "),
-        Span::styled(
-            activity,
-            Style::default().fg(if row.focused {
-                theme.fg
-            } else {
-                theme.dim_color
-            }),
-        ),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(row.right, Style::default().fg(theme.dim_color)),
-    ])
-}
-
-/// Main plus each sub-agent: state, what it is doing, tokens and time.
-fn draw_agents(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let len = app.subagents.len();
-    let agent_rows = (area.height as usize).saturating_sub(2);
-    let mut first = app.strip_first.get().min(len.saturating_sub(agent_rows));
-    if let Some(f) = app.focus {
-        if f < first {
-            first = f;
-        } else if f >= first + agent_rows {
-            first = f + 1 - agent_rows;
-        }
-    }
-    app.strip_first.set(first);
-    let shown: Vec<usize> = (first..len).take(agent_rows).collect();
-    let hidden = len - shown.len();
-
-    let mut block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(theme.border_color))
-        .padding(Padding::new(1, 1, 0, 0))
-        .title_bottom(
-            Line::from(Span::styled(
-                " Alt+←→ switch · Ctrl+S split · Ctrl+X stop ",
-                Style::default().fg(theme.dim_color),
-            ))
-            .right_aligned(),
-        );
-    if hidden > 0 {
-        block = block.title_bottom(Span::styled(
-            format!(" +{hidden} more "),
-            Style::default().fg(theme.dim_color),
-        ));
-    }
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    app.strip_area.set(inner);
-
-    let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
-    let name_w = shown
-        .iter()
-        .map(|&i| app.subagents[i].name.width())
-        .chain([4])
-        .max()
-        .unwrap_or(4)
-        .min(18);
-    let width = inner.width as usize;
-
-    let (icon, icon_color) = if app.is_processing {
-        (spinner, theme.tool_color)
-    } else if app.status == "Error" {
-        ("✗", theme.error_color)
-    } else {
-        ("●", theme.success_color)
-    };
-    let mut lines = vec![agent_row(
-        AgentRow {
-            focused: app.focus.is_none(),
-            number: "0".into(),
-            name: "main",
-            icon,
-            icon_color,
-            activity: app.status.clone(),
-            right: app
-                .run_started
-                .filter(|_| app.is_processing)
-                .map(|t| format_duration(t.elapsed()))
-                .unwrap_or_default(),
-        },
-        name_w,
-        width,
-        theme,
-    )];
-    for &i in &shown {
-        let sub = &app.subagents[i];
-        let (icon, icon_color) = match sub.state {
-            AgentState::Running => (spinner, theme.tool_color),
-            AgentState::Done => ("✓", theme.success_color),
-            AgentState::Failed => ("✗", theme.error_color),
-        };
-        let mut right = format_duration(sub.elapsed());
-        if sub.tokens > 0 {
-            right = format!("{} tok  {right}", format_tokens(sub.tokens));
-        }
-        lines.push(agent_row(
-            AgentRow {
-                focused: app.focus == Some(i),
-                number: (i + 1).to_string(),
-                name: &sub.name,
-                icon,
-                icon_color,
-                activity: sub.current_activity(&app.project_root),
-                right,
-            },
-            name_w,
-            width,
-            theme,
-        ));
-    }
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-}
-
-/// Title row of a chat pane that isn't the plain main view.
-fn pane_title(app: &App, view: Option<usize>, focused: bool) -> Line<'static> {
-    let theme = &app.theme;
-    let strong = Style::default()
-        .fg(if focused {
-            theme.accent_color
-        } else {
-            theme.dim_color
-        })
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(theme.dim_color);
-    match view.and_then(|i| app.subagents.get(i).map(|s| (i, s))) {
-        None => Line::from(vec![
-            Span::styled("MAIN", strong),
-            Span::styled(format!("  {}", app.status), dim),
-        ]),
-        Some((i, sub)) => {
-            let mut spans = vec![
-                Span::styled(format!("SUB-AGENT {} · {}", i + 1, sub.name), strong),
-                Span::styled(
-                    format!(
-                        "  {} · {}",
-                        sub.state_word(),
-                        format_duration(sub.elapsed())
-                    ),
-                    dim,
-                ),
-            ];
-            if !app.split_active() {
-                spans.push(Span::styled("  ·  Alt+0 back to main", dim));
-            }
-            Line::from(spans)
-        }
-    }
-}
-
-fn draw_chat(frame: &mut Frame, area: Rect, app: &App, pane_idx: usize) {
-    let theme = &app.theme;
-    let pane = &app.panes[pane_idx];
-    let view = app.pane_view(pane_idx);
-    let transcript = app.transcript(view);
-    let expanded = app.show_reasoning;
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(theme.border_color))
-        .padding(Padding::new(2, 1, 1, 0));
-    let mut inner = block.inner(area);
-    frame.render_widget(block, area);
-    if (app.split_active() || view.is_some()) && inner.height > 2 {
-        let focused = app.focused_pane() == pane_idx;
-        frame.render_widget(
-            Paragraph::new(pane_title(app, view, focused)),
-            Rect::new(inner.x, inner.y, inner.width, 1),
-        );
-        inner = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
-    }
-    pane.area.set(inner);
-
-    let width = inner.width.max(10) as usize;
-    let view_height = inner.height as usize;
-
-    // Heights of every message (cached), then only the visible slice is cloned.
-    let mut all: Vec<Line<'static>> = Vec::new();
-    let mut all_meta: Vec<RowMeta> = Vec::new();
-    let mut extra: Vec<Line<'static>> = Vec::new();
-    let heights: Vec<usize> = (0..transcript.lines.len())
-        .map(|i| transcript.message_height(i, width, theme, expanded))
-        .collect();
-
-    if app.view_busy(view)
-        && !transcript.is_thinking
-        && transcript.lines.last().is_none_or(|l| {
-            matches!(
-                l.style,
-                LineStyle::User | LineStyle::Task | LineStyle::Status
-            )
-        })
-    {
-        extra.push(Line::from(Span::styled(
-            format!("{} Working…", SPINNER[app.spinner_frame % SPINNER.len()]),
-            Style::default().fg(theme.dim_color),
-        )));
-    }
-
-    let total: usize = heights.iter().sum::<usize>() + extra.len();
-    let max_scroll = total.saturating_sub(view_height);
-    pane.max_scroll.set(max_scroll);
-    pane.total_lines.set(total);
-    pane.view_height.set(view_height);
-    {
-        let mut starts = pane.message_starts.borrow_mut();
-        starts.clear();
-        let mut offset = 0;
-        for (line, h) in transcript.lines.iter().zip(&heights) {
-            if matches!(
-                line.style,
-                LineStyle::User | LineStyle::Task | LineStyle::Assistant
-            ) {
-                starts.push(offset);
-            }
-            offset += h;
-        }
-    }
-    let scroll = transcript.scroll.min(max_scroll);
-    let start = total.saturating_sub(view_height + scroll);
-    let end = (start + view_height).min(total);
-
-    let mut offset = 0;
-    for (i, h) in heights.iter().enumerate() {
-        if offset + h > start && offset < end {
-            let (lines, meta) = transcript.message_rows(i, width, theme, expanded);
-            let from = start.saturating_sub(offset);
-            let to = (end - offset).min(*h);
-            all.extend(lines[from..to].iter().cloned());
-            all_meta.extend(meta[from..to].iter().cloned());
-        }
-        offset += h;
-        if offset >= end {
-            break;
-        }
-    }
-    if offset < end {
-        let from = start.saturating_sub(offset);
-        all.extend(extra.into_iter().skip(from).take(end - offset.max(start)));
-    }
-
-    *pane.visible_plain.borrow_mut() = all
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect();
-    all_meta.resize_with(all.len(), RowMeta::default);
-    *pane.visible_meta.borrow_mut() = all_meta;
-
-    frame.render_widget(Paragraph::new(Text::from(all)), inner);
-
-    if max_scroll > 0 {
-        let bar = Rect::new(
-            area.x + area.width.saturating_sub(1),
-            inner.y,
-            1,
-            inner.height,
-        );
-        let mut state = ScrollbarState::new(max_scroll)
-            .viewport_content_length(view_height)
-            .position(max_scroll - scroll);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_symbol(Some("│"))
-                .track_style(Style::default().fg(theme.border_color))
-                .thumb_symbol("┃")
-                .thumb_style(Style::default().fg(theme.dim_color)),
-            bar,
-            &mut state,
-        );
-    }
-
-    if scroll > 0 {
-        let hint = format!(" ↓ {scroll} more ");
-        let w = hint.width() as u16;
-        let rect = Rect::new(
-            inner.x + inner.width.saturating_sub(w),
-            inner.y + inner.height.saturating_sub(1),
-            w,
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(theme.bg).bg(theme.dim_color)),
-            rect,
-        );
-    }
-}
-
-/// One-line summary of a tool call's arguments (activity panel, agents
-/// strip and headless output).
+/// One-line summary of a tool call's arguments (tool rows, agent cards
+/// and headless output).
 pub(crate) fn summarize_args(name: &str, args: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
         return extract_streaming_content(args, "path");
     };
+    // A search says what it looks for, and where.
+    if let Some(pattern) = value.get("pattern").and_then(|v| v.as_str()) {
+        return match value.get("path").and_then(|v| v.as_str()) {
+            Some(path) => format!("{pattern} in {path}"),
+            None => pattern.to_string(),
+        };
+    }
     for key in [
         "command", "path", "query", "url", "pattern", "name", "action", "source",
     ] {
@@ -2919,509 +2691,6 @@ pub(crate) fn summarize_args(name: &str, args: &str) -> String {
         }
     }
     String::new()
-}
-
-fn draw_tools(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let focused = app.active_panel == ActivePanel::Activity;
-    let tool_log = &app.focused().tool_log;
-    let block = Block::default().padding(Padding::new(2, 1, 1, 0));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    app.tools_area.set(area);
-
-    let mut heading = vec![Span::styled(
-        "ACTIVITY",
-        Style::default()
-            .fg(if focused {
-                theme.accent_color
-            } else {
-                theme.dim_color
-            })
-            .add_modifier(Modifier::BOLD),
-    )];
-    if let Some(sub) = app.focus.and_then(|i| app.subagents.get(i)) {
-        heading.push(Span::styled(
-            format!(" · {}", sub.name),
-            Style::default().fg(theme.dim_color),
-        ));
-    }
-    heading.push(Span::styled(
-        if focused {
-            "  ↑↓ select · Enter details · c copy · Esc back"
-        } else {
-            "  Tab to browse"
-        },
-        Style::default().fg(theme.dim_color),
-    ));
-    let mut lines = vec![Line::from(heading), Line::default()];
-
-    if tool_log.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Tool runs will appear here.",
-            Style::default().fg(theme.dim_color),
-        )));
-    }
-
-    let detail_width = inner.width.saturating_sub(4).max(8) as usize;
-    let mut selected_row = 0;
-    for (i, entry) in tool_log.iter().rev().enumerate() {
-        let is_selected = focused && i == app.selected_tool_index;
-        if is_selected {
-            selected_row = lines.len();
-        }
-        let (mark, color) = match entry.status {
-            ToolStatus::Running => (SPINNER[app.spinner_frame % SPINNER.len()], theme.tool_color),
-            ToolStatus::Success => ("✓", theme.success_color),
-            ToolStatus::Failed => ("✗", theme.error_color),
-        };
-        let name_style = if is_selected {
-            Style::default()
-                .bg(theme.accent_color)
-                .fg(theme.bg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
-        };
-        let duration = match entry.duration {
-            Some(d) => format_duration(d),
-            None => format_duration(entry.started.elapsed()),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{mark} "),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(entry.name.clone(), name_style),
-            Span::styled(
-                format!("  {duration}"),
-                Style::default().fg(theme.dim_color),
-            ),
-        ]));
-
-        let summary = clean_paths(&summarize_args(&entry.name, &entry.args), &app.project_root);
-        if !summary.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {}",
-                    crate::util::truncate_chars(&compact_detail(&summary, 200), detail_width)
-                ),
-                Style::default().fg(theme.dim_color),
-            )));
-        }
-        if entry.status == ToolStatus::Failed {
-            let first = entry
-                .output
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or_default();
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {}",
-                    crate::util::truncate_chars(first.trim_start_matches("ERROR: "), detail_width)
-                ),
-                Style::default().fg(theme.error_color),
-            )));
-        }
-    }
-
-    let visible = inner.height as usize;
-    let scroll = if selected_row >= visible {
-        (selected_row + 2).saturating_sub(visible)
-    } else {
-        0
-    };
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)),
-        inner,
-    );
-}
-
-fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let border = if app.is_processing {
-        theme.border_color
-    } else {
-        theme.accent_color
-    };
-    let title = if let Some(search) = &app.history_search {
-        format!(
-            " History search: {}{} ",
-            search.query,
-            if search.found { "" } else { "  (no match)" }
-        )
-    } else if !app.user_backlog.is_empty() {
-        format!(" Message · {} queued ", app.user_backlog.len())
-    } else if app.is_processing {
-        " Message (queued until the current run finishes) ".into()
-    } else if app.focus.is_some() {
-        " Message to the main agent ".into()
-    } else {
-        " Message ".into()
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(Span::styled(
-            title,
-            Style::default().fg(border).add_modifier(Modifier::BOLD),
-        ))
-        .padding(Padding::horizontal(1));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    app.input_box.set(area);
-    app.input_area.set(inner);
-    app.input_scroll.set(0);
-
-    if app.input.is_empty() {
-        let placeholder = if app.history_search.is_some() {
-            "Type to search earlier prompts · Ctrl+R older · Esc cancel"
-        } else if app.is_processing {
-            "Type to queue a follow-up · Esc to stop"
-        } else {
-            "What should we build?  (/ for commands, Alt+Enter for a new line)"
-        };
-        frame.render_widget(
-            Paragraph::new(placeholder).style(Style::default().fg(theme.dim_color)),
-            inner,
-        );
-        frame.set_cursor_position((inner.x, inner.y));
-        return;
-    }
-
-    let width = inner.width.max(1) as usize;
-    let (rows, cursor_row, cursor_col) = layout_input(&app.input, app.cursor_pos, width);
-    let height = inner.height as usize;
-    let first = (cursor_row + 1).saturating_sub(height);
-    app.input_scroll.set(first);
-    let lines: Vec<Line> = rows
-        .iter()
-        .skip(first)
-        .take(height)
-        .map(|r| {
-            Line::from(Span::styled(
-                r.clone(),
-                Style::default().fg(theme.input_color),
-            ))
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-    frame.set_cursor_position((
-        inner.x + cursor_col as u16,
-        inner.y + (cursor_row - first) as u16,
-    ));
-}
-
-fn draw_suggestions(frame: &mut Frame, input_area: Rect, app: &App) {
-    let suggestions = app.command_suggestions();
-    if suggestions.is_empty() || !app.approvals.is_empty() {
-        return;
-    }
-    let shown = suggestions.len().min(7);
-    let selected = app.palette_index.min(suggestions.len() - 1);
-    let first = (selected + 1).saturating_sub(shown);
-    let width = input_area.width.min(60);
-    let rect = Rect::new(
-        input_area.x + 1,
-        input_area.y.saturating_sub(shown as u16 + 2),
-        width,
-        shown as u16 + 2,
-    );
-    let lines: Vec<Line> = suggestions
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(shown)
-        .map(|(i, (cmd, desc))| {
-            let style = if i == selected {
-                Style::default().fg(app.theme.bg).bg(app.theme.accent_color)
-            } else {
-                Style::default().fg(app.theme.fg)
-            };
-            Line::from(vec![
-                Span::styled(format!(" {cmd:<17}"), style.add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" {desc}"), Style::default().fg(app.theme.dim_color)),
-            ])
-        })
-        .collect();
-    let hint = if suggestions.len() > shown {
-        format!(" Tab complete · ↑↓ {} more ", suggestions.len() - shown)
-    } else {
-        " Tab complete · ↑↓ pick · Enter run ".to_string()
-    };
-    frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(app.theme.border_color))
-                .title(Span::styled(hint, Style::default().fg(app.theme.dim_color))),
-        ),
-        rect,
-    );
-}
-
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    if let Some((notice, at)) = &app.notice {
-        if at.elapsed() < NOTICE_DURATION {
-            frame.render_widget(
-                Paragraph::new(format!(" {notice}")).style(Style::default().fg(theme.accent_color)),
-                area,
-            );
-            return;
-        }
-    }
-    let narrow = area.width < 100;
-    let pairs: &[(&str, &str)] = if app.selection_start.is_some() {
-        &[("Ctrl+C", "copy again"), ("Esc", "clear highlight")]
-    } else if app.history_search.is_some() {
-        &[
-            ("Ctrl+R", "older"),
-            ("Enter", "send"),
-            ("→", "edit"),
-            ("Esc", "cancel"),
-        ]
-    } else if app.focus.is_some() {
-        &[
-            ("Alt+0", "main"),
-            ("Alt+←→", "switch"),
-            ("Ctrl+X", "stop agent"),
-            ("Ctrl+S", "split"),
-            ("F1", "keys"),
-        ]
-    } else if app.is_processing {
-        if narrow {
-            &[
-                ("Esc", "stop"),
-                ("Enter", "queue"),
-                ("PgUp/PgDn", "scroll"),
-                ("F1", "keys"),
-            ]
-        } else {
-            &[
-                ("Esc", "stop"),
-                ("Enter", "queue a follow-up"),
-                ("PgUp/PgDn", "scroll"),
-                ("Ctrl+T", "reasoning"),
-                ("F1", "all keys"),
-            ]
-        }
-    } else if narrow {
-        &[
-            ("Enter", "send"),
-            ("↑↓", "history"),
-            ("PgUp/PgDn", "scroll"),
-            ("F1", "keys"),
-        ]
-    } else {
-        &[
-            ("Enter", "send"),
-            ("Alt+Enter", "new line"),
-            ("Ctrl+R", "search history"),
-            ("/", "commands"),
-            ("Tab", "activity"),
-            ("F1", "all keys"),
-        ]
-    };
-    frame.render_widget(Paragraph::new(hint_line(pairs, theme)), area);
-}
-
-fn draw_approval(frame: &mut Frame, area: Rect, app: &App, pending: &PendingApproval) {
-    let theme = &app.theme;
-    let info = &pending.info;
-    let modal = centered_rect(64, 50, area);
-    frame.render_widget(Clear, modal);
-
-    let args: serde_json::Value = serde_json::from_str(&info.args_preview).unwrap_or_default();
-    let mut lines = Vec::new();
-    if let Some((_, name)) = &pending.agent {
-        lines.push(Line::from(vec![
-            Span::styled("Agent ", Style::default().fg(theme.dim_color)),
-            Span::styled(
-                format!("sub-agent {name}"),
-                Style::default()
-                    .fg(theme.accent_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        Span::styled("Tool  ", Style::default().fg(theme.dim_color)),
-        Span::styled(
-            info.tool_name.clone(),
-            Style::default()
-                .fg(theme.tool_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::default());
-    if let Some(cmd) = args.get("command").and_then(|c| c.as_str()) {
-        lines.push(Line::from(Span::styled(
-            "Command",
-            Style::default().fg(theme.dim_color),
-        )));
-        for l in cmd.lines() {
-            lines.push(Line::from(Span::styled(
-                format!("  $ {l}"),
-                Style::default()
-                    .fg(theme.input_color)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
-        if args.get("background").and_then(|b| b.as_bool()) == Some(true) {
-            lines.push(Line::from(Span::styled(
-                "  (runs in the background)",
-                Style::default().fg(theme.dim_color),
-            )));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(
-            "Arguments",
-            Style::default().fg(theme.dim_color),
-        )));
-        for l in crate::util::truncate_chars(&info.args_preview, 1500).lines() {
-            lines.push(Line::from(format!("  {l}")));
-        }
-    }
-    lines.push(Line::default());
-    lines.push(Line::from(vec![
-        Span::styled(
-            " y ",
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.success_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" allow    "),
-        Span::styled(
-            " n ",
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.error_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" deny    "),
-        Span::styled(
-            "(/ask_perms off disables these prompts)",
-            Style::default().fg(theme.dim_color),
-        ),
-    ]));
-
-    let title = match &pending.agent {
-        Some((_, name)) => format!(" Allow this tool call by {name}? "),
-        None => " Allow this tool call? ".to_string(),
-    };
-    let mut block = Block::default()
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(theme.tool_color)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.tool_color))
-        .padding(Padding::new(2, 2, 1, 1));
-    if app.approvals.len() > 1 {
-        block = block.title_bottom(Span::styled(
-            format!(" {} more waiting ", app.approvals.len() - 1),
-            Style::default().fg(theme.dim_color),
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .block(block)
-            .style(Style::default().fg(theme.fg).bg(theme.bg)),
-        modal,
-    );
-}
-
-fn draw_tool_details(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(entry) = app
-        .focused()
-        .tool_log
-        .iter()
-        .rev()
-        .nth(app.selected_tool_index)
-    else {
-        return;
-    };
-    let theme = &app.theme;
-    let modal = centered_rect(80, 80, area);
-    frame.render_widget(Clear, modal);
-
-    let color = match entry.status {
-        ToolStatus::Running => theme.tool_color,
-        ToolStatus::Success => theme.success_color,
-        ToolStatus::Failed => theme.error_color,
-    };
-    let status = match entry.status {
-        ToolStatus::Running => "running",
-        ToolStatus::Success => "succeeded",
-        ToolStatus::Failed => "failed",
-    };
-    let heading = |t: &str| {
-        Line::from(Span::styled(
-            t.to_string(),
-            Style::default()
-                .fg(theme.accent_color)
-                .add_modifier(Modifier::BOLD),
-        ))
-    };
-
-    let mut text = vec![
-        Line::from(vec![
-            Span::styled(
-                status,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "  ·  {}",
-                    format_duration(entry.duration.unwrap_or_else(|| entry.started.elapsed()))
-                ),
-                Style::default().fg(theme.dim_color),
-            ),
-        ]),
-        Line::default(),
-        heading("ARGUMENTS"),
-    ];
-    let args = serde_json::from_str::<serde_json::Value>(&entry.args)
-        .ok()
-        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-        .unwrap_or_else(|| entry.args.clone());
-    for l in crate::util::truncate_chars(&args, 4000).lines() {
-        text.push(Line::from(l.to_string()));
-    }
-    text.push(Line::default());
-    text.push(heading("OUTPUT"));
-    let output = clean_paths(&entry.output, &app.project_root);
-    for l in crate::util::truncate_chars(&output, 8000).lines() {
-        text.push(Line::from(l.to_string()));
-    }
-
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        format!(" {} ", entry.name),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ))
-                    .title_bottom(Span::styled(
-                        " ↑↓ PgUp/PgDn scroll · c copy output · Esc close ",
-                        Style::default().fg(theme.dim_color),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(color))
-                    .padding(Padding::new(2, 2, 1, 1)),
-            )
-            .style(Style::default().fg(theme.fg).bg(theme.bg))
-            .scroll((app.tool_details_scroll, 0))
-            .wrap(Wrap { trim: false }),
-        modal,
-    );
 }
 
 fn clean_paths(text: &str, project_root: &Path) -> String {
@@ -3489,6 +2758,7 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
     let mut dirty = true;
     let mut last_draw = Instant::now() - FRAME;
     let mut last_key_at: Option<Instant> = None;
+    app.refresh_sessions();
 
     let result: io::Result<()> = async {
         loop {
@@ -3498,9 +2768,14 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
                 dirty = false;
             }
             let busy = app.is_processing || app.subagents.iter().any(SubAgentView::is_running);
+            let live_overlay = matches!(
+                app.overlay,
+                Some(Overlay::Processes { .. } | Overlay::Mcp { .. } | Overlay::Inspector { .. })
+            );
+            let waiting = app.pending_sessions.is_some() || app.pending_models.is_some();
             let wait = if dirty {
                 FRAME.saturating_sub(last_draw.elapsed())
-            } else if busy {
+            } else if busy || live_overlay || waiting {
                 SPINNER_TICK
             } else {
                 Duration::from_millis(500)
@@ -3554,8 +2829,26 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
                     }
                 }
                 _ = tokio::time::sleep(wait) => {
-                    if busy || app.main.tool_log.iter().any(|t| t.status == ToolStatus::Running) {
+                    if busy
+                        || live_overlay
+                        || app.main.tool_log.iter().any(|t| t.status == ToolStatus::Running)
+                    {
                         app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                        dirty = true;
+                    }
+                    // The start screen shows MCP servers, which connect in the background.
+                    if app.show_start_screen() {
+                        dirty = true;
+                    }
+                    if app.poll_background() {
+                        dirty = true;
+                    }
+                    let running = crate::tools::shell::command_feed()
+                        .iter()
+                        .filter(|run| run.ended.is_none())
+                        .count();
+                    if running != app.running_commands {
+                        app.running_commands = running;
                         dirty = true;
                     }
                     if app.notice.as_ref().is_some_and(|(_, at)| at.elapsed() >= NOTICE_DURATION) {
@@ -3572,6 +2865,9 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
             for id in app.subagent_cancels.drain(..) {
                 subagent::cancel(&id);
             }
+            for command in app.outbox.drain(..) {
+                let _ = user_tx.send(command);
+            }
             if std::mem::take(&mut app.bell_pending) {
                 let backend = terminal.backend_mut();
                 let _ = backend.write_all(b"\x07");
@@ -3579,8 +2875,7 @@ pub async fn run_tui(mut app: App, handle: crate::runtime::AgentHandle) -> io::R
             }
             if !app.is_processing {
                 if let Some(next) = app.user_backlog.pop_front() {
-                    app.start_run();
-                    app.status = "Starting next message".into();
+                    let next = app.start_queued(next);
                     let _ = user_tx.send(next);
                 }
             }
@@ -4156,18 +3451,6 @@ mod tests {
     }
 
     #[test]
-    fn layout_is_responsive() {
-        let app = App::new("test-model / test-provider", std::path::PathBuf::new());
-        let wide = render(&app, 120, 30);
-        assert!(wide.contains("NORVEXUM"));
-        assert!(wide.contains("ACTIVITY"));
-
-        let narrow = render(&app, 70, 20);
-        assert!(narrow.contains("NORVEXUM"));
-        assert!(!narrow.contains("ACTIVITY"));
-    }
-
-    #[test]
     fn inline_markdown_parses_bold() {
         let spans =
             parse_inline_markdown("hello **world**", Style::default(), LineStyle::Assistant);
@@ -4399,33 +3682,33 @@ mod tests {
             app.handle_agent_event(AgentEvent::Done { usage: None });
         }
         render(&app, 70, 20);
-        assert_eq!(app.main.scroll, 0);
+        assert_eq!(app.main.scroll.get(), 0);
         app.handle_key(KeyCode::Up, KeyModifiers::ALT);
-        let after_one = app.main.scroll;
+        let after_one = app.main.scroll.get();
         assert!(after_one > 0);
         render(&app, 70, 20);
         app.handle_key(KeyCode::Up, KeyModifiers::ALT);
-        assert!(app.main.scroll > after_one);
+        assert!(app.main.scroll.get() > after_one);
         render(&app, 70, 20);
         app.handle_key(KeyCode::Down, KeyModifiers::ALT);
-        assert_eq!(app.main.scroll, after_one);
+        assert_eq!(app.main.scroll.get(), after_one);
     }
 
     #[test]
     fn help_overlay_toggles_and_swallows_keys() {
         let mut app = App::new("m", std::path::PathBuf::new());
         app.handle_key(KeyCode::F(1), KeyModifiers::NONE);
-        assert!(app.show_help);
+        assert!(help_open(&app));
         app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
         assert!(app.input.is_empty());
         assert!(render(&app, 120, 30).contains("toggle this help"));
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(!app.show_help);
+        assert!(!help_open(&app));
         // `?` opens help only when it isn't part of a message.
         app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Char('?'), KeyModifiers::NONE);
         assert_eq!(app.input, "a?");
-        assert!(!app.show_help);
+        assert!(!help_open(&app));
     }
 
     #[test]
@@ -4436,7 +3719,6 @@ mod tests {
         }
         app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(app.input, "/compact ");
-        assert_eq!(app.active_panel, ActivePanel::Chat);
     }
 
     #[test]
@@ -4538,7 +3820,9 @@ mod tests {
         let tests = &app.subagents[0].transcript;
         assert_eq!(tests.lines[0].style, LineStyle::Task);
         assert_eq!(tests.last_reply(), Some("tests report"));
-        assert_eq!(app.subagents[1].transcript.lines.len(), 1);
+        // Only its task and the tool row: the tool is not in main or the other agent.
+        assert_eq!(app.subagents[1].transcript.lines.len(), 2);
+        assert_eq!(app.subagents[1].transcript.lines[1].style, LineStyle::Tool);
         assert_eq!(
             app.subagents[1].current_activity(Path::new("")),
             "read_file README.md"
@@ -4594,14 +3878,14 @@ mod tests {
         let screen = render(&app, 120, 30);
         assert!(screen.contains("main says hi"));
         assert!(!screen.contains("sub says hi"));
-        assert!(screen.contains("tests"), "agents strip missing");
+        assert!(screen.contains("tests"), "agent tab missing");
 
         app.handle_key(KeyCode::Right, KeyModifiers::ALT);
         assert_eq!(app.focus, Some(0));
         let screen = render(&app, 120, 30);
         assert!(screen.contains("sub says hi"));
         assert!(!screen.contains("main says hi"));
-        assert!(screen.contains("SUB-AGENT 1"));
+        assert!(screen.contains("agent 1 · tests"));
 
         // Wraps around: sub-agent 1 → main.
         app.handle_key(KeyCode::Right, KeyModifiers::ALT);
@@ -4615,13 +3899,13 @@ mod tests {
 
         // Split view: both transcripts at once.
         app.handle_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
-        assert!(app.split);
+        assert_eq!(app.layout, AgentLayout::Split);
         let screen = render(&app, 120, 30);
         assert!(screen.contains("main says hi"));
         assert!(screen.contains("sub says hi"));
-        assert!(screen.contains("MAIN"));
+        assert!(screen.contains("main"));
         app.handle_key(KeyCode::F(2), KeyModifiers::NONE);
-        assert!(!app.split);
+        assert_eq!(app.layout, AgentLayout::Focus);
 
         // `/agents N` from the input box.
         type_text(&mut app, "/agents 1");
@@ -4849,7 +4133,7 @@ mod tests {
         // `/keys` is handled by the TUI itself.
         type_text(&mut app, "/keys");
         assert_eq!(app.handle_key(KeyCode::Enter, KeyModifiers::NONE), None);
-        assert!(app.show_help);
+        assert!(help_open(&app));
     }
 
     #[test]
@@ -4896,36 +4180,14 @@ mod tests {
         }
         render(&app, 70, 20);
         app.handle_key(KeyCode::Home, KeyModifiers::NONE);
-        assert!(app.main.scroll > 0);
+        assert!(app.main.scroll.get() > 0);
         app.handle_key(KeyCode::End, KeyModifiers::NONE);
-        assert_eq!(app.main.scroll, 0);
+        assert_eq!(app.main.scroll.get(), 0);
         // With text in the box they move the cursor instead.
         type_text(&mut app, "abc");
         app.handle_key(KeyCode::Home, KeyModifiers::NONE);
         assert_eq!(app.cursor_pos, 0);
-        assert_eq!(app.main.scroll, 0);
-    }
-
-    #[test]
-    fn clicking_the_agents_strip_focuses_an_agent() {
-        let mut app = App::new("m", std::path::PathBuf::new());
-        start_subagent(&mut app, "agent-1", "tests");
-        start_subagent(&mut app, "agent-2", "docs");
-        render(&app, 120, 30);
-        let strip = app.strip_area.get();
-        assert!(strip.height >= 3);
-        app.handle_mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            strip.x + 3,
-            strip.y + 2,
-        );
-        assert_eq!(app.focus, Some(1));
-        app.handle_mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            strip.x + 3,
-            strip.y,
-        );
-        assert_eq!(app.focus, None);
+        assert_eq!(app.main.scroll.get(), 0);
     }
 
     #[test]
@@ -4965,5 +4227,810 @@ mod tests {
         type_text(&mut app, "/msg nobody hello");
         assert_eq!(app.handle_key(KeyCode::Enter, KeyModifiers::NONE), None);
         assert!(!app.is_processing);
+    }
+
+    fn help_open(app: &App) -> bool {
+        matches!(app.overlay, Some(Overlay::Help { .. }))
+    }
+
+    fn test_app() -> App {
+        App::new("alpha-1 / acme", std::path::PathBuf::new())
+    }
+
+    /// The rendered screen, one string per row.
+    fn screen_rows(app: &App, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn click(app: &mut App, x: u16, y: u16) {
+        app.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        app.handle_mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+    }
+
+    fn model(provider: &str, id: &str, has_key: bool) -> overlay::ModelRow {
+        overlay::ModelRow {
+            provider: provider.into(),
+            provider_name: provider.to_uppercase(),
+            id: id.into(),
+            family: id.split('-').next().unwrap_or(id).into(),
+            context: 200_000,
+            cost_in: 0.003,
+            cost_out: 0.015,
+            vision: true,
+            tools: true,
+            images: false,
+            reasoning: false,
+            has_key,
+            env_key: format!("{}_KEY", provider.to_uppercase()),
+        }
+    }
+
+    fn picker(rows: Vec<overlay::ModelRow>) -> Box<overlay::ModelPicker> {
+        let mut providers: Vec<(String, String)> = Vec::new();
+        for row in &rows {
+            if !providers.iter().any(|(name, _)| *name == row.provider) {
+                providers.push((row.provider.clone(), row.provider_name.clone()));
+            }
+        }
+        Box::new(overlay::ModelPicker {
+            rows,
+            providers,
+            current_model: "alpha-1".into(),
+            current_provider: "acme".into(),
+            ..Default::default()
+        })
+    }
+
+    fn sample_models() -> Box<overlay::ModelPicker> {
+        picker(vec![
+            model("acme", "alpha-1", true),
+            model("acme", "alpha-2-mini", true),
+            model("bolt", "beta-large", true),
+            model("bolt", "vendor/gamma-mini", true),
+            model("corp", "gamma-large", false),
+        ])
+    }
+
+    fn listed(picker: &overlay::ModelPicker) -> Vec<String> {
+        picker
+            .entries()
+            .iter()
+            .map(|e| match e {
+                overlay::ModelEntry::Header(h) => format!("# {h}"),
+                overlay::ModelEntry::Row { index, .. } => picker.rows[*index].id.clone(),
+                overlay::ModelEntry::Custom { id, .. } => format!("? {id}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layout_is_responsive() {
+        let mut app = App::new("test-model / test-provider", std::path::PathBuf::new());
+        app.add_user_message("hello".into());
+        for (w, h) in [(120, 30), (70, 20), (40, 12)] {
+            let screen = render(&app, w, h);
+            assert!(screen.contains("NORVEXUM"), "no logo at {w}x{h}");
+            assert!(screen.contains("hello"), "no message at {w}x{h}");
+            assert!(screen.contains("test-model"), "no model at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn every_screen_survives_tiny_terminals() {
+        let mut app = test_app();
+        for (w, h) in [(1, 1), (5, 2), (20, 4), (33, 9)] {
+            render(&app, w, h);
+        }
+        app.add_user_message("go 👋".into());
+        start_subagent(&mut app, "agent-1", "tests");
+        app.handle_agent_event(AgentEvent::ToolStart {
+            name: "read_file".into(),
+            id: "1".into(),
+        });
+        app.handle_agent_event(AgentEvent::ApprovalRequest {
+            id: "c1".into(),
+            tool_name: "run_command".into(),
+            args_preview: r#"{"command":"cargo test"}"#.into(),
+        });
+        for layout in [AgentLayout::Focus, AgentLayout::Split, AgentLayout::Grid] {
+            app.layout = layout;
+            for (w, h) in [(1, 1), (5, 2), (20, 4), (33, 9), (200, 60)] {
+                render(&app, w, h);
+            }
+        }
+        app.approvals.clear();
+        app.layout = AgentLayout::Focus;
+        let overlays = || {
+            vec![
+                Overlay::Help { scroll: 0 },
+                Overlay::Inspector {
+                    selected: 0,
+                    scroll: 0,
+                },
+                Overlay::Models(sample_models()),
+                Overlay::Palette {
+                    query: "co".into(),
+                    selected: 0,
+                },
+                Overlay::Sessions {
+                    query: String::new(),
+                    selected: 0,
+                },
+                Overlay::Processes { selected: 0 },
+                Overlay::Mcp {
+                    selected: 0,
+                    armed: None,
+                },
+            ]
+        };
+        for overlay in overlays() {
+            app.overlay = Some(overlay);
+            for (w, h) in [(1, 1), (5, 2), (20, 4), (33, 9), (200, 60)] {
+                render(&app, w, h);
+            }
+        }
+    }
+
+    #[test]
+    fn start_screen_shows_until_the_first_message() {
+        let project = std::env::temp_dir().join("norvexum-start-screen");
+        let mut app = App::new("alpha-1 / acme", project);
+        app.recent_sessions = vec![SessionSummary {
+            id: "s1".into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            message_count: 4,
+            model: "alpha-1".into(),
+            title: "fix the parser".into(),
+        }];
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains("█▀█"), "wordmark missing");
+        assert!(screen.contains("norvexum-start-screen"));
+        assert!(screen.contains("alpha-1"));
+        assert!(screen.contains("fix the parser"));
+        assert!(screen.contains("just now"));
+        assert!(app.main.lines.is_empty());
+
+        app.add_user_message("hello".into());
+        let screen = render(&app, 100, 30);
+        assert!(!screen.contains("█▀█"));
+        assert!(screen.contains("hello"));
+
+        // /clear comes back here.
+        app.handle_agent_event(AgentEvent::ClearChat);
+        app.is_processing = false;
+        assert!(render(&app, 100, 30).contains("█▀█"));
+    }
+
+    #[test]
+    fn tools_appear_inline_in_the_order_they_ran() {
+        let mut app = test_app();
+        app.add_user_message("go".into());
+        app.handle_agent_event(AgentEvent::Content("First I look.".into()));
+        app.handle_agent_event(AgentEvent::ToolStart {
+            name: "read_file".into(),
+            id: "1".into(),
+        });
+        app.handle_agent_event(AgentEvent::ToolArgsDelta {
+            id: "1".into(),
+            delta: r#"{"path":"src/main.rs"}"#.into(),
+        });
+        app.handle_agent_event(AgentEvent::ToolResult {
+            id: "1".into(),
+            name: "read_file".into(),
+            result: "ERROR: no such file".into(),
+            success: false,
+        });
+        app.handle_agent_event(AgentEvent::Content("Then I answer.".into()));
+        app.handle_agent_event(AgentEvent::Done { usage: None });
+
+        let rows = screen_rows(&app, 100, 30);
+        let row_of = |text: &str| {
+            rows.iter()
+                .position(|r| r.contains(text))
+                .unwrap_or_else(|| panic!("{text} not on screen:\n{}", rows.join("\n")))
+        };
+        assert!(row_of("First I look.") < row_of("read_file"));
+        assert!(row_of("read_file") < row_of("Then I answer."));
+        assert!(rows[row_of("read_file")].contains('✗'));
+        assert!(rows[row_of("read_file")].contains("src/main.rs"));
+        // Why it failed, without the error prefix.
+        assert!(rows.iter().any(|r| r.contains("no such file")));
+        assert!(!rows.iter().any(|r| r.contains("ERROR:")));
+
+        // Tool rows aren't conversation.
+        assert_eq!(app.focused().last_reply(), Some("Then I answer."));
+    }
+
+    #[test]
+    fn a_running_tool_keeps_animating() {
+        let mut app = test_app();
+        app.add_user_message("go".into());
+        app.handle_agent_event(AgentEvent::ToolStart {
+            name: "run_command".into(),
+            id: "1".into(),
+        });
+        let first = render(&app, 100, 30);
+        app.spinner_frame += 1;
+        let second = render(&app, 100, 30);
+        assert_ne!(first, second, "cached row didn't redraw");
+        // Stopping the run stops the spinner, and the row says so.
+        app.handle_agent_event(AgentEvent::Done { usage: None });
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains('✗'));
+        assert!(screen.contains("Stopped before it finished."));
+    }
+
+    #[test]
+    fn clicking_a_tool_row_opens_the_inspector_on_it() {
+        let mut app = test_app();
+        app.add_user_message("go".into());
+        for (id, path) in [("1", "one.rs"), ("2", "two.rs")] {
+            app.handle_agent_event(AgentEvent::ToolStart {
+                name: "read_file".into(),
+                id: id.into(),
+            });
+            app.handle_agent_event(AgentEvent::ToolArgsDelta {
+                id: id.into(),
+                delta: format!(r#"{{"path":"{path}"}}"#),
+            });
+            app.handle_agent_event(AgentEvent::ToolResult {
+                id: id.into(),
+                name: "read_file".into(),
+                result: format!("contents of {path}"),
+                success: true,
+            });
+        }
+        let rows = screen_rows(&app, 100, 30);
+        let y = rows.iter().position(|r| r.contains("one.rs")).unwrap() as u16;
+        click(&mut app, 10, y);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Inspector { selected: 1, .. })
+        ));
+        assert!(render(&app, 100, 30).contains("contents of one.rs"));
+
+        // Up/Down walk the calls, Esc closes.
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert!(render(&app, 100, 30).contains("contents of two.rs"));
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+
+        // Tab opens it on the newest call.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Inspector { selected: 0, .. })
+        ));
+        // A drag selects text; it doesn't open anything.
+        app.overlay = None;
+        app.handle_mouse(MouseEventKind::Down(MouseButton::Left), 10, y);
+        app.handle_mouse(MouseEventKind::Drag(MouseButton::Left), 20, y);
+        app.handle_mouse(MouseEventKind::Up(MouseButton::Left), 20, y);
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn inspector_says_when_there_is_nothing_to_show() {
+        let mut app = test_app();
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+        assert!(app.notice.is_some());
+    }
+
+    #[test]
+    fn clicking_a_tab_focuses_that_agent() {
+        let mut app = test_app();
+        app.add_user_message("go".into());
+        start_subagent(&mut app, "agent-1", "tests");
+        start_subagent(&mut app, "agent-2", "docs");
+        render(&app, 120, 30);
+        let tab = |app: &App, i: usize| app.tabs.borrow()[i].0;
+        assert_eq!(app.tabs.borrow().len(), 3);
+        let docs = tab(&app, 2);
+        click(&mut app, docs.x + 1, docs.y);
+        assert_eq!(app.focus, Some(1));
+        render(&app, 120, 30);
+        let main = tab(&app, 0);
+        click(&mut app, main.x + 1, main.y);
+        assert_eq!(app.focus, None);
+    }
+
+    #[test]
+    fn tabs_keep_the_focused_agent_visible() {
+        let mut app = test_app();
+        app.add_user_message("go".into());
+        for i in 0..20 {
+            start_subagent(&mut app, &format!("agent-{i}"), &format!("worker{i}"));
+        }
+        app.set_focus(Some(19));
+        let rows = screen_rows(&app, 70, 20);
+        assert!(
+            rows[0].contains("worker19"),
+            "focused tab hidden: {}",
+            rows[0]
+        );
+        assert!(rows[0].contains('‹'), "hidden tabs not marked: {}", rows[0]);
+        app.set_focus(None);
+        let rows = screen_rows(&app, 70, 20);
+        assert!(rows[0].contains("main"));
+        assert!(rows[0].contains('›'), "hidden tabs not marked: {}", rows[0]);
+    }
+
+    #[test]
+    fn grid_shows_every_agent_and_pages_with_focus() {
+        let mut app = test_app();
+        app.add_user_message("go".into());
+        app.handle_agent_event(AgentEvent::Content("main report".into()));
+        for i in 1..=3 {
+            let id = format!("agent-{i}");
+            start_subagent(&mut app, &id, &format!("w{i}"));
+            app.handle_agent_event(sub(&id, AgentEvent::Content(format!("report {i}"))));
+        }
+        app.handle_key(KeyCode::F(3), KeyModifiers::NONE);
+        assert_eq!(app.layout, AgentLayout::Grid);
+        let screen = render(&app, 120, 40);
+        for text in ["main report", "report 1", "report 2", "report 3"] {
+            assert!(screen.contains(text), "{text} missing from the grid");
+        }
+        // Each card is a place to click.
+        let card = app.panes[2].outer.get();
+        click(&mut app, card.x + 2, card.y + 1);
+        assert_eq!(app.focus, Some(1));
+
+        // Enter with an empty composer opens the focused agent full width.
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.layout, AgentLayout::Focus);
+        assert_eq!(app.focus, Some(1));
+        assert!(render(&app, 120, 40).contains("report 2"));
+        assert!(!render(&app, 120, 40).contains("report 3"));
+
+        // A short terminal fits fewer cards: the page follows the focus.
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::ALT);
+        assert_eq!(app.layout, AgentLayout::Grid);
+        app.set_focus(Some(2));
+        render(&app, 80, 12);
+        assert_eq!(app.grid_capacity.get(), 1);
+        let screen = render(&app, 80, 12);
+        assert!(screen.contains("report 3"));
+        assert!(!screen.contains("main report"));
+
+        // Once nothing is running, Esc leaves the grid.
+        app.handle_agent_event(AgentEvent::Done { usage: None });
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.layout, AgentLayout::Focus);
+    }
+
+    #[test]
+    fn grid_and_split_need_a_sub_agent() {
+        let mut app = test_app();
+        app.handle_key(KeyCode::F(3), KeyModifiers::NONE);
+        app.handle_key(KeyCode::F(2), KeyModifiers::NONE);
+        assert_eq!(app.layout, AgentLayout::Focus);
+    }
+
+    #[test]
+    fn scrolled_up_view_holds_still_while_a_reply_streams() {
+        let mut app = test_app();
+        app.add_user_message("go".into());
+        app.handle_agent_event(AgentEvent::Content(
+            (0..60)
+                .map(|i| format!("line number {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        render(&app, 80, 20);
+        app.handle_key(KeyCode::PageUp, KeyModifiers::NONE);
+        let before = screen_rows(&app, 80, 20);
+        assert!(app.main.scroll.get() > 0);
+
+        app.handle_agent_event(AgentEvent::Content("\nmore\nand more\nand more".into()));
+        app.handle_agent_event(AgentEvent::ToolStart {
+            name: "read_file".into(),
+            id: "1".into(),
+        });
+        let after = screen_rows(&app, 80, 20);
+        // The text stays; only the scrollbar in the last column shows there is more.
+        let text = |rows: &[String]| -> Vec<String> {
+            rows[1..14]
+                .iter()
+                .map(|r| r.chars().take(70).collect())
+                .collect()
+        };
+        assert_eq!(text(&before), text(&after), "the view moved");
+
+        // Sending something jumps back to the latest.
+        app.is_processing = false;
+        type_text(&mut app, "next");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.main.scroll.get(), 0);
+    }
+
+    #[test]
+    fn at_mention_sends_a_note_only_to_a_known_agent() {
+        let mut app = test_app();
+        start_subagent(&mut app, "agent-1", "tests");
+        // The agent isn't really running, so delivery reports that; either
+        // way the note isn't sent to main as a message.
+        type_text(&mut app, "@tests use nextest");
+        assert_eq!(app.handle_key(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(!app.is_processing);
+        // A file reference is an ordinary message.
+        type_text(&mut app, "@src/main.rs explain this");
+        assert_eq!(
+            app.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+                .as_deref(),
+            Some("@src/main.rs explain this")
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_prefers_real_matches() {
+        let score = |text, query| overlay::fuzzy_match(text, query).map(|(s, _)| s);
+        // Exact beats prefix beats a word start beats the middle of a word.
+        assert!(score("sonnet", "sonnet") > score("sonnet-5", "sonnet"));
+        assert!(score("sonnet-5", "sonnet") > score("claude-sonnet", "sonnet"));
+        assert!(score("claude-sonnet", "son") > score("person", "son"));
+        // A run of letters beats scattered ones.
+        assert!(score("gpt-mini", "gpt") > score("g-p-t", "gpt"));
+        // Every word has to match, in any order.
+        assert!(score("claude-sonnet-5", "5 son").is_some());
+        assert!(score("claude-sonnet-5", "son opus").is_none());
+        assert_eq!(score("abc", "x"), None);
+        // Matching ignores case and handles any width of text.
+        assert!(score("Claude", "CLAUDE").is_some());
+        for text in MULTIBYTE {
+            let _ = overlay::fuzzy_match(text, "日本");
+            let _ = overlay::fuzzy_match(text, "👋");
+        }
+        let (_, hits) = overlay::fuzzy_match("vendor/gamma", "gam").unwrap();
+        assert_eq!(hits, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn model_search_groups_ranks_and_filters() {
+        let mut models = sample_models();
+        // No search: the active provider first, keyless providers last.
+        assert_eq!(
+            listed(&models),
+            vec![
+                "# ACME",
+                "alpha-1",
+                "alpha-2-mini",
+                "# BOLT",
+                "beta-large",
+                "vendor/gamma-mini",
+                "# CORP · no API key",
+                "gamma-large",
+            ]
+        );
+
+        // Search: flat and ranked, across providers.
+        models.query = "gamma".into();
+        assert_eq!(
+            listed(&models),
+            vec!["gamma-large", "vendor/gamma-mini", "? gamma"]
+        );
+        // Words match across the id and provider, in any order.
+        models.query = "mini bolt".into();
+        assert_eq!(listed(&models), vec!["vendor/gamma-mini"]);
+        // An exact id isn't offered as a custom one.
+        models.query = "alpha-1".into();
+        assert_eq!(listed(&models), vec!["alpha-1"]);
+
+        // Tab steps through providers.
+        models.query.clear();
+        models.cycle_filter(1);
+        assert_eq!(models.filter.as_deref(), Some("acme"));
+        models.cycle_filter(1);
+        assert_eq!(
+            listed(&models),
+            vec!["# BOLT", "beta-large", "vendor/gamma-mini"]
+        );
+        models.cycle_filter(-1);
+        models.cycle_filter(-1);
+        assert_eq!(models.filter, None);
+    }
+
+    #[test]
+    fn starring_a_model_moves_it_up_and_keeps_the_cursor_on_it() {
+        let mut app = test_app();
+        let mut models = sample_models();
+        models.selected = 2; // beta-large
+        app.overlay = Some(Overlay::Models(models));
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        let Some(Overlay::Models(models)) = &app.overlay else {
+            panic!("the picker closed");
+        };
+        assert_eq!(models.stars, vec!["beta-large".to_string()]);
+        let names = listed(models);
+        assert_eq!(&names[..2], &["# ★ Starred", "beta-large"]);
+        assert_eq!(models.selected, 0);
+        assert!(render(&app, 120, 40).contains('★'));
+    }
+
+    #[test]
+    fn picking_a_model_switches_provider_and_model_together() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Models(sample_models()));
+        type_text(&mut app, "beta");
+        let screen = render(&app, 120, 40);
+        assert!(screen.contains("beta-large"));
+        assert!(screen.contains("$3.00/$15.00"));
+        assert!(screen.contains("200K"));
+        assert_eq!(app.handle_key(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.outbox, vec!["/use bolt beta-large".to_string()]);
+        assert!(app.is_processing);
+
+        // The reply doesn't land on the start screen; the chip just changes.
+        app.handle_agent_event(AgentEvent::ModelSwitched {
+            model: "beta-large".into(),
+            provider: "bolt".into(),
+        });
+        app.handle_agent_event(AgentEvent::Content("Switched model.".into()));
+        app.handle_agent_event(AgentEvent::Done { usage: None });
+        assert!(app.main.lines.is_empty());
+        assert!(!app.is_processing);
+        assert_eq!(app.status, "Ready");
+        assert!(app.model_info.starts_with("beta-large"));
+        assert!(render(&app, 120, 40).contains("█▀█"));
+    }
+
+    #[test]
+    fn a_model_that_is_not_listed_can_still_be_used() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Models(sample_models()));
+        type_text(&mut app, "brand-new-9");
+        assert!(render(&app, 120, 40).contains("brand-new-9"));
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.outbox, vec!["/use acme brand-new-9".to_string()]);
+    }
+
+    #[test]
+    fn switching_models_mid_run_waits_for_the_run() {
+        let mut app = test_app();
+        app.add_user_message("go".into());
+        app.overlay = Some(Overlay::Models(sample_models()));
+        type_text(&mut app, "beta");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.outbox.is_empty());
+        assert_eq!(app.user_backlog.len(), 1);
+
+        app.handle_agent_event(AgentEvent::Content("Normal reply.".into()));
+        app.handle_agent_event(AgentEvent::Done { usage: None });
+        let next = app.user_backlog.pop_front().unwrap();
+        assert_eq!(app.start_queued(next), "/use bolt beta-large");
+        app.handle_agent_event(AgentEvent::Content("Switched model.".into()));
+        app.handle_agent_event(AgentEvent::Done { usage: None });
+        // The run's reply stayed; the switch's reply didn't appear.
+        assert!(app.main.lines.iter().any(|l| l.content == "Normal reply."));
+        assert!(
+            app.main
+                .lines
+                .iter()
+                .all(|l| l.content != "Switched model.")
+        );
+
+        // An ordinary queued message isn't affected.
+        app.is_processing = true;
+        assert_eq!(app.start_queued("hello".into()), "hello");
+        assert!(!app.quiet_run);
+    }
+
+    #[test]
+    fn slash_model_opens_the_search_and_with_an_id_goes_to_the_agent() {
+        let mut app = test_app();
+        type_text(&mut app, "/model");
+        assert_eq!(app.handle_key(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(matches!(app.overlay, Some(Overlay::Models(_))));
+        app.overlay = None;
+
+        type_text(&mut app, "/provider");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let Some(Overlay::Models(models)) = &app.overlay else {
+            panic!("no model search");
+        };
+        assert_eq!(models.filter.as_deref(), Some("acme"));
+        app.overlay = None;
+
+        type_text(&mut app, "/model gpt-x");
+        assert_eq!(
+            app.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+                .as_deref(),
+            Some("/model gpt-x")
+        );
+    }
+
+    #[test]
+    fn overlay_shortcuts_open_and_esc_closes_without_touching_the_draft() {
+        let mut app = test_app();
+        type_text(&mut app, "draft");
+        for (key, modifiers) in [
+            (KeyCode::Char('k'), KeyModifiers::CONTROL),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+            (KeyCode::Char('o'), KeyModifiers::CONTROL),
+            (KeyCode::Char('g'), KeyModifiers::CONTROL),
+            (KeyCode::Char('b'), KeyModifiers::CONTROL),
+            (KeyCode::Char('m'), KeyModifiers::ALT),
+            (KeyCode::F(1), KeyModifiers::NONE),
+        ] {
+            app.handle_key(key, modifiers);
+            assert!(app.overlay.is_some(), "{key:?} opened nothing");
+            render(&app, 120, 40);
+            app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "{key:?} didn't close");
+        }
+        assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn palette_searches_and_runs_everything() {
+        let mut app = test_app();
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert!(render(&app, 120, 40).contains("Switch model"));
+
+        // A command the agent runs.
+        type_text(&mut app, "compact");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.outbox, vec!["/compact".to_string()]);
+        app.outbox.clear();
+        app.is_processing = false;
+
+        // One needing an argument waits in the composer.
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        type_text(&mut app, "/msg");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.input, "/msg ");
+        assert!(app.outbox.is_empty());
+        app.set_input(String::new());
+
+        // An action opens its overlay.
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        type_text(&mut app, "process");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Some(Overlay::Processes { .. })));
+        app.overlay = None;
+
+        // Agents can be reached by name.
+        start_subagent(&mut app, "agent-1", "tests");
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        type_text(&mut app, "go to tests");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.focus, Some(0));
+
+        // And stopped by name.
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        type_text(&mut app, "stop tests");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.subagent_cancels, vec!["agent-1".to_string()]);
+    }
+
+    #[test]
+    fn overlay_lists_respond_to_the_mouse_and_paste() {
+        let mut app = test_app();
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        render(&app, 120, 40);
+        let (y, index) = app.overlay_rows.borrow()[2];
+        let card = app.overlay_area.get();
+        // First click highlights, second picks.
+        click(&mut app, card.x + 3, y);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Palette { selected, .. }) if selected == index
+        ));
+        app.handle_mouse(MouseEventKind::Down(MouseButton::Left), card.x + 3, y);
+        assert!(matches!(app.overlay, Some(Overlay::Processes { .. })));
+        // A click outside closes.
+        app.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert!(app.overlay.is_none());
+
+        // Paste goes into the search box, on one line, not the composer.
+        app.overlay = Some(Overlay::Models(sample_models()));
+        app.paste_text("beta\nlarge");
+        let Some(Overlay::Models(models)) = &app.overlay else {
+            panic!("no model search");
+        };
+        assert_eq!(models.query, "beta large");
+        assert!(app.input.is_empty());
+        // Typing fast in a search box isn't mistaken for a paste into the composer.
+        assert!(!app.paste_key(KeyCode::Char('x'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn saved_conversations_replay_without_the_agents_notes() {
+        use crate::ai::types::Message;
+        let mut app = test_app();
+        app.replay_messages(&[
+            Message::system("system prompt"),
+            Message::user("fix the parser"),
+            Message::assistant("Done."),
+            Message::user("[note to the model]"),
+        ]);
+        let shown: Vec<(&str, LineStyle)> = app
+            .main
+            .lines
+            .iter()
+            .map(|l| (l.content.as_str(), l.style))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("fix the parser", LineStyle::User),
+                ("Done.", LineStyle::Assistant)
+            ]
+        );
+    }
+
+    #[test]
+    fn sessions_are_searchable_and_cannot_load_mid_run() {
+        let mut app = test_app();
+        app.recent_sessions = ["write the docs", "fix the parser"]
+            .iter()
+            .map(|title| SessionSummary {
+                id: title.replace(' ', "-"),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                message_count: 2,
+                model: "m".into(),
+                title: title.to_string(),
+            })
+            .collect();
+        assert_eq!(app.sessions_matching("").len(), 2);
+        assert_eq!(app.sessions_matching("parser")[0].0, 1);
+        assert!(app.sessions_matching("nothing here").is_empty());
+        app.overlay = Some(Overlay::Sessions {
+            query: "parser".into(),
+            selected: 0,
+        });
+        assert!(render(&app, 120, 40).contains("fix the parser"));
+
+        app.is_processing = true;
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.outbox.is_empty());
+        assert!(app.main.lines.is_empty());
+    }
+
+    #[test]
+    fn status_line_shows_usage_and_cost() {
+        let mut app = test_app();
+        app.model_cost = Some((0.003, 0.015));
+        app.add_user_message("go".into());
+        app.handle_agent_event(AgentEvent::Done {
+            usage: Some(crate::ai::types::UsageStats {
+                prompt_tokens: 10_000,
+                completion_tokens: 2_000,
+                total_tokens: 12_000,
+                reasoning_tokens: None,
+            }),
+        });
+        let rows = screen_rows(&app, 120, 30);
+        let status = &rows[29];
+        assert!(status.contains("alpha-1"), "{status}");
+        assert!(status.contains("↑10.0K ↓2.0K"), "{status}");
+        assert!(status.contains("~$0.06"), "{status}");
+        // Clicking the model opens the search.
+        click(&mut app, 3, 29);
+        assert!(matches!(app.overlay, Some(Overlay::Models(_))));
+    }
+
+    #[test]
+    fn composer_rule_carries_the_runs_state_and_the_queue() {
+        let mut app = test_app();
+        app.add_user_message("go".into());
+        app.handle_agent_event(AgentEvent::ToolStart {
+            name: "read_file".into(),
+            id: "1".into(),
+        });
+        type_text(&mut app, "follow up");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let rows = screen_rows(&app, 100, 30);
+        let rule = &rows[27];
+        assert!(rule.contains("read_file"), "{rule}");
+        assert!(rule.contains("1 queued"), "{rule}");
     }
 }

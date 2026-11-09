@@ -58,7 +58,14 @@ pub async fn run(settings: Settings, opts: ChatOptions) -> Result<()> {
         .join(NORVEXUM_DIR)
         .join(HISTORY_DIR)
         .join("prompts.jsonl");
+    let resumed = opts
+        .resume
+        .then(|| crate::agent::session::Session::load_latest(&project_root))
+        .flatten();
     let mut app = App::new(&model_info, project_root).with_history_file(history_file);
+    if let Some(session) = &resumed {
+        app.replay_messages(&session.messages);
+    }
     if let Some(message) = opts.initial_message {
         app.add_user_message(message);
     } else if opts.resume {

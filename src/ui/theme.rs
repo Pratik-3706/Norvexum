@@ -7,6 +7,10 @@ use ratatui::style::Color;
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub bg: Color,
+    /// Raised areas: the user's messages, overlay cards, the focused tab.
+    pub surface: Color,
+    /// The highlighted row of a list.
+    pub selection: Color,
     pub fg: Color,
     pub accent_color: Color,
     pub border_color: Color,
@@ -26,6 +30,8 @@ impl Default for Theme {
         // Neutral greys with one blue accent (matches the desktop app).
         Self {
             bg: Color::Rgb(17, 18, 20),
+            surface: Color::Rgb(27, 28, 33),
+            selection: Color::Rgb(38, 46, 78),
             fg: Color::Rgb(228, 229, 231),
             accent_color: Color::Rgb(122, 146, 240),
             border_color: Color::Rgb(48, 50, 56),

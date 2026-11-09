@@ -122,6 +122,8 @@ struct ModelTurn {
     finish_reason: String,
     /// Tool call ids whose arguments were already streamed as deltas.
     streamed_args: HashSet<String>,
+    /// (id, name) of every tool call the stream announced.
+    started_tools: Vec<(String, String)>,
     error: Option<String>,
     cancelled: bool,
     thinking_chars: usize,
@@ -522,6 +524,17 @@ Another agent gave you one task. Work on it independently with your tools; the u
             "/stop" => self.reply("⏹️ Nothing is running."),
             "/model" => self.handle_model_command(arg).await,
             "/provider" => self.handle_provider_command(arg).await,
+            // Sent by the terminal UI's model search: both at once, so a model
+            // never gets checked against the previous provider.
+            "/use" => match (arg, parts.get(2).copied()) {
+                (Some(provider), Some(model)) => {
+                    let mut settings = (*self.settings).clone();
+                    settings.active_provider = provider.to_string();
+                    settings.active_model = model.to_string();
+                    self.switch_to(settings, "model");
+                }
+                _ => self.reply("Usage: `/use <provider> <model>`"),
+            },
             _ => {
                 let _ = self.event_tx.send(AgentEvent::Error(format!(
                     "❌ Unknown command **{command}**. Type `/help` for the list."
@@ -654,6 +667,10 @@ Another agent gave you one task. Work on it independently with your tools; the u
     }
 
     fn switch_to(&mut self, mut settings: Settings, what: &str) {
+        // Stars can change while the agent runs; saving must not undo them.
+        if let Ok(on_disk) = Settings::load() {
+            settings.starred_models = on_disk.starred_models;
+        }
         settings.model_reasoning_type =
             ai::guess_reasoning_support_by_name(&settings.active_provider, &settings.active_model);
         match ai::build_client(&settings) {
@@ -966,7 +983,7 @@ Another agent gave you one task. Work on it independently with your tools; the u
         let mut loop_num = 0;
         let mut malformed_retries = 0;
         loop {
-            if max_loops > 0 && loop_num >= max_loops {
+            if crate::config::loop_limit_reached(max_loops, loop_num) {
                 let _ = self.event_tx.send(AgentEvent::Warning(format!(
                     "Reached the tool-loop limit ({max_loops}). Type 'continue' to let the agent keep going, or raise it with /loops."
                 )));
@@ -1328,6 +1345,23 @@ Another agent gave you one task. Work on it independently with your tools; the u
                 },
             }
         }
+        // A call the stream announced but never completed will not run: say so,
+        // or the UIs would show it as running for the rest of the run. (A stop
+        // is handled when the run ends.)
+        if !turn.cancelled {
+            for (id, name) in &turn.started_tools {
+                if !turn.tool_calls.iter().any(|tc| &tc.id == id) {
+                    let _ = self.event_tx.send(AgentEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        result:
+                            "The reply was cut off before this call finished, so it did not run."
+                                .into(),
+                        success: false,
+                    });
+                }
+            }
+        }
         tracing::info!(
             thinking_chars = turn.thinking_chars,
             text_chars = turn.text.len(),
@@ -1359,6 +1393,7 @@ Another agent gave you one task. Work on it independently with your tools; the u
                 let _ = tx.send(AgentEvent::Content(text));
             }
             AiStreamEvent::ToolCallStart(tc) => {
+                turn.started_tools.push((tc.id.clone(), tc.name.clone()));
                 let _ = tx.send(AgentEvent::ToolStart {
                     name: tc.name,
                     id: tc.id,
@@ -2362,6 +2397,166 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         let requests = requests.lock().unwrap().clone();
         (agent, requests, warnings)
+    }
+
+    /// Run scripted replies through the real agent and real tools, feed what it
+    /// emits to the terminal UI, and return the screen.
+    async fn screen_after(root: &std::path::Path, replies: Vec<Vec<AiStreamEvent>>) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+        let settings = Settings {
+            project_root: root.to_path_buf(),
+            ..Settings::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(settings, tx);
+        agent.approval_disabled = true;
+        agent.client = Arc::new(ScriptedClient {
+            replies: std::sync::Mutex::new(replies.into()),
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        agent.process_message("go", &mut cancel_rx).await.unwrap();
+
+        let mut app = crate::ui::App::new("m / p", root.to_path_buf());
+        app.add_user_message("go".into());
+        while let Ok(event) = rx.try_recv() {
+            app.handle_agent_event(event);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..40)
+            .map(|y| (0..110).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// A tool call as streaming providers send it: start, argument pieces, complete.
+    fn streamed_call(id: &str, name: &str, args: &str) -> Vec<AiStreamEvent> {
+        let (head, tail) = args.split_at(args.len() / 2);
+        let call = |arguments| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+            thought_signature: None,
+        };
+        vec![
+            AiStreamEvent::ToolCallStart(call(serde_json::Value::Null)),
+            AiStreamEvent::ToolCallDelta {
+                id: id.into(),
+                arguments_delta: head.into(),
+            },
+            AiStreamEvent::ToolCallDelta {
+                id: id.into(),
+                arguments_delta: tail.into(),
+            },
+            AiStreamEvent::ToolCallComplete(call(serde_json::Value::String(args.into()))),
+        ]
+    }
+
+    #[tokio::test]
+    async fn real_tool_calls_show_up_properly_in_the_terminal_ui() {
+        let root = std::env::temp_dir().join(format!("nvx-rows-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), "needle\n").unwrap();
+
+        let mut first = vec![AiStreamEvent::ContentDelta("Let me look.".into())];
+        first.extend(streamed_call("a", "read_file", r#"{"path":"notes.txt"}"#));
+        first.extend(streamed_call(
+            "b",
+            "grep",
+            r#"{"pattern":"needle","path":"."}"#,
+        ));
+        first.extend(streamed_call(
+            "c",
+            "run_command",
+            r#"{"command":"echo hello"}"#,
+        ));
+        first.extend(streamed_call(
+            "d",
+            "write_file",
+            r#"{"path":"out.txt","content":"done\n"}"#,
+        ));
+        first.extend(streamed_call("e", "read_file", r#"{"path":"missing.txt"}"#));
+        // Providers that deliver arguments in one piece.
+        let whole = ToolCall {
+            id: "f".into(),
+            name: "ls".into(),
+            arguments: serde_json::json!({ "path": "." }),
+            thought_signature: None,
+        };
+        first.push(AiStreamEvent::ToolCallStart(whole.clone()));
+        first.push(AiStreamEvent::ToolCallComplete(whole));
+        first.push(done("tool_calls"));
+        let replies = vec![
+            first,
+            vec![
+                AiStreamEvent::ContentDelta("All done.".into()),
+                done("stop"),
+            ],
+        ];
+
+        let rows = screen_after(&root, replies).await;
+        let screen = rows.join("\n");
+        let row = |text: &str| {
+            rows.iter()
+                .position(|r| r.contains(text))
+                .unwrap_or_else(|| panic!("{text} not on screen:\n{screen}"))
+        };
+        assert!(rows[row("✓ read_file")].contains("notes.txt"), "{screen}");
+        assert!(rows[row("✓ grep")].contains("needle in ."), "{screen}");
+        assert!(
+            rows[row("✓ run_command")].contains("echo hello"),
+            "{screen}"
+        );
+        assert!(rows[row("✓ write_file")].contains("out.txt"), "{screen}");
+        assert!(rows[row("✗ read_file")].contains("missing.txt"), "{screen}");
+        assert!(rows[row("✓ ls")].contains('.'), "{screen}");
+        // In the order things happened, and the file was really written.
+        assert!(row("Let me look.") < row("✓ read_file"), "{screen}");
+        assert!(row("✓ ls") < row("All done."), "{screen}");
+        assert!(root.join("out.txt").exists());
+        // Nothing still claims to be running.
+        let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        assert!(!spinners.iter().any(|s| screen.contains(s)), "{screen}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_call_cut_off_mid_stream_does_not_look_like_it_is_still_running() {
+        let root = std::env::temp_dir().join(format!("nvx-rows-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        // The call starts, its arguments begin, and the reply just ends.
+        let mut cut_off = streamed_call("a", "read_file", r#"{"path":"notes.txt"}"#);
+        cut_off.pop();
+        cut_off.push(AiStreamEvent::ContentDelta("Partial".into()));
+        cut_off.push(done("stop"));
+
+        let rows = screen_after(&root, vec![cut_off]).await;
+        let screen = rows.join("\n");
+        assert!(screen.contains("✗ read_file"), "{screen}");
+        assert!(screen.contains("did not run"), "{screen}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_finished_normally_reports_no_cut_off_calls() {
+        let root = std::env::temp_dir().join(format!("nvx-rows-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), "x\n").unwrap();
+        let mut first = streamed_call("a", "read_file", r#"{"path":"notes.txt"}"#);
+        first.push(done("tool_calls"));
+        let rows = screen_after(
+            &root,
+            vec![
+                first,
+                vec![AiStreamEvent::ContentDelta("ok".into()), done("stop")],
+            ],
+        )
+        .await;
+        let screen = rows.join("\n");
+        assert!(screen.contains("✓ read_file"), "{screen}");
+        assert!(!screen.contains("did not run"), "{screen}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn last_reply(agent: &Agent) -> String {

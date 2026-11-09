@@ -332,7 +332,12 @@ impl Settings {
 
     /// Get the API key for the active provider
     pub fn active_api_key(&self) -> Option<&str> {
-        match self.active_provider.as_str() {
+        self.api_key_for(&self.active_provider)
+    }
+
+    /// Get the API key configured for a provider.
+    pub fn api_key_for(&self, provider: &str) -> Option<&str> {
+        match provider {
             "aicredits" => self.aicredits_api_key.as_deref(),
             "google_direct" => self.google_ai_api_key.as_deref(),
             "openai" => self.openai_api_key.as_deref(),
@@ -435,6 +440,11 @@ pub fn parse_loop_limit(value: &str) -> Option<usize> {
     }
 }
 
+/// Whether a run has used up its tool-loop limit. A limit of 0 means no limit.
+pub fn loop_limit_reached(limit: usize, loops_done: usize) -> bool {
+    limit > 0 && loops_done >= limit
+}
+
 /// How a tool-loop limit reads to the user (0 means no limit).
 pub fn describe_loop_limit(limit: usize) -> String {
     if limit == 0 {
@@ -447,6 +457,16 @@ pub fn describe_loop_limit(limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_loop_limit_of_zero_means_unlimited() {
+        assert_eq!(parse_loop_limit("unlimited"), Some(0));
+        assert!(!loop_limit_reached(0, 0));
+        assert!(!loop_limit_reached(0, 100_000));
+        assert_eq!(describe_loop_limit(0), "unlimited");
+        assert!(!loop_limit_reached(25, 24));
+        assert!(loop_limit_reached(25, 25));
+    }
 
     #[test]
     fn sandbox_rejects_traversal_through_missing_paths() {
