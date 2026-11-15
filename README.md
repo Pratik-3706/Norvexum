@@ -44,8 +44,8 @@ Enforces strict canonical path verification across all filesystem and shell exec
 
 ### 📸 Vision & OCR Multimodality
 *   **Multimodal Input**: Automatically parses user inputs for image paths (PNG, JPG, WebP), base64-encodes them, and attaches them to Gemini/Claude/OpenAI content streams.
-*   **TUI Image Inspector**: Autonomous image viewing via the `view_image` tool.
-*   **OCR Space Fallback**: For text-only language models, Norvexum automatically invokes an OCR API fallback to read visual text.
+*   **Native Image Viewing**: `view_image` and `batch_view_images` (up to 14 at once) attach the images straight to the conversation, so a vision-capable model looks at them itself instead of asking a separate vision model.
+*   **Text-Only Fallback**: For models that can't see images, the images are described by Gemini (`GOOGLE_AI_API_KEY`), or their text is read with OCR (`OCR_SPACE_API_KEY`).
 
 ### 🛡️ Dependency Safety Shield
 Before running dangerous setups or installing pip/npm packages, the **`check_package`** tool checks package names against the Open Source Vulnerabilities (OSV) database and runs typosquatting checks to prevent malicious dependency injection.
@@ -113,12 +113,13 @@ The agent has access to a comprehensive suite of registered developer tools:
 
 *   **Filesystem**: `read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_files`, `touch`, `remove_file`, `move_file`, `copy_file`, `pwd`.
 *   **Web Operations**: `web_search` (Tavily search client), `web_fetch` (markdown scraper).
-*   **Media**: `generate_image` (Gemini/Pollinations/DALL-E 3 unified generator), `image_search` (DDG), `download_image`, `batch_download_images`, `view_image`.
+*   **Media**: `generate_image` (Gemini/Pollinations/DALL-E 3 unified generator), `image_search` (DDG), `download_image`, `batch_download_images`, `view_image`, `batch_view_images`.
 *   **Execution**: `run_command` (shell task runner with TUI interactive turn approvals), `check_package` (OSV vulnerability protection shield).
 *   **VCS**: `git_status`, `git_diff`, `git_commit`, `git_log`.
 
 ### 🔌 API Changes
 *   **`zerochan_search` removed**: Zerochan's API no longer accepts requests from automated agents, so the tool has been taken out. Use `image_search` instead. Saved sessions that still try to call it get an explanation instead of an error about an unknown tool.
+*   **`view_image` / `batch_view_images` see images directly**: vision-capable models now get the images attached to the tool result instead of a text description from a second model request. The `attach_natively` parameter of `view_image` is gone, since attaching is now always the case for these models.
 
 ---
 

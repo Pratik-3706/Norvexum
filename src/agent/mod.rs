@@ -1620,7 +1620,7 @@ Another agent gave you one task. Work on it independently with your tools; the u
         );
         let content = crate::util::truncate_middle(&result.to_message_content(), max_chars);
         let mut msg = Message::tool_result(&call.id, &call.name, content);
-        if let Some((data, mime)) = result.base64_image {
+        for (data, mime) in result.images {
             msg = msg.with_image(data, mime);
         }
         msg.thought_signature = call.thought_signature.clone();

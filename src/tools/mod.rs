@@ -45,9 +45,9 @@ pub struct ToolResult {
     /// Structured data for the agent to use (e.g. file paths, image URLs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
-    /// Optional image data as (base64_string, mime_type)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base64_image: Option<(String, String)>,
+    /// Images for the model to look at, as (base64_string, mime_type)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<(String, String)>,
 }
 
 impl ToolResult {
@@ -57,7 +57,7 @@ impl ToolResult {
             output: output.into(),
             error: None,
             data: None,
-            base64_image: None,
+            images: Vec::new(),
         }
     }
 
@@ -67,7 +67,7 @@ impl ToolResult {
             output: output.into(),
             error: None,
             data: Some(data),
-            base64_image: None,
+            images: Vec::new(),
         }
     }
 
@@ -77,7 +77,18 @@ impl ToolResult {
             output: output.into(),
             error: None,
             data: None,
-            base64_image: Some((base64, mime)),
+            images: vec![(base64, mime)],
+        }
+    }
+
+    /// Several images for the model to see, in order, with a text note.
+    pub fn ok_with_images(output: impl Into<String>, images: Vec<(String, String)>) -> Self {
+        Self {
+            success: true,
+            output: output.into(),
+            error: None,
+            data: None,
+            images,
         }
     }
 
@@ -88,7 +99,7 @@ impl ToolResult {
             output: String::new(),
             error: Some(error_str),
             data: None,
-            base64_image: None,
+            images: Vec::new(),
         }
     }
 
@@ -319,6 +330,90 @@ mod tests {
             inbox: None,
         };
         (root, context)
+    }
+
+    /// A model that can see images; counts the requests sent to it.
+    struct SeeingModel(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiClient for SeeingModel {
+        async fn chat_stream(
+            &self,
+            _request: crate::ai::types::AiRequest,
+            _tx: tokio::sync::mpsc::UnboundedSender<crate::ai::types::AiStreamEvent>,
+        ) -> eyre::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn supports_vision(&self) -> bool {
+            true
+        }
+    }
+
+    fn write_png(path: &std::path::Path) {
+        image::RgbImage::from_pixel(4, 4, image::Rgb([10, 200, 10]))
+            .save(path)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn models_that_see_images_get_them_directly() {
+        let (root, mut context) = test_context();
+        let model = Arc::new(SeeingModel(Default::default()));
+        context.client = Some(model.clone());
+        write_png(&root.join("a.png"));
+        write_png(&root.join("b.png"));
+        let registry = ToolRegistry::new(&context.settings);
+
+        let one = registry
+            .execute(
+                "view_image",
+                json!({ "path": "a.png", "prompt": "is it green?" }),
+                &context,
+            )
+            .await;
+        assert!(one.success, "{}", one.to_message_content());
+        assert_eq!(one.images.len(), 1);
+        assert!(one.output.contains("a.png") && one.output.contains("is it green?"));
+
+        let many = registry
+            .execute(
+                "batch_view_images",
+                json!({ "paths": ["b.png", "a.png"] }),
+                &context,
+            )
+            .await;
+        assert!(many.success, "{}", many.to_message_content());
+        assert_eq!(many.images.len(), 2);
+        // The note gives the order the images are attached in.
+        let (b, a) = (
+            many.output.find("1. b.png").unwrap(),
+            many.output.find("2. a.png").unwrap(),
+        );
+        assert!(b < a);
+
+        // No separate vision request was made for either call.
+        assert_eq!(model.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn text_only_models_without_keys_are_told_how_to_see_images() {
+        let (root, context) = test_context();
+        write_png(&root.join("a.png"));
+        let registry = ToolRegistry::new(&context.settings);
+        for (tool, args) in [
+            ("view_image", json!({ "path": "a.png" })),
+            ("batch_view_images", json!({ "paths": ["a.png"] })),
+        ] {
+            let result = registry.execute(tool, args, &context).await;
+            assert!(!result.success, "{tool}");
+            assert!(result.images.is_empty(), "{tool}");
+            let said = result.to_message_content();
+            assert!(said.contains("can't see images"), "{tool}: {said}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
