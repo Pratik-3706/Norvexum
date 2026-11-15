@@ -197,7 +197,6 @@ impl ToolRegistry {
         registry.register(Arc::new(web_search::WebSearchTool));
         registry.register(Arc::new(web_fetch::WebFetchTool));
         registry.register(Arc::new(image_search::ImageSearchTool));
-        registry.register(Arc::new(image_search::ZerochanSearchTool));
         registry.register(Arc::new(image_download::DownloadImageTool));
         registry.register(Arc::new(image_download::BatchDownloadImageTool));
         registry.register(Arc::new(image_inspect::InspectImageTool));
@@ -264,6 +263,11 @@ impl ToolRegistry {
         match self.get(name) {
             Some(tool) => tool.execute(args, ctx).await,
             None if name.starts_with(mcp::PREFIX) => mcp::call(name, args).await,
+            // Older saved sessions may still call tools that were taken out.
+            None if name == "zerochan_search" => ToolResult::err(
+                "zerochan_search has been removed: Zerochan's API no longer accepts requests from \
+                 automated agents. Use image_search instead.",
+            ),
             None => ToolResult::err(format!(
                 "Unknown tool: {name}. Available tools: {}",
                 self.tool_names().join(", ")
@@ -315,6 +319,27 @@ mod tests {
             inbox: None,
         };
         (root, context)
+    }
+
+    #[tokio::test]
+    async fn the_removed_zerochan_tool_is_gone_and_explained() {
+        let (root, context) = test_context();
+        let registry = ToolRegistry::new(&context.settings);
+        assert!(!registry.tool_names().contains(&"zerochan_search"));
+        // Nothing offered to the model mentions it either.
+        assert!(registry.tool_defs().iter().all(|d| {
+            !format!("{} {} {}", d.name, d.description, d.parameters)
+                .to_lowercase()
+                .contains("zerochan")
+        }));
+        let result = registry
+            .execute("zerochan_search", json!({ "query": "x" }), &context)
+            .await;
+        assert!(!result.success);
+        let said = result.to_message_content();
+        assert!(said.contains("no longer accepts"), "{}", said);
+        assert!(said.contains("image_search"), "{said}");
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ graph TD
     Agent --> |Invokes Parallel| Tools[Extensible Tool Registry]
     Tools --> |Executes| LocalFiles[Sandbox Filesystem]
     Tools --> |Executes| Shell[Command Exec]
-    Tools --> |Requests| Zerochan[Zerochan / DDG APIs]
+    Tools --> |Requests| Web[Web Search / DDG APIs]
 ```
 
 ---
@@ -38,8 +38,7 @@ Norvexum is designed for speed. If the AI requests multiple tool calls (e.g. rea
 ### 🛡️ Secure Workspace Sandbox
 Enforces strict canonical path verification across all filesystem and shell execution tools. The agent cannot read, edit, copy, write, or execute paths outside the workspace root directory. For shell commands, the tool tokenizes the command line, resolving and validating every path-like argument (including command names, traversal sequences like `../../`, home directories `~/`, and `file://` URLs) against the project root. Safe commands execute directly without spawning a subshell, while unparseable commands or commands with shell metacharacters fall back to a shell under forced user approval. Critical binaries are hard-blocked using a strict command name denylist.
 
-### 🌸 Dedicated Zerochan & DDG Clients
-*   **`zerochan_search`**: A dedicated API tag client for high-quality anime, game, manga, and fictional character illustrations. Supports multi-tag queries using comma separations (e.g. `Genshin Impact, Furina`). It handles tag-specific redirections and preserves JSON API parameters.
+### 🖼️ Image Search & Downloads
 *   **`image_search`**: Generic web image search utilizing DuckDuckGo.
 *   **`batch_download_images`**: Concurrently downloads up to 20 images directly to your specified folder or current working directory.
 
@@ -114,9 +113,12 @@ The agent has access to a comprehensive suite of registered developer tools:
 
 *   **Filesystem**: `read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_files`, `touch`, `remove_file`, `move_file`, `copy_file`, `pwd`.
 *   **Web Operations**: `web_search` (Tavily search client), `web_fetch` (markdown scraper).
-*   **Media**: `generate_image` (Gemini/Pollinations/DALL-E 3 unified generator), `image_search` (DDG), `zerochan_search` (Zerochan Tag API), `download_image`, `batch_download_images`, `view_image`.
+*   **Media**: `generate_image` (Gemini/Pollinations/DALL-E 3 unified generator), `image_search` (DDG), `download_image`, `batch_download_images`, `view_image`.
 *   **Execution**: `run_command` (shell task runner with TUI interactive turn approvals), `check_package` (OSV vulnerability protection shield).
 *   **VCS**: `git_status`, `git_diff`, `git_commit`, `git_log`.
+
+### 🔌 API Changes
+*   **`zerochan_search` removed**: Zerochan's API no longer accepts requests from automated agents, so the tool has been taken out. Use `image_search` instead. Saved sessions that still try to call it get an explanation instead of an error about an unknown tool.
 
 ---
 
