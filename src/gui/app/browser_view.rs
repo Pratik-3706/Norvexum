@@ -49,23 +49,24 @@ impl GuiApp {
         // Toolbar: back, forward, reload, address, close.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            let enabled = open;
-            for (glyph, hint, action) in [
-                ("‹", "Back", UserAction::Back),
-                ("›", "Forward", UserAction::Forward),
-                ("⟳", "Reload", UserAction::Reload),
+            for (icon, hint, action) in [
+                (style::Icon::Back, "Back", UserAction::Back),
+                (style::Icon::Chevron, "Forward", UserAction::Forward),
+                (style::Icon::Refresh, "Reload", UserAction::Reload),
             ] {
-                let button = egui::Button::new(egui::RichText::new(glyph).size(17.0).color(p.dim))
-                    .frame(false)
-                    .min_size(egui::vec2(26.0, 26.0));
-                if ui
-                    .add_enabled(enabled, button)
-                    .on_hover_text(hint)
-                    .clicked()
-                {
+                // Dimmed and inert until a page is open.
+                let clicked = ui
+                    .add_enabled_ui(open, |ui| {
+                        style::icon_button(ui, icon, 26.0, false, p)
+                            .on_hover_text(hint)
+                            .clicked()
+                    })
+                    .inner;
+                if clicked {
                     browser::user_action(action, timeout);
                 }
             }
+            ui.add_space(4.0);
             // An exact size: egui puts a text box's margins outside its desired
             // width, and anything wider than the space left widens the panel a
             // little more every frame.
@@ -95,8 +96,9 @@ impl GuiApp {
         ui.add_space(6.0);
 
         let Some((_, tex)) = &self.browser_tex else {
-            empty_hint(
+            style::empty_state(
                 ui,
+                style::Icon::Globe,
                 if open {
                     "Loading…"
                 } else {
@@ -104,6 +106,7 @@ impl GuiApp {
                 },
                 "Enter an address above, or ask the agent to open a page. It shows up here \
                  instead of in a separate window, and you can click and scroll it.",
+                None,
                 p,
             );
             return;

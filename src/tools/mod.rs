@@ -8,6 +8,7 @@
 //   • Are sandboxed to the project directory
 // ===========================================================================
 
+pub mod ask;
 pub mod batch_image_inspect;
 pub mod filesystem;
 pub mod git;
@@ -20,6 +21,7 @@ pub mod mcp;
 pub mod memory;
 pub mod package_safety;
 pub mod processes;
+pub mod push_check;
 pub mod shell;
 pub mod skills;
 pub mod web_fetch;
@@ -245,6 +247,9 @@ impl ToolRegistry {
         registry.register(Arc::new(git::GitDiffTool));
         registry.register(Arc::new(git::GitCommitTool));
         registry.register(Arc::new(git::GitLogTool));
+        registry.register(Arc::new(git::GitPushTool));
+        registry.register(Arc::new(git::GitTool));
+        registry.register(Arc::new(ask::AskUserTool));
 
         registry
     }

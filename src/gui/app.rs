@@ -74,6 +74,8 @@ pub struct GuiApp {
 
     // Approval modal / card state
     approval_pending: Option<crate::ui::ApprovalInfo>,
+    /// Answers the agent offered with ask_user: (question, options).
+    choices: Option<(Option<String>, Vec<String>)>,
 
     // Textures
     last_layer_tex: egui::TextureHandle,
@@ -498,6 +500,7 @@ impl GuiApp {
             folder_input,
             folder_error: None,
             approval_pending: None,
+            choices: None,
             last_layer_tex,
             middle_layer_tex,
             top_layer_tex,
@@ -1580,7 +1583,11 @@ impl GuiApp {
                                 self.approval_agent = None;
                             }
                         }
+                        AgentEvent::Choices { question, options } => {
+                            self.choices = Some((question, options));
+                        }
                         AgentEvent::ClearChat => {
+                            self.choices = None;
                             self.subagents.clear();
                             self.chat_view = ChatView::Main;
                             self.messages.clear();
@@ -1743,6 +1750,8 @@ impl GuiApp {
             return;
         }
 
+        // A message answers (or passes over) any offered choices.
+        self.choices = None;
         let mut raw_prompt = self.input_text.trim().to_string();
         if raw_prompt.is_empty() {
             raw_prompt = if self.attachments.len() == 1 {
@@ -1948,6 +1957,28 @@ impl GuiApp {
         style::section_label(ui, "Workspace folder", p);
         self.draw_workspace_picker(ui, ctx, p);
         ui.add_space(14.0);
+        style::section_label(ui, "Git", p);
+        let mut changed = false;
+        let mut credit = self.settings.co_author_commits;
+        if ui
+            .checkbox(
+                &mut credit,
+                "Credit Norvexum as co-author on commits it makes",
+            )
+            .changed()
+        {
+            self.settings.co_author_commits = credit;
+            changed = true;
+        }
+        ui.label(
+            egui::RichText::new(
+                "Adds a Co-authored-by line, so GitHub shows the Norvexum logo next to yours. \
+                 It uses a GitHub noreply address, never your email.",
+            )
+            .size(11.5)
+            .color(p.faint),
+        );
+        ui.add_space(14.0);
         style::section_label(ui, "Keyboard", p);
         if style::secondary_button(ui, "Show keyboard shortcuts", p).clicked() {
             self.show_shortcuts = true;
@@ -1959,7 +1990,7 @@ impl GuiApp {
                 .size(12.5)
                 .color(p.dim),
         );
-        false
+        changed
     }
 
     fn settings_permissions(&mut self, ui: &mut egui::Ui, p: &Palette) -> bool {
@@ -2362,7 +2393,7 @@ impl GuiApp {
 /// System messages and empty assistant bubbles (no text, reasoning or tool
 /// activity) are not drawn.
 /// The agent's `/` commands, for the composer's suggestions.
-const SLASH_COMMANDS: [(&str, &str); 11] = [
+const SLASH_COMMANDS: [(&str, &str); 12] = [
     ("/help", "Show every command"),
     ("/clear", "Clear the chat and the agent's memory"),
     ("/compact", "Summarize older messages to free context"),
@@ -2376,6 +2407,7 @@ const SLASH_COMMANDS: [(&str, &str); 11] = [
     ("/provider", "List providers or switch"),
     ("/session", "resume · list · load <id> · clear"),
     ("/ask_perms", "Turn tool approval prompts on or off"),
+    ("/co_author", "Credit Norvexum as co-author on its commits"),
     ("/copy", "Copy the last answer (or: /copy chat)"),
 ];
 
@@ -2560,25 +2592,15 @@ struct TreeView<'a> {
 
 fn draw_tree(ui: &mut egui::Ui, node: &FileTree, prefix: &str, depth: usize, view: &mut TreeView) {
     for (name, child) in &node.dirs {
-        let mut key = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        // Chains of single folders share one row ("src/engine/physics").
-        let mut label = name.clone();
-        let mut child = child;
-        while child.files.is_empty() && child.dirs.len() == 1 {
-            let (next_name, next) = child.dirs.iter().next().expect("one entry");
-            label = format!("{label}/{next_name}");
-            key = format!("{key}/{next_name}");
-            child = next;
-        }
+        let (label, key, child) = merged_dir(prefix, name, child);
         let open = view.force_open || view.expanded.contains(&key);
         let resp = tree_row(
             ui,
             depth,
-            Some(open),
+            TreeItem::Dir {
+                open,
+                items: child.dirs.len() + child.files.len(),
+            },
             &label,
             false,
             FileDecor::default(),
@@ -2599,51 +2621,119 @@ fn draw_tree(ui: &mut egui::Ui, node: &FileTree, prefix: &str, depth: usize, vie
     for (name, path) in &node.files {
         let decor = (view.decor)(path);
         let selected = view.selected == Some(path.as_str());
-        if tree_row(ui, depth, None, name, selected, decor, view.p, view.time)
-            .on_hover_text(path.as_str())
-            .clicked()
-        {
+        let mut row = tree_row(
+            ui,
+            depth,
+            TreeItem::File,
+            name,
+            selected,
+            decor,
+            view.p,
+            view.time,
+        );
+        // The name is on the row already; only a nested path adds anything.
+        if path != name {
+            row = row.on_hover_text(path.as_str());
+        }
+        if row.clicked() {
             view.clicked = Some(path.clone());
         }
     }
 }
 
-/// One tree line: indent guides, a chevron for folders (or a pulsing dot
-/// for a file being written), the name, and diff counts on the right.
+/// A folder row and what it stands for: chains of single folders share one
+/// row ("src/engine/physics"). Returns the label, the expansion key and the
+/// folder whose contents the row opens.
+fn merged_dir<'a>(
+    prefix: &str,
+    name: &str,
+    mut child: &'a FileTree,
+) -> (String, String, &'a FileTree) {
+    let mut key = if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    };
+    let mut label = name.to_string();
+    while child.files.is_empty() && child.dirs.len() == 1 {
+        let (next_name, next) = child.dirs.iter().next().expect("one entry");
+        label = format!("{label}/{next_name}");
+        key = format!("{key}/{next_name}");
+        child = next;
+    }
+    (label, key, child)
+}
+
+/// The expansion key of every folder row in the tree, for "Expand all".
+fn all_dir_keys(node: &FileTree, prefix: &str, out: &mut std::collections::HashSet<String>) {
+    for (name, child) in &node.dirs {
+        let (_, key, child) = merged_dir(prefix, name, child);
+        all_dir_keys(child, &key, out);
+        out.insert(key);
+    }
+}
+
+/// What a tree row shows.
+#[derive(Clone, Copy)]
+enum TreeItem {
+    Dir { open: bool, items: usize },
+    File,
+}
+
+/// The icon and tint for a file, by what kind of file it is.
+fn file_glyph(name: &str, p: &Palette) -> (style::Icon, egui::Color32) {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "avif" => {
+            (style::Icon::Image, p.success)
+        }
+        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "c" | "h" | "cpp" | "hpp" | "java"
+        | "kt" | "cs" | "rb" | "php" | "swift" | "html" | "css" | "scss" | "sh" | "ps1" | "sql"
+        | "lua" | "vue" | "svelte" => (style::Icon::Code, p.accent),
+        "json" | "toml" | "yaml" | "yml" | "xml" | "ini" | "env" | "lock" | "cfg" => {
+            (style::Icon::Gear, p.warn)
+        }
+        _ => (style::Icon::File, p.dim),
+    }
+}
+
+/// One tree line: indent guides, a chevron and folder icon for folders (a
+/// pulsing dot for a file being written, a file-type icon otherwise), the
+/// name, and on the right the folder's item count or the file's diff counts.
 #[allow(clippy::too_many_arguments)]
 fn tree_row(
     ui: &mut egui::Ui,
     depth: usize,
-    dir_open: Option<bool>,
+    item: TreeItem,
     name: &str,
     selected: bool,
     decor: FileDecor,
     p: &Palette,
     time: f32,
 ) -> egui::Response {
-    const INDENT: f32 = 14.0;
+    const INDENT: f32 = 16.0;
     let width = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hovered = resp.hovered();
     let painter = ui.painter();
-    if decor.writing {
-        painter.rect_filled(rect, 5.0, p.accent_soft);
-    } else if selected {
-        painter.rect_filled(rect, 5.0, p.hover);
-    } else if resp.hovered() {
-        painter.rect_filled(rect, 5.0, p.surface);
+    if decor.writing || selected {
+        painter.rect_filled(rect, 6.0, p.accent_soft);
+    } else if hovered {
+        painter.rect_filled(rect, 6.0, p.hover);
     }
     if selected {
         painter.rect_filled(
             egui::Rect::from_min_size(
-                rect.left_top() + egui::vec2(0.0, 5.0),
-                egui::vec2(2.0, 14.0),
+                rect.left_top() + egui::vec2(0.0, 6.0),
+                egui::vec2(2.5, 14.0),
             ),
             1.0,
             p.accent,
         );
     }
     for level in 0..depth {
-        let x = rect.left() + 11.0 + level as f32 * INDENT;
+        let x = rect.left() + 13.0 + level as f32 * INDENT;
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(1.0_f32, p.border),
@@ -2652,32 +2742,50 @@ fn tree_row(
 
     let cy = rect.center().y;
     let x0 = rect.left() + 6.0 + depth as f32 * INDENT;
-    let mark_x = x0 + 5.0;
-    let chevron =
-        |points: Vec<egui::Pos2>| egui::Shape::convex_polygon(points, p.faint, egui::Stroke::NONE);
-    match dir_open {
-        Some(true) => {
-            painter.add(chevron(vec![
-                egui::pos2(mark_x - 3.5, cy - 1.5),
-                egui::pos2(mark_x + 3.5, cy - 1.5),
-                egui::pos2(mark_x, cy + 2.5),
-            ]));
+    let mark_x = x0 + 7.0;
+    let icon_rect = egui::Rect::from_center_size(egui::pos2(x0 + 24.0, cy), egui::vec2(14.0, 14.0));
+    match item {
+        TreeItem::Dir { open, .. } => {
+            let color = if hovered { p.text } else { p.dim };
+            let points = if open {
+                vec![
+                    egui::pos2(mark_x - 3.5, cy - 1.8),
+                    egui::pos2(mark_x, cy + 1.8),
+                    egui::pos2(mark_x + 3.5, cy - 1.8),
+                ]
+            } else {
+                vec![
+                    egui::pos2(mark_x - 1.8, cy - 3.5),
+                    egui::pos2(mark_x + 1.8, cy),
+                    egui::pos2(mark_x - 1.8, cy + 3.5),
+                ]
+            };
+            painter.add(egui::Shape::line(points, egui::Stroke::new(1.5_f32, color)));
+            style::paint_icon(
+                painter,
+                icon_rect,
+                style::Icon::Files,
+                if open { p.accent } else { p.dim },
+            );
         }
-        Some(false) => {
-            painter.add(chevron(vec![
-                egui::pos2(mark_x - 1.5, cy - 3.5),
-                egui::pos2(mark_x + 2.5, cy),
-                egui::pos2(mark_x - 1.5, cy + 3.5),
-            ]));
-        }
-        None if decor.writing => {
+        TreeItem::File if decor.writing => {
             let pulse = 0.55 + 0.45 * (time * std::f32::consts::TAU / 1.4).sin();
-            painter.circle_filled(egui::pos2(mark_x, cy), 3.5, p.accent.gamma_multiply(pulse));
+            painter.circle_filled(icon_rect.center(), 3.5, p.accent.gamma_multiply(pulse));
         }
-        None => {}
+        TreeItem::File => {
+            let (icon, color) = file_glyph(name, p);
+            style::paint_icon(painter, icon_rect, icon, color.gamma_multiply(0.85));
+        }
     }
 
     let mut right = rect.right() - 8.0;
+    if let TreeItem::Dir { items, .. } = item {
+        let g =
+            painter.layout_no_wrap(items.to_string(), egui::FontId::proportional(11.0), p.faint);
+        right -= g.size().x;
+        painter.galley(egui::pos2(right, cy - g.size().y / 2.0), g, p.faint);
+        right -= 6.0;
+    }
     if decor.writing {
         let g =
             painter.layout_no_wrap("writing".into(), egui::FontId::proportional(11.0), p.accent);
@@ -2698,15 +2806,13 @@ fn tree_row(
         }
     }
 
-    let text_x = x0 + 14.0;
-    let color = if dir_open.is_some() { p.dim } else { p.text };
-    let name_g = style::one_line(
-        ui,
-        name,
-        egui::FontId::proportional(12.5),
-        color,
-        right - text_x - 4.0,
-    );
+    let text_x = x0 + 36.0;
+    let (font, color) = match item {
+        TreeItem::Dir { .. } => (style::strong(12.5), p.text),
+        TreeItem::File if selected || hovered => (egui::FontId::proportional(12.5), p.text),
+        TreeItem::File => (egui::FontId::proportional(12.5), p.dim),
+    };
+    let name_g = style::one_line(ui, name, font, color, right - text_x - 4.0);
     painter.galley(
         egui::pos2(text_x, cy - name_g.size().y / 2.0),
         name_g,
@@ -2921,22 +3027,10 @@ enum RightTab {
 
 /// Inner margin of the files panel; its divider runs out to the panel edges.
 const RIGHT_PAD: f32 = 12.0;
-
-/// Quiet placeholder for an empty list.
-fn empty_hint(ui: &mut egui::Ui, title: &str, body: &str, p: &Palette) {
-    ui.add_space(20.0);
-    ui.vertical_centered(|ui| {
-        ui.label(
-            egui::RichText::new(title)
-                .font(style::strong(12.5))
-                .color(p.dim),
-        );
-        if !body.is_empty() {
-            ui.add_space(2.0);
-            ui.label(egui::RichText::new(body).size(12.0).color(p.faint));
-        }
-    });
-}
+/// Narrowest the right panel gets: its four tabs still fit.
+const RIGHT_MIN_WIDTH: f32 = 320.0;
+/// Room the side panels always leave for the chat and the composer.
+pub(crate) const MIN_CHAT_WIDTH: f32 = 460.0;
 
 impl GuiApp {
     fn pal(&self) -> Palette {
@@ -2953,6 +3047,7 @@ impl GuiApp {
 
     fn new_chat(&mut self) {
         let _ = self.user_tx.send("/clear".to_string());
+        self.choices = None;
         self.messages.clear();
         self.session_written_files.clear();
         self.file_diff_stats.clear();
@@ -3051,18 +3146,25 @@ impl GuiApp {
             return;
         }
 
+        // Wide enough for its four tabs, and never so wide that the chat and
+        // the composer next to it get cut off.
+        let max_width = (ctx.screen_rect().width() * 0.6)
+            .min(ctx.available_rect().width() - MIN_CHAT_WIDTH)
+            .max(RIGHT_MIN_WIDTH);
         let mut right_panel = egui::SidePanel::right("right_sidebar")
             .frame(
                 egui::Frame::none()
                     .fill(p.panel)
                     .inner_margin(egui::Margin::same(RIGHT_PAD)),
             )
-            .resizable(!right_animating && self.right_sidebar_open)
-            .width_range(60.0..=(ctx.screen_rect().width() * 0.6).max(320.0));
+            .resizable(!right_animating && self.right_sidebar_open);
         if right_animating {
-            right_panel = right_panel.exact_width(self.right_sidebar_width * right_t);
+            right_panel = right_panel
+                .exact_width(self.right_sidebar_width.clamp(RIGHT_MIN_WIDTH, max_width) * right_t);
         } else {
-            right_panel = right_panel.default_width(self.right_sidebar_width);
+            right_panel = right_panel
+                .width_range(RIGHT_MIN_WIDTH..=max_width)
+                .default_width(self.right_sidebar_width.clamp(RIGHT_MIN_WIDTH, max_width));
         }
 
         let panel_response = right_panel.show(ctx, |ui| {
@@ -3084,9 +3186,7 @@ impl GuiApp {
             }
         });
         if !right_animating && self.right_sidebar_open {
-            // Never let the panel crowd out the chat.
-            let max = (ctx.screen_rect().width() * 0.6).max(320.0);
-            self.right_sidebar_width = panel_response.response.rect.width().min(max);
+            self.right_sidebar_width = panel_response.response.rect.width().min(max_width);
         }
     }
 
@@ -3142,13 +3242,19 @@ impl GuiApp {
         let changes = self.session_written_files.len();
         let running = self.subagents.iter().filter(|s| s.running()).count();
         let items = [
-            ("Changes", (changes > 0).then(|| changes.to_string())),
-            ("Files", None),
             (
+                style::Icon::Edit,
+                "Changes",
+                (changes > 0).then(|| changes.to_string()),
+            ),
+            (style::Icon::Files, "Files", None),
+            (
+                style::Icon::Globe,
                 "Browser",
                 crate::tools::browser::is_open().then(|| "●".to_string()),
             ),
             (
+                style::Icon::Agents,
                 "Agents",
                 if running > 0 {
                     Some(running.to_string())
@@ -3206,12 +3312,16 @@ impl GuiApp {
                     }
                 }
                 if display_files.is_empty() {
-                    empty_hint(
+                    if style::empty_state(
                         ui,
+                        style::Icon::Edit,
                         "No changes yet",
                         "Files the agent creates or edits in this chat appear here as it writes them.",
+                        Some("Browse all files"),
                         p,
-                    );
+                    ) {
+                        self.right_tab = RightTab::All;
+                    }
                     return None;
                 }
 
@@ -3273,14 +3383,44 @@ impl GuiApp {
             RightTab::Browser | RightTab::Agents => None,
             RightTab::All => {
                 style::search_field(ui, &mut self.file_filter, "Search files", p);
-                if !self.expanded_dirs.is_empty() && self.file_filter.is_empty() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if style::link_button(ui, "Collapse all", p).clicked() {
-                            self.expanded_dirs.clear();
-                        }
-                    });
-                }
-                ui.add_space(6.0);
+                ui.add_space(2.0);
+                // How much is here, and the whole tree open or shut in one click.
+                ui.horizontal(|ui| {
+                    let shown = if self.file_filter.is_empty() {
+                        self.workspace_files.len()
+                    } else {
+                        let query = self.file_filter.to_lowercase();
+                        self.workspace_files
+                            .iter()
+                            .filter(|f| f.to_lowercase().contains(&query))
+                            .count()
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{shown} {}",
+                            match (shown, self.file_filter.is_empty()) {
+                                (1, true) => "file",
+                                (_, true) => "files",
+                                (1, false) => "match",
+                                (_, false) => "matches",
+                            }
+                        ))
+                        .size(11.5)
+                        .color(p.faint),
+                    );
+                    if self.file_filter.is_empty() && !self.file_tree.dirs.is_empty() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.expanded_dirs.is_empty() {
+                                if style::link_button(ui, "Expand all", p).clicked() {
+                                    all_dir_keys(&self.file_tree, "", &mut self.expanded_dirs);
+                                }
+                            } else if style::link_button(ui, "Collapse all", p).clicked() {
+                                self.expanded_dirs.clear();
+                            }
+                        });
+                    }
+                });
+                ui.add_space(2.0);
                 if self.file_tree_dirty || self.file_tree_filter != self.file_filter {
                     let query = self.file_filter.to_lowercase();
                     self.file_tree = FileTree::build(
@@ -3292,7 +3432,7 @@ impl GuiApp {
                     self.file_tree_dirty = false;
                 }
                 if self.is_loading_files && self.workspace_files.is_empty() {
-                    empty_hint(ui, "Scanning…", "", p);
+                    style::empty_state(ui, style::Icon::Files, "Scanning…", "", None, p);
                     return None;
                 }
                 if self.file_tree.is_empty() {
@@ -3301,7 +3441,21 @@ impl GuiApp {
                     } else {
                         "Nothing matches that search."
                     };
-                    empty_hint(ui, "No files", hint, p);
+                    let filtered = !self.file_filter.is_empty();
+                    if style::empty_state(
+                        ui,
+                        if filtered {
+                            style::Icon::Search
+                        } else {
+                            style::Icon::Files
+                        },
+                        "No files",
+                        hint,
+                        filtered.then_some("Clear search"),
+                        p,
+                    ) {
+                        self.file_filter.clear();
+                    }
                     return None;
                 }
 
@@ -3686,7 +3840,24 @@ impl GuiApp {
             let args_preview = approval.args_preview.clone();
 
             let mut target_summary = String::new();
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&args_preview) {
+            let parsed = serde_json::from_str::<serde_json::Value>(&args_preview);
+            let git_args = parsed
+                .as_ref()
+                .ok()
+                .and_then(|v| v["args"].as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+            // A push is described as what it sends: shown in full.
+            let full = tool_name == "git_push";
+            if full {
+                target_summary = crate::util::truncate_chars(&args_preview, 1500);
+            } else if let (true, Some(args)) = (tool_name == "git", git_args) {
+                target_summary = format!("git {args}");
+            } else if let Ok(v) = parsed {
                 if let Some(path) = v
                     .get("path")
                     .or_else(|| v.get("TargetFile"))
@@ -3723,7 +3894,7 @@ impl GuiApp {
             if target_summary.is_empty() {
                 target_summary = args_preview.clone();
             }
-            if target_summary.len() > 120 {
+            if !full && target_summary.chars().count() > 120 {
                 target_summary = crate::util::truncate_chars(&target_summary, 120);
             }
 
@@ -3788,6 +3959,14 @@ impl GuiApp {
 
         if let Some(approved) = user_response {
             self.answer_approval(approved);
+        }
+
+        // Answers the agent offered (ask_user), while it waits for a pick.
+        if self.approval_pending.is_none() && !self.is_processing {
+            if let Some(answer) = self.draw_choices(ui, p) {
+                self.input_text = answer;
+                self.send_message();
+            }
         }
 
         // Attachment chips
@@ -4036,8 +4215,10 @@ impl GuiApp {
 
                     let active_provider = &registry[current_provider_idx];
                     let mut model_display = self.settings.active_model.clone();
-                    if model_display.chars().count() > 30 {
-                        model_display = crate::util::truncate_chars(&model_display, 27);
+                    // In a narrow chat column the name gives way to the send button.
+                    let fits = (((ui.available_width() - 64.0) / 7.0) as usize).clamp(10, 30);
+                    if model_display.chars().count() > fits {
+                        model_display = crate::util::truncate_chars(&model_display, fits);
                     }
 
                     let popup_id = ui.make_persistent_id("model_search_popup");
@@ -5296,6 +5477,16 @@ fn format_tool_args_summary(name: &str, args_json: &str) -> String {
                 name
             }
         }
+        "git" => serde_json::from_str::<serde_json::Value>(args_json)
+            .ok()
+            .and_then(|v| {
+                v["args"].as_array().map(|a| {
+                    let joined: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+                    crate::util::truncate_chars(&format!("git {}", joined.join(" ")), 60)
+                })
+            })
+            .unwrap_or_default(),
+        "ask_user" => extract_streaming_content(args_json, "question"),
         _ => String::new(),
     }
 }
@@ -5303,6 +5494,11 @@ fn format_tool_args_summary(name: &str, args_json: &str) -> String {
 fn format_tool_text(name: &str, success: bool, summary: &str) -> String {
     let prefix = if success { "" } else { "Failed to " };
     match name {
+        "git" if !summary.is_empty() => format!("{prefix}ran `{summary}`"),
+        "git_push" if success => "pushed to the remote".to_string(),
+        "git_push" => "Failed to push".to_string(),
+        "ask_user" if summary.is_empty() => "offered next steps".to_string(),
+        "ask_user" => format!("asked: {summary}"),
         "read_file" | "cat" | "view_file" => {
             if summary.is_empty() {
                 format!("{}read file", prefix)

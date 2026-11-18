@@ -50,6 +50,9 @@ Enforces strict canonical path verification across all filesystem and shell exec
 ### 🛡️ Dependency Safety Shield
 Before running dangerous setups or installing pip/npm packages, the **`check_package`** tool checks package names against the Open Source Vulnerabilities (OSV) database and runs typosquatting checks to prevent malicious dependency injection.
 
+### 🤝 Co-Author Credit on Commits
+Commits Norvexum makes end with a `Co-authored-by: Norvexum` line, so GitHub shows the Norvexum logo next to your avatar. The line uses the GitHub noreply address of the Norvexum machine account: it holds no credentials, receives no mail, and never includes your own email. It is on by default; turn it off with `/co_author off`, `norvexum config set co_author_commits false`, or Settings → General → Git in the desktop app.
+
 ### 💾 Persistent State and Session Manager
 Config values and provider choices are saved to `.norvexum/config.toml` so your setup carries over automatically. Active conversations are archived and can be restored seamlessly.
 
@@ -115,7 +118,8 @@ The agent has access to a comprehensive suite of registered developer tools:
 *   **Web Operations**: `web_search` (Tavily search client), `web_fetch` (markdown scraper).
 *   **Media**: `generate_image` (Gemini/Pollinations/DALL-E 3 unified generator), `image_search` (DDG), `download_image`, `batch_download_images`, `view_image`, `batch_view_images`.
 *   **Execution**: `run_command` (shell task runner with TUI interactive turn approvals), `check_package` (OSV vulnerability protection shield).
-*   **VCS**: `git_status`, `git_diff`, `git_commit`, `git_log`.
+*   **VCS**: `git_status`, `git_diff`, `git_commit`, `git_log`, `git_push`, and `git` for everything else (branches, pull, fetch, merge, stash, tags, …). Norvexum only pushes when you ask, shows you exactly which commits are going where before it does, and never force-pushes. Every push is first checked for secret files (`.env`, private keys), API keys and tokens, files over GitHub's 100 MB limit, secret files your `.gitignore` doesn't cover, and personal email addresses in commits. If your project has `.env` files, Norvexum asks whether it may also check that none of their values are being pushed; the values are compared inside the check and never shown to the model. A push the check stops doesn't go out. If the remote has new commits, Norvexum pulls, resolves the conflicts, tells you what it did and pushes again. Norvexum also adds its own `.norvexum/` folder to your `.gitignore`. Git commands that can throw work away (`reset --hard`, `clean`, `branch -D`, …) ask you first.
+*   **Choices**: `ask_user` offers numbered answers when a request is ambiguous, and next steps (commit, push, keep polishing, …) when a piece of work is done. Pick one with a click or its number, or type your own answer.
 
 ### 🔌 API Changes
 *   **`zerochan_search` removed**: Zerochan's API no longer accepts requests from automated agents, so the tool has been taken out. Use `image_search` instead. Saved sessions that still try to call it get an explanation instead of an error about an unknown tool.

@@ -24,6 +24,12 @@ pub const VENVS_DIR: &str = "venvs";
 pub const MIN_CONTENT_CHARS: usize = 2_000;
 pub const MAX_CONTENT_CHARS: usize = 40_000;
 
+/// Added to commits Norvexum makes, so GitHub lists it as a co-author with
+/// its avatar. The address is the GitHub noreply address of the Norvexum
+/// machine account: it carries no credentials and receives no mail.
+pub const CO_AUTHOR_TRAILER: &str =
+    "Co-authored-by: Norvexum <240050648+Norvexum@users.noreply.github.com>";
+
 /// Global application settings, assembled from .env + config.toml + CLI args.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -78,6 +84,15 @@ pub struct Settings {
     /// agent (it used to be `serde(skip)`, so the agent never saw it).
     #[serde(default)]
     pub model_reasoning_type: Option<crate::ai::types::ReasoningType>,
+
+    // ── Git ──────────────────────────────────────────────────────────────
+    /// Credit Norvexum as co-author on the commits it makes ([`CO_AUTHOR_TRAILER`]).
+    #[serde(default = "default_true")]
+    pub co_author_commits: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -107,6 +122,7 @@ impl Default for Settings {
             starred_models: vec![],
             thinking_effort: None,
             model_reasoning_type: None,
+            co_author_commits: true,
         }
     }
 }
@@ -198,6 +214,9 @@ impl Settings {
             if let Some(csp) = file_settings.custom_system_prompt {
                 settings.custom_system_prompt = Some(csp);
             }
+            if let Some(credit) = file_settings.co_author_commits {
+                settings.co_author_commits = credit;
+            }
         }
 
         // Auto-select provider based on available keys if using defaults
@@ -272,6 +291,7 @@ impl Settings {
             fullscreen: Some(self.fullscreen),
             maximized: Some(self.maximized),
             custom_system_prompt: self.custom_system_prompt.clone(),
+            co_author_commits: Some(self.co_author_commits),
         };
 
         let content = toml::to_string_pretty(&file_settings)?;
@@ -370,6 +390,8 @@ struct FileSettings {
     fullscreen: Option<bool>,
     maximized: Option<bool>,
     custom_system_prompt: Option<String>,
+    #[serde(default)]
+    co_author_commits: Option<bool>,
 }
 
 /// Load `~/.norvexum/.env` (where the GUI stores keys) and the project `.env`.

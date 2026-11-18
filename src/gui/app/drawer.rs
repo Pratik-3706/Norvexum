@@ -7,6 +7,70 @@ use super::*;
 use crate::style::Icon;
 
 impl GuiApp {
+    /// The open folder as one card: its name, where it lives, and a click to
+    /// open another one. (Settings has the field for typing a path.)
+    fn draw_workspace_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Palette) {
+        let root = self.settings.project_root.clone();
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::click());
+        let hovered = resp.hovered();
+        ui.painter().rect(
+            rect,
+            9.0,
+            if hovered { p.hover } else { p.surface },
+            egui::Stroke::new(1.0_f32, p.border),
+        );
+        let icon = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 20.0, rect.center().y),
+            egui::vec2(16.0, 16.0),
+        );
+        style::paint_icon(ui.painter(), icon, Icon::Files, p.accent);
+        let chevron = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 16.0, rect.center().y),
+            egui::vec2(11.0, 11.0),
+        );
+        style::paint_icon(
+            ui.painter(),
+            chevron,
+            Icon::Chevron,
+            if hovered { p.text } else { p.faint },
+        );
+        let text_w = rect.width() - 38.0 - 30.0;
+        let name = style::one_line(
+            ui,
+            &self.project_name(),
+            style::strong(13.0),
+            p.text,
+            text_w,
+        );
+        let parent = root
+            .parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let place = style::one_line(
+            ui,
+            &parent,
+            egui::FontId::proportional(11.0),
+            p.faint,
+            text_w,
+        );
+        let x = rect.left() + 38.0;
+        ui.painter()
+            .galley(egui::pos2(x, rect.top() + 7.0), name, p.text);
+        ui.painter()
+            .galley(egui::pos2(x, rect.top() + 26.0), place, p.faint);
+        let clicked = resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("{}\nClick to open another folder", root.display()))
+            .clicked();
+        if clicked {
+            if let Some(path) = rfd::FileDialog::new().set_directory(&root).pick_folder() {
+                self.folder_input = path.to_string_lossy().to_string();
+                self.load_project_folder(&path, ctx.clone());
+            }
+        }
+    }
+
     pub(super) fn draw_left_sidebar(&mut self, ctx: &egui::Context, p: &Palette) {
         let target = if self.left_sidebar_open { 1.0 } else { 0.0 };
         let raw = ctx.animate_value_with_time(egui::Id::new("left_sidebar_anim"), target, 0.18);
@@ -51,7 +115,7 @@ impl GuiApp {
             ui.add_space(10.0);
 
             // Workspace at the bottom; the list takes the rest.
-            let footer_h = 118.0;
+            let footer_h = 96.0;
             let list_h = (ui.available_height() - footer_h).max(80.0);
             let mut load = None;
             let mut delete = None;
@@ -166,7 +230,7 @@ impl GuiApp {
             ui.add_space(10.0);
             style::section_label(ui, "Workspace", p);
             ui.add_space(4.0);
-            self.draw_workspace_picker(ui, ctx, p);
+            self.draw_workspace_card(ui, ctx, p);
         });
         if !animating && self.left_sidebar_open {
             self.left_sidebar_width = response.response.rect.width();

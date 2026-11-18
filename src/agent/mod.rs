@@ -75,6 +75,14 @@ pub enum AgentEvent {
         tool_name: String,
         args_preview: String,
     },
+    /// Answers for the user to pick (ask_user): a question for an ambiguous
+    /// request, or next steps after finished work when `question` is None.
+    /// Picking one sends it as the user's next message; they can also type
+    /// their own. Replaced by the next message the user sends.
+    Choices {
+        question: Option<String>,
+        options: Vec<String>,
+    },
     /// Dynamic skill triggered
     TriggeredSkill(String),
     /// The agent started a sub-agent (spawn_agent).
@@ -199,6 +207,7 @@ impl Agent {
                 &settings.active_model,
             );
         }
+        crate::tools::push_check::ensure_norvexum_ignored(&settings.project_root);
         let client = build_client_or_placeholder(&settings);
         let tools = Arc::new(ToolRegistry::new(&settings));
         let settings = Arc::new(settings);
@@ -269,6 +278,27 @@ Another agent gave you one task. Work on it independently with your tools; the u
         self.inbox_tx.clone()
     }
 
+    /// Turn the co-author credit on commits on or off, remember it, and tell
+    /// the model (its instructions mention the line).
+    fn set_co_author(&mut self, on: bool) {
+        let mut settings = (*self.settings).clone();
+        settings.co_author_commits = on;
+        if let Err(e) = settings.save() {
+            let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                "Couldn't save the setting, so it lasts until Norvexum closes: {e}"
+            )));
+        }
+        let system = build_system_prompt(&settings);
+        self.settings = Arc::new(settings);
+        if self
+            .messages
+            .first()
+            .is_some_and(|m| m.role == Role::System)
+        {
+            self.messages[0] = Message::system(system);
+        }
+    }
+
     /// Update the settings, AiClient, tools, and system prompt dynamically without losing message history.
     pub fn update_settings(&mut self, mut settings: Settings) -> Result<()> {
         let _ = std::env::set_current_dir(&settings.project_root);
@@ -278,6 +308,7 @@ Another agent gave you one task. Work on it independently with your tools; the u
                 &settings.active_model,
             );
         }
+        crate::tools::push_check::ensure_norvexum_ignored(&settings.project_root);
         let built = ai::build_client(&settings);
         let mut tools = ToolRegistry::new(&settings);
         if self.subagent_name.is_some() {
@@ -363,6 +394,7 @@ Another agent gave you one task. Work on it independently with your tools; the u
                         "📖 **Norvexum commands**",
                         "  `/help`                 Show this help",
                         "  `/ask_perms <on/off>`   Toggle tool approval prompts",
+                        "  `/co_author <on/off>`   Credit Norvexum as co-author on its commits",
                         "  `/loops <num|unlimited>` Set the tool-loop limit for one request",
                         "  `/clear`                Clear the chat and conversation memory",
                         "  `/compact`              Summarize older messages to free context",
@@ -408,6 +440,33 @@ Another agent gave you one task. Work on it independently with your tools; the u
                     ));
                 }
             },
+            "/co_author" => {
+                let wanted = match arg {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => None,
+                };
+                match wanted {
+                    Some(on) => {
+                        self.set_co_author(on);
+                        self.reply(if on {
+                            "Commits Norvexum makes will credit it as co-author."
+                        } else {
+                            "Commits Norvexum makes will no longer credit it as co-author."
+                        });
+                    }
+                    None => {
+                        let state = if self.settings.co_author_commits {
+                            "ON"
+                        } else {
+                            "OFF"
+                        };
+                        self.reply(format!(
+                            "Co-author credit on commits: {state}\nUsage: `/co_author <on/off>`"
+                        ));
+                    }
+                }
+            }
             "/mcp" => {
                 use crate::tools::mcp;
                 mcp::start();
@@ -1125,11 +1184,21 @@ Another agent gave you one task. Work on it independently with your tools; the u
             };
 
             self.turn_ran_tools = true;
+            // Choices were put to the user: the turn ends and their pick
+            // arrives as the next message.
+            let asked_user = calls.iter().zip(&results).any(|(call, result)| {
+                result.success
+                    && crate::tools::canonical_tool_name(&call.name) == crate::tools::ask::NAME
+            });
             for (call, result) in calls.iter().zip(results) {
                 self.messages.push(self.tool_result_message(call, result));
             }
 
             self.save_session();
+            if asked_user {
+                self.done(Some(usage));
+                return Ok(self.drain_instructions());
+            }
             loop_num += 1;
         }
     }
@@ -1460,20 +1529,44 @@ Another agent gave you one task. Work on it independently with your tools; the u
                 approvals.push(true);
                 continue;
             };
+            let name = crate::tools::canonical_tool_name(&tc.name);
             // Adding an MCP server runs a program of the model's choosing.
-            let changes_mcp = crate::tools::canonical_tool_name(&tc.name)
-                == crate::tools::mcp::MANAGE_TOOL_NAME
+            let changes_mcp = name == crate::tools::mcp::MANAGE_TOOL_NAME
                 && crate::tools::mcp::changes_setup(&args);
+            // Every push, and git commands that can throw work away.
+            let git_risk = crate::tools::git::always_ask(name, &args);
             if self.approval_disabled
-                || !(changes_mcp || tool_needs_approval(&self.settings, &tc.name))
+                || !(changes_mcp || git_risk || tool_needs_approval(&self.settings, &tc.name))
             {
                 approvals.push(true);
                 continue;
             }
+            // A push is shown as exactly what it will send. One that can't go
+            // ahead (nothing to send, the .env question still open, stopped
+            // by the safety check, an error) needs no approval: the tool
+            // refuses and says why.
+            let args_preview = match name {
+                "git_push" => {
+                    match crate::tools::git::push_plan(&args, &self.settings.project_root).await {
+                        Ok(plan)
+                            if !plan.nothing_to_push()
+                                && !plan.needs_env_answer()
+                                && !plan.blocked() =>
+                        {
+                            plan.describe()
+                        }
+                        _ => {
+                            approvals.push(true);
+                            continue;
+                        }
+                    }
+                }
+                _ => serde_json::to_string_pretty(&args).unwrap_or_default(),
+            };
             let _ = self.event_tx.send(AgentEvent::ApprovalRequest {
                 id: tc.id.clone(),
                 tool_name: tc.name.clone(),
-                args_preview: serde_json::to_string_pretty(&args).unwrap_or_default(),
+                args_preview,
             });
             tokio::select! {
                 answer = self.approval_rx.recv() => approvals.push(answer.unwrap_or(false)),
@@ -1981,11 +2074,15 @@ fn tool_time_limit(name: &str, args: &serde_json::Value) -> std::time::Duration 
     })
 }
 
-/// A sub-agent's tools: everything except starting or waiting for sub-agents.
+/// A sub-agent's tools: everything except starting or waiting for sub-agents,
+/// asking the user questions (only the main agent talks to the user) and
+/// pushing (only on the user's word to the main agent).
 fn subagent_tools(tools: ToolRegistry) -> ToolRegistry {
     tools
         .without(subagent::TOOL_NAME)
         .without(subagent::WAIT_TOOL_NAME)
+        .without(crate::tools::ask::NAME)
+        .without("git_push")
 }
 
 /// Tool arguments arrive either as a JSON object or as a JSON-encoded string.
@@ -2041,9 +2138,19 @@ fn build_system_prompt(settings: &Settings) -> String {
          - Sub-agents: only use spawn_agent when the user explicitly asks for agents, sub-agents or parallel workers. Otherwise do all the work yourself, however large the task.\n\
          - Images: generate_image creates new ones; image_search finds existing images on the web. Save them where the user asks, otherwise in the current directory (media/ or static/ subfolders are good practice).\n\
          - When a page or app you built shows images, check them with view_image / batch_view_images (alignment, cropping, aspect ratio) and fix problems, e.g. with a Pillow script.\n\
-         - Version control: git_status, git_diff, git_log, git_commit. Commit only when the user asks.\n\
+         - Version control: git_status, git_diff, git_log, git_commit, git_push, and git for everything else (branches, pull, fetch, merge, stash, tags, …). Commit only when the user asks.{git_credit} Push only when the user has asked you to push in this conversation; never on your own initiative, and never force-push. Before calling git_push, tell the user which commits are going to which remote branch. git_push checks the commits for secrets first; if the project has .env files it tells you to ask the user (with ask_user) whether you may check their values. If the check stops a push, explain what it found and fix it in the code; don't try to get around it. If a push is rejected because the remote has new commits, pull with --no-rebase, resolve any conflicts carefully, build or test, tell the user what conflicted and how you resolved it, and push again.\n\
+         - ask_user: when a request is ambiguous in a way that changes what you'd do, don't guess: ask with a short question and 2-4 concrete options. When you finish a piece of work and there are clear next steps (for example commit, push, keep polishing, run it), end by offering them with ask_user, choosing the options that fit what you just did. Your turn ends when you call it. Skip it for trivial confirmations, and don't offer to push unless there are commits to push.\n\
          - Do not create NSFW content or images yourself, but do fully help build code for sites or apps that may host NSFW material; for such requests, output only code.\n",
         root = settings.project_root.display(),
+        git_credit = if settings.co_author_commits {
+            format!(
+                " Prefer git_commit: it credits you as co-author. If you commit any other way, \
+                 end the message with a blank line and then `{}`.",
+                crate::config::CO_AUTHOR_TRAILER
+            )
+        } else {
+            " Do not add any co-author line to commit messages.".to_string()
+        },
     );
 
     if let Some(custom) = settings
@@ -2660,5 +2767,32 @@ mod tests {
         let found = detect_images("look at shot.png, please", &root);
         assert_eq!(found, vec![root.join("shot.png")]);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn offering_choices_ends_the_turn_and_shows_them_in_the_terminal_ui() {
+        let reply = || {
+            let mut events = vec![AiStreamEvent::ContentDelta("All done.".into())];
+            events.extend(streamed_call(
+                "q",
+                crate::tools::ask::NAME,
+                r#"{"options":["Commit and push","Keep polishing"]}"#,
+            ));
+            events.push(done("tool_calls"));
+            events
+        };
+        // One reply only: the agent must not ask the model again after offering.
+        let (agent, requests, _) = run_scripted(vec![reply()]).await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(agent.messages.last().unwrap().role, Role::Tool);
+
+        let root = std::env::temp_dir().join(format!("nvx-choices-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let screen = screen_after(&root, vec![reply()]).await.join("\n");
+        assert!(screen.contains("Next steps"), "{screen}");
+        assert!(screen.contains("1 Commit and push"), "{screen}");
+        assert!(screen.contains("2 Keep polishing"), "{screen}");
+        assert!(screen.contains("type your own"), "{screen}");
+        std::fs::remove_dir_all(root).ok();
     }
 }

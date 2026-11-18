@@ -15,6 +15,7 @@ const KEYS: &[&str] = &[
     "max_content_chars",
     "browser_timeout_secs",
     "ask_perms",
+    "co_author_commits",
     "require_approval",
     "ollama_base_url",
     "project_root",
@@ -83,6 +84,7 @@ fn get_value(s: &Settings, key: &str) -> Option<String> {
         "max_content_chars" => s.max_content_chars.to_string(),
         "browser_timeout_secs" => s.browser_timeout_secs.to_string(),
         "ask_perms" => s.ask_perms.to_string(),
+        "co_author_commits" => s.co_author_commits.to_string(),
         "require_approval" => s.require_approval.join(","),
         "ollama_base_url" => s
             .ollama_base_url
@@ -135,6 +137,13 @@ fn set_value(s: &mut Settings, key: &str, value: &str) -> Result<()> {
                 "true" | "on" | "yes" | "1" => true,
                 "false" | "off" | "no" | "0" => false,
                 _ => return Err(eyre::eyre!("ask_perms must be true or false")),
+            }
+        }
+        "co_author_commits" => {
+            s.co_author_commits = match value {
+                "true" | "on" | "yes" | "1" => true,
+                "false" | "off" | "no" | "0" => false,
+                _ => return Err(eyre::eyre!("co_author_commits must be true or false")),
             }
         }
         "require_approval" => {

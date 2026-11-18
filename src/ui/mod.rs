@@ -94,6 +94,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "MCP servers: manage, or add <name> <command|url>, remove",
     ),
     ("/ask_perms", "toggle tool approval prompts"),
+    ("/co_author", "credit Norvexum as co-author on its commits"),
     ("/msg", "note to a sub-agent: /msg tests use nextest"),
     ("/keys", "show key bindings"),
     ("/exit", "quit"),
@@ -189,6 +190,8 @@ pub struct App {
     pub is_selecting: bool,
     /// Tool approvals waiting for an answer, oldest first.
     pub approvals: VecDeque<PendingApproval>,
+    /// Answers the agent offered (ask_user), waiting for a pick.
+    pub choices: Option<Choices>,
     /// What is open over the timeline: model search, palette, help, …
     overlay: Option<Overlay>,
     pub active_skill: Option<String>,
@@ -372,6 +375,16 @@ pub struct PendingApproval {
     pub info: ApprovalInfo,
     /// (id, name) of the sub-agent asking, or None for the main agent.
     pub agent: Option<(String, String)>,
+}
+
+/// Answers the agent offered with ask_user: a question, or next steps when
+/// `question` is None. Picking one sends it as the next message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choices {
+    pub question: Option<String>,
+    pub options: Vec<String>,
+    /// The highlighted option (↑↓ move it, Enter picks it).
+    pub selected: usize,
 }
 
 /// Where the answer to an approval must go.
@@ -1080,6 +1093,7 @@ impl App {
             selection_end: None,
             is_selecting: false,
             approvals: VecDeque::new(),
+            choices: None,
             overlay: None,
             active_skill: None,
             project_root,
@@ -1305,6 +1319,7 @@ impl App {
                 self.refresh_model_cost();
             }
             AgentEvent::ClearChat => {
+                self.choices = None;
                 self.main.clear();
                 self.subagents.retain(SubAgentView::is_running);
                 self.focus = None;
@@ -1326,6 +1341,13 @@ impl App {
                 },
                 agent: None,
             }),
+            AgentEvent::Choices { question, options } => {
+                self.choices = Some(Choices {
+                    question,
+                    options,
+                    selected: 0,
+                })
+            }
             AgentEvent::TriggeredSkill(name) => self.active_skill = Some(name),
             AgentEvent::AgentMessage { from, to, text } => {
                 self.agent_message(None, &from, &to, &text)
@@ -2234,6 +2256,9 @@ impl App {
             return None;
         }
 
+        if let Some(out) = self.choice_key(key, modifiers) {
+            return out;
+        }
         if self.history_search.is_some() {
             return self.history_search_key(key, modifiers);
         }
@@ -2406,6 +2431,51 @@ impl App {
         true
     }
 
+    /// The offered choices, while they can be picked: the agent is idle,
+    /// nothing waits for approval and nothing is open on top.
+    pub fn choices_shown(&self) -> Option<&Choices> {
+        self.choices
+            .as_ref()
+            .filter(|_| !self.is_processing && self.approvals.is_empty() && self.overlay.is_none())
+    }
+
+    /// Keys for the offered choices, while the composer is empty: a digit
+    /// picks that option, ↑↓ move the highlight, Enter picks it, Esc hides the
+    /// list. Typing anything else writes your own answer instead.
+    /// `Some(out)` when the key was used (`out` as from `handle_key`).
+    fn choice_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Option<Option<String>> {
+        if !self.input.is_empty()
+            || self.history_search.is_some()
+            || modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        let count = self.choices_shown()?.options.len();
+        let choices = self.choices.as_mut()?;
+        let pick = match key {
+            KeyCode::Char(c) => match c.to_digit(10) {
+                Some(n) if (1..=count as u32).contains(&n) => n as usize - 1,
+                _ => return None,
+            },
+            KeyCode::Up => {
+                choices.selected = choices.selected.checked_sub(1).unwrap_or(count - 1);
+                return Some(None);
+            }
+            KeyCode::Down => {
+                choices.selected = (choices.selected + 1) % count;
+                return Some(None);
+            }
+            KeyCode::Enter => choices.selected.min(count - 1),
+            KeyCode::Esc => {
+                self.choices = None;
+                return Some(None);
+            }
+            _ => return None,
+        };
+        let answer = choices.options[pick].clone();
+        Some(self.submit(answer))
+    }
+
     /// Send what's in the composer: a local command, a note to an agent, or a
     /// message to the main agent (returned for the event loop to deliver).
     fn submit(&mut self, message: String) -> Option<String> {
@@ -2443,6 +2513,8 @@ impl App {
         if self.effective_layout() == AgentLayout::Focus {
             self.set_focus(None);
         }
+        // A message to the agent answers (or passes over) any offered choices.
+        self.choices = None;
         if self.is_processing {
             self.main.push_line(message.clone(), LineStyle::User, None);
             self.user_backlog.push_back(message);
@@ -5032,5 +5104,50 @@ mod tests {
         let rule = &rows[27];
         assert!(rule.contains("read_file"), "{rule}");
         assert!(rule.contains("1 queued"), "{rule}");
+    }
+
+    #[test]
+    fn offered_choices_are_picked_by_number_or_arrows_and_typing_wins() {
+        let offer = |app: &mut App| {
+            app.handle_agent_event(AgentEvent::Choices {
+                question: Some("Which database?".into()),
+                options: vec!["SQLite".into(), "Postgres".into()],
+            })
+        };
+        let mut app = App::new("m", std::path::PathBuf::new());
+        offer(&mut app);
+        assert!(app.choices_shown().is_some());
+        assert_eq!(
+            app.handle_key(KeyCode::Char('2'), KeyModifiers::NONE),
+            Some("Postgres".to_string())
+        );
+        assert!(app.choices.is_none());
+
+        let mut app = App::new("m", std::path::PathBuf::new());
+        offer(&mut app);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            app.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some("SQLite".to_string())
+        );
+
+        // Typed text is an answer of its own; digits go into it.
+        let mut app = App::new("m", std::path::PathBuf::new());
+        offer(&mut app);
+        for c in "MySQL 8".chars() {
+            app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            app.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some("MySQL 8".to_string())
+        );
+        assert!(app.choices.is_none());
+
+        // Esc hides them without sending anything.
+        let mut app = App::new("m", std::path::PathBuf::new());
+        offer(&mut app);
+        assert_eq!(app.handle_key(KeyCode::Esc, KeyModifiers::NONE), None);
+        assert!(app.choices.is_none());
     }
 }

@@ -383,35 +383,45 @@ pub fn secondary_button(ui: &mut Ui, label: &str, p: &Palette) -> Response {
     )
 }
 
-/// A row of equal-width segments, one selected; `badge` is a small count or
-/// marker drawn after the label. Returns the segment clicked this frame.
+/// A row of equal-width segments, one selected: an icon (shown when there is
+/// room), a label, and a `badge` — a small count or marker after the label.
+/// Returns the segment clicked this frame.
 pub fn segmented(
     ui: &mut Ui,
-    items: &[(&str, Option<String>)],
+    items: &[(Icon, &str, Option<String>)],
     selected: usize,
     p: &Palette,
 ) -> Option<usize> {
-    const HEIGHT: f32 = 30.0;
+    const HEIGHT: f32 = 32.0;
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), HEIGHT),
         egui::Sense::hover(),
     );
     let painter = ui.painter().clone();
-    painter.rect(rect, 8.0, p.surface, Stroke::new(1.0_f32, p.border));
+    painter.rect(rect, 9.0, p.surface, Stroke::new(1.0_f32, p.border));
     let width = (rect.width() - 4.0) / items.len().max(1) as f32;
     let mut clicked = None;
-    for (i, (label, badge)) in items.iter().enumerate() {
+    for (i, (icon, label, badge)) in items.iter().enumerate() {
         let seg = egui::Rect::from_min_size(
             rect.min + egui::vec2(2.0 + i as f32 * width, 2.0),
             egui::vec2(width, HEIGHT - 4.0),
         );
-        let resp = ui.interact(seg, ui.id().with(("segment", i)), egui::Sense::click());
+        let resp = ui
+            .interact(seg, ui.id().with(("segment", i)), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         let active = i == selected;
         if active {
-            painter.rect_filled(seg, 6.0, p.hover);
+            painter.rect_filled(seg, 7.0, p.accent_soft);
         } else if resp.hovered() {
-            painter.rect_filled(seg, 6.0, p.panel);
+            painter.rect_filled(seg, 7.0, p.hover);
         }
+        let color = if active {
+            p.accent
+        } else if resp.hovered() {
+            p.text
+        } else {
+            p.dim
+        };
         let label_g = painter.layout_no_wrap(
             label.to_string(),
             if active {
@@ -419,22 +429,32 @@ pub fn segmented(
             } else {
                 FontId::proportional(12.5)
             },
-            if active || resp.hovered() {
-                p.text
-            } else {
-                p.dim
-            },
+            color,
         );
         let badge_g = badge
             .as_ref()
             .map(|b| painter.layout_no_wrap(b.clone(), FontId::proportional(11.0), p.faint));
-        let total = label_g.size().x + badge_g.as_ref().map_or(0.0, |g| g.size().x + 5.0);
-        let mut x = seg.center().x - total / 2.0;
+        let text_w = label_g.size().x + badge_g.as_ref().map_or(0.0, |g| g.size().x + 5.0);
+        // The icon is the first thing to go in a narrow panel.
+        let icon_w = if text_w + 19.0 + 12.0 <= width {
+            19.0
+        } else {
+            0.0
+        };
+        let mut x = seg.center().x - (text_w + icon_w) / 2.0;
+        if icon_w > 0.0 {
+            let glyph = egui::Rect::from_center_size(
+                egui::pos2(x + 6.5, seg.center().y),
+                egui::vec2(13.0, 13.0),
+            );
+            paint_icon(&painter, glyph, *icon, color);
+            x += icon_w;
+        }
         let label_w = label_g.size().x;
         painter.galley(
             egui::pos2(x, seg.center().y - label_g.size().y / 2.0),
             label_g,
-            p.text,
+            color,
         );
         x += label_w + 5.0;
         if let Some(g) = badge_g {
@@ -448,6 +468,48 @@ pub fn segmented(
             clicked = Some(i);
         }
     }
+    clicked
+}
+
+/// The middle of an empty panel: an icon in a soft disc, what is missing and
+/// why, and optionally a button for the obvious next step. Returns whether
+/// that button was clicked.
+pub fn empty_state(
+    ui: &mut Ui,
+    icon: Icon,
+    title: &str,
+    body: &str,
+    action: Option<&str>,
+    p: &Palette,
+) -> bool {
+    let mut clicked = false;
+    ui.add_space((ui.available_height() * 0.16).clamp(16.0, 110.0));
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 26.0, p.surface);
+        ui.painter()
+            .circle_stroke(rect.center(), 26.0, Stroke::new(1.0_f32, p.border));
+        let glyph = egui::Rect::from_center_size(rect.center(), egui::vec2(22.0, 22.0));
+        paint_icon(ui.painter(), glyph, icon, p.dim);
+        ui.add_space(10.0);
+        ui.label(RichText::new(title).font(strong(14.0)).color(p.text));
+        if !body.is_empty() {
+            ui.add_space(2.0);
+            // A readable measure, however wide the panel is.
+            let width = ui.available_width().min(340.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 0.0),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.label(RichText::new(body).size(12.5).color(p.dim));
+                },
+            );
+        }
+        if let Some(label) = action {
+            ui.add_space(10.0);
+            clicked = secondary_button(ui, label, p).clicked();
+        }
+    });
     clicked
 }
 
@@ -581,6 +643,10 @@ pub enum Icon {
     Undo,
     Edit,
     Clip,
+    File,
+    Image,
+    Code,
+    Back,
 }
 
 /// Draw `icon` centred in `rect` (designed on a 16×16 grid).
@@ -754,6 +820,40 @@ pub fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: 
                 p(3.0, 13.0),
             ]);
         }
+        Icon::File => {
+            poly(vec![
+                p(9.5, 2.0),
+                p(4.0, 2.0),
+                p(4.0, 14.0),
+                p(12.5, 14.0),
+                p(12.5, 5.0),
+                p(9.5, 2.0),
+                p(9.5, 5.0),
+                p(12.5, 5.0),
+            ]);
+        }
+        Icon::Image => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(2.0, 3.0), p(14.0, 13.0)),
+                1.8 * s,
+                stroke,
+            );
+            painter.circle_filled(p(5.6, 6.6), 1.3 * s, color);
+            poly(vec![
+                p(2.5, 12.0),
+                p(6.5, 8.6),
+                p(9.0, 10.6),
+                p(11.0, 8.8),
+                p(13.5, 11.4),
+            ]);
+        }
+        Icon::Code => {
+            poly(vec![p(6.0, 4.5), p(2.5, 8.0), p(6.0, 11.5)]);
+            poly(vec![p(10.0, 4.5), p(13.5, 8.0), p(10.0, 11.5)]);
+        }
+        Icon::Back => {
+            poly(vec![p(10.0, 4.0), p(6.0, 8.0), p(10.0, 12.0)]);
+        }
         Icon::Clip => {
             let pts: Vec<Pos2> = [
                 (10.5, 6.0),
@@ -797,6 +897,50 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, active: bool, p: &Palette
     let glyph = egui::Rect::from_center_size(rect.center(), egui::vec2(size * 0.5, size * 0.5));
     paint_icon(ui.painter(), glyph, icon, color);
     click_flash(ui, &resp, 8.0, p);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A navigation item for the rail: an icon above a short label, so every
+/// destination is named. `active` marks the view that is open.
+pub fn rail_button(ui: &mut Ui, icon: Icon, label: &str, active: bool, p: &Palette) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(56.0, 46.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, 9.0, p.accent_soft);
+        // A bar on the window edge marks the open view.
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left() - 6.0, rect.top() + 11.0),
+            egui::pos2(rect.left() - 3.0, rect.bottom() - 11.0),
+        );
+        painter.rect_filled(bar, 1.5, p.accent);
+    } else if hovered {
+        painter.rect_filled(rect, 9.0, p.hover);
+    }
+    let color = if active {
+        p.accent
+    } else if hovered {
+        p.text
+    } else {
+        p.dim
+    };
+    let glyph = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + 16.0),
+        egui::vec2(17.0, 17.0),
+    );
+    paint_icon(painter, glyph, icon, color);
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 10.5),
+        egui::Align2::CENTER_CENTER,
+        label,
+        if active {
+            strong(10.0)
+        } else {
+            FontId::proportional(10.0)
+        },
+        color,
+    );
+    click_flash(ui, &resp, 9.0, p);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

@@ -39,15 +39,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let input_width = area.width.saturating_sub(4).max(1) as usize;
     let input_rows = (input_line_count(&app.input, input_width) as u16).clamp(1, MAX_INPUT_ROWS);
+    // Offered choices sit between the chat and the composer, so they never
+    // cover the answer they follow.
+    let choice_rows = app
+        .choices_shown()
+        .map_or(0, |c| choices_height(c, area.width).min(area.height / 3));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(choice_rows),
             Constraint::Length(input_rows + 1),
             Constraint::Length(1),
         ])
         .split(area);
+    let rows = [rows[0], rows[1], rows[3], rows[4], rows[2]];
 
     for pane in &app.panes {
         pane.outer.set(Rect::default());
@@ -64,6 +71,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     draw_composer(frame, rows[2], app);
     draw_status(frame, rows[3], app);
+    if let Some(choices) = app.choices_shown() {
+        draw_choices(frame, rows[4], app, choices);
+    }
 
     if app.approvals.is_empty() && app.overlay.is_none() {
         draw_suggestions(frame, rows[2], app);
@@ -1138,6 +1148,97 @@ fn status_hints(app: &App) -> Vec<&'static [(&'static str, &'static str)]> {
 // ── Approval ──────────────────────────────────────────────────────────────
 
 /// A sheet rising from the composer, so the conversation above stays readable.
+/// Rows the choices box needs at `width`: borders, the question (wrapped),
+/// one row per option, and the hint row.
+fn choices_height(choices: &Choices, width: u16) -> u16 {
+    let inner = width.saturating_sub(4).max(1) as usize;
+    let question = choices
+        .question
+        .as_deref()
+        .map_or(0, |q| q.width().div_ceil(inner).max(1) + 1);
+    (2 + question + choices.options.len() + 1) as u16
+}
+
+/// The agent's offered answers: numbered, the highlighted one marked, and a
+/// last row saying you can type your own. Dimmed while you do.
+fn draw_choices(frame: &mut Frame, area: Rect, app: &App, choices: &Choices) {
+    if area.height < 3 || area.width < 10 {
+        return;
+    }
+    let theme = &app.theme;
+    let typing = !app.input.is_empty();
+    let dim = Style::default().fg(theme.dim_color);
+    let mut lines = Vec::new();
+    if let Some(question) = &choices.question {
+        lines.push(Line::from(Span::styled(
+            question.clone(),
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+    }
+    let inner = area.width.saturating_sub(10) as usize;
+    for (i, option) in choices.options.iter().enumerate() {
+        let current = i == choices.selected && !typing;
+        let marker = if current { "› " } else { "  " };
+        let number = Style::default()
+            .fg(if typing {
+                theme.dim_color
+            } else {
+                theme.accent_color
+            })
+            .add_modifier(Modifier::BOLD);
+        let text = if typing {
+            dim
+        } else if current {
+            Style::default().fg(theme.fg).bg(theme.selection)
+        } else {
+            Style::default().fg(theme.fg)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.accent_color)),
+            Span::styled(format!("{} ", i + 1), number),
+            Span::styled(fit(option, inner), text),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        if typing {
+            "  Enter sends your own answer instead".to_string()
+        } else {
+            format!(
+                "  or type your own answer · 1-{} or ↑↓ Enter to pick · Esc hide",
+                choices.options.len()
+            )
+        },
+        dim,
+    )));
+    let title = if choices.question.is_some() {
+        " Norvexum asks "
+    } else {
+        " Next steps "
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent_color)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if typing {
+            theme.border_color
+        } else {
+            theme.accent_color
+        }))
+        .padding(Padding::horizontal(1));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
 fn draw_approval(frame: &mut Frame, body: Rect, app: &App, pending: &PendingApproval) {
     let theme = &app.theme;
     let info = &pending.info;

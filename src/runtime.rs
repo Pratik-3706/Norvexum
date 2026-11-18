@@ -292,6 +292,17 @@ pub async fn run_headless(mut handle: AgentHandle, opts: HeadlessOptions) -> Res
                         }
                     }
                     AgentEvent::AgentMessage { from, to, text } => print_agent_message(&from, &to, &text),
+                    AgentEvent::Choices { question, options } => {
+                        if !at_line_start {
+                            println!();
+                            at_line_start = true;
+                        }
+                        println!("\n{}", question.as_deref().unwrap_or("Next steps:"));
+                        for (i, option) in options.iter().enumerate() {
+                            println!("  {}. {option}", i + 1);
+                        }
+                        println!("  (or reply in your own words)");
+                    }
                     AgentEvent::Quit => break,
                     _ => {}
                 }

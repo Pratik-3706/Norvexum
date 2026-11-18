@@ -79,7 +79,7 @@ enum Command {
 }
 
 /// Width of the icon rail.
-const RAIL_WIDTH: f32 = 52.0;
+const RAIL_WIDTH: f32 = 68.0;
 /// Height of the chat header (the right panel's tabs line up with it).
 pub(super) const HEADER_HEIGHT: f32 = 46.0;
 
@@ -112,6 +112,146 @@ impl GuiApp {
             })
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| "New chat".to_string())
+    }
+
+    /// The agent's offered answers (ask_user) as a card above the message
+    /// box: the question, numbered options to click (or press 1-4 while the
+    /// box is empty), and a note that typing your own works too. Returns the
+    /// option picked this frame.
+    pub(super) fn draw_choices(&mut self, ui: &mut egui::Ui, p: &Palette) -> Option<String> {
+        let (question, options) = self.choices.clone()?;
+        let typing = !self.input_text.trim().is_empty();
+        let mut picked = None;
+        let mut dismiss = false;
+        if !typing {
+            const KEYS: [egui::Key; 4] = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+            ];
+            ui.input_mut(|i| {
+                for (n, key) in KEYS.iter().enumerate().take(options.len()) {
+                    if i.consume_key(egui::Modifiers::NONE, *key) {
+                        picked = Some(n);
+                        // The digit must not also land in the message box.
+                        let digit = (n + 1).to_string();
+                        i.events
+                            .retain(|e| !matches!(e, egui::Event::Text(t) if *t == digit));
+                    }
+                }
+            });
+        }
+
+        egui::Frame::none()
+            .fill(p.surface)
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                p.accent.gamma_multiply(if typing { 0.25 } else { 0.6 }),
+            ))
+            .rounding(10.0)
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    style::dot(ui, p.accent);
+                    let width = (ui.available_width() - 30.0).max(60.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 0.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        question.as_deref().unwrap_or("What next?"),
+                                    )
+                                    .font(style::strong(13.0))
+                                    .color(p.text),
+                                )
+                                .wrap(),
+                            );
+                        },
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if style::close_button(ui, p)
+                            .on_hover_text("Hide these suggestions")
+                            .clicked()
+                        {
+                            dismiss = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for (i, option) in options.iter().enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 32.0),
+                        egui::Sense::click(),
+                    );
+                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let hovered = resp.hovered();
+                    let painter = ui.painter();
+                    painter.rect(
+                        rect,
+                        8.0,
+                        if hovered { p.accent_soft } else { p.panel },
+                        egui::Stroke::new(
+                            1.0_f32,
+                            if hovered {
+                                p.accent.gamma_multiply(0.6)
+                            } else {
+                                p.border
+                            },
+                        ),
+                    );
+                    let badge = egui::pos2(rect.left() + 18.0, rect.center().y);
+                    painter.circle_filled(
+                        badge,
+                        10.0,
+                        if typing { p.hover } else { p.accent_soft },
+                    );
+                    painter.text(
+                        badge,
+                        egui::Align2::CENTER_CENTER,
+                        (i + 1).to_string(),
+                        style::strong(11.5),
+                        if typing { p.faint } else { p.accent },
+                    );
+                    let text = style::one_line(
+                        ui,
+                        option,
+                        egui::FontId::proportional(13.0),
+                        if typing { p.dim } else { p.text },
+                        rect.width() - 46.0,
+                    );
+                    painter.galley(
+                        egui::pos2(rect.left() + 36.0, rect.center().y - text.size().y / 2.0),
+                        text,
+                        p.text,
+                    );
+                    if resp.on_hover_text(option.as_str()).clicked() {
+                        picked = Some(i);
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(if typing {
+                        "Send to answer in your own words instead".to_string()
+                    } else {
+                        format!(
+                            "Or type your own answer below · press 1-{} to pick",
+                            options.len()
+                        )
+                    })
+                    .size(11.5)
+                    .color(p.faint),
+                );
+            });
+        ui.add_space(8.0);
+        if dismiss {
+            self.choices = None;
+        }
+        picked.and_then(|i| options.get(i).cloned())
     }
 
     fn right_panel_shows(&self, tabs: &[RightTab]) -> bool {
@@ -168,12 +308,12 @@ impl GuiApp {
             .frame(
                 egui::Frame::none()
                     .fill(p.panel)
-                    .inner_margin(egui::Margin::symmetric(8.0, 10.0)),
+                    .inner_margin(egui::Margin::symmetric(6.0, 10.0)),
             )
             .show(ctx, |ui| {
                 let rail = ui.max_rect();
                 ui.painter().vline(
-                    rail.right() + 8.0,
+                    rail.right() + 6.0,
                     ui.clip_rect().y_range(),
                     egui::Stroke::new(1.0_f32, p.border),
                 );
@@ -199,24 +339,34 @@ impl GuiApp {
                         .iter()
                         .filter(|r| r.ended.is_none())
                         .count();
-                    let items: [(Icon, &str, bool, usize, Command); 7] = [
+                    let items: [(Icon, &str, &str, bool, usize, Command); 7] = [
                         (
                             Icon::Chats,
-                            "Chats  (Ctrl+B)",
+                            "Chats",
+                            "Show or hide your chats  (Ctrl+B)",
                             self.left_sidebar_open,
                             0,
                             Command::ToggleChats,
                         ),
-                        (Icon::Plus, "New chat  (Ctrl+N)", false, 0, Command::NewChat),
+                        (
+                            Icon::Plus,
+                            "New",
+                            "New chat  (Ctrl+N)",
+                            false,
+                            0,
+                            Command::NewChat,
+                        ),
                         (
                             Icon::Search,
-                            "Search everything  (Ctrl+K)",
+                            "Search",
+                            "Search chats and actions  (Ctrl+K)",
                             self.shell.palette_open,
                             0,
                             Command::Focus,
                         ),
                         (
                             Icon::Files,
+                            "Files",
                             "Changes and files  (Ctrl+E)",
                             self.right_panel_shows(&[RightTab::Changed, RightTab::All]),
                             0,
@@ -225,6 +375,7 @@ impl GuiApp {
                         (
                             Icon::Agents,
                             "Agents",
+                            "Sub-agents and what they are doing",
                             self.right_panel_shows(&[RightTab::Agents]),
                             running_agents,
                             Command::Agents,
@@ -232,19 +383,23 @@ impl GuiApp {
                         (
                             Icon::Globe,
                             "Browser",
+                            "The page the agent has open",
                             self.right_panel_shows(&[RightTab::Browser]),
                             0,
                             Command::Browser,
                         ),
                         (
                             Icon::Terminal,
-                            "Terminal  (Ctrl+J)",
+                            "Terminal",
+                            "Commands the agents run  (Ctrl+J)",
                             self.show_terminal_panel,
                             running_commands,
                             Command::Terminal,
                         ),
                     ];
-                    for (i, (icon, tip, active, badge, command)) in items.into_iter().enumerate() {
+                    for (i, (icon, label, tip, active, badge, command)) in
+                        items.into_iter().enumerate()
+                    {
                         if i == 3 {
                             ui.add_space(4.0);
                             let r = ui.available_rect_before_wrap();
@@ -255,7 +410,7 @@ impl GuiApp {
                             );
                             ui.add_space(8.0);
                         }
-                        let resp = style::icon_button(ui, icon, 36.0, active, p);
+                        let resp = style::rail_button(ui, icon, label, active, p);
                         if badge > 0 {
                             paint_badge(ui, resp.rect, badge, p);
                         }
@@ -275,18 +430,18 @@ impl GuiApp {
                 // Settings at the bottom.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.y = 6.0;
-                    if style::icon_button(ui, Icon::Gear, 36.0, self.show_settings_modal, p)
+                    if style::rail_button(ui, Icon::Gear, "Settings", self.show_settings_modal, p)
                         .on_hover_text("Settings  (Ctrl+,)")
                         .clicked()
                     {
                         chosen = Some(Command::Settings(SettingsSection::General));
                     }
-                    let theme = if self.dark_mode {
-                        Icon::Sun
+                    let (theme, theme_label) = if self.dark_mode {
+                        (Icon::Sun, "Light")
                     } else {
-                        Icon::Moon
+                        (Icon::Moon, "Dark")
                     };
-                    if style::icon_button(ui, theme, 36.0, false, p)
+                    if style::rail_button(ui, theme, theme_label, false, p)
                         .on_hover_text("Switch theme")
                         .clicked()
                     {
@@ -296,10 +451,10 @@ impl GuiApp {
                     let failing = servers
                         .iter()
                         .any(|s| matches!(s.status, crate::tools::mcp::Status::Failed(_)));
-                    let plug = style::icon_button(ui, Icon::Plug, 36.0, false, p);
+                    let plug = style::rail_button(ui, Icon::Plug, "MCP", false, p);
                     if failing {
                         ui.painter().circle_filled(
-                            plug.rect.right_top() + egui::vec2(-8.0, 8.0),
+                            plug.rect.right_top() + egui::vec2(-14.0, 8.0),
                             3.5,
                             p.danger,
                         );
@@ -771,7 +926,7 @@ fn paint_badge(ui: &egui::Ui, rect: egui::Rect, count: usize, p: &Palette) {
     } else {
         count.to_string()
     };
-    let center = rect.right_top() + egui::vec2(-6.0, 6.0);
+    let center = rect.right_top() + egui::vec2(-12.0, 8.0);
     ui.painter().circle_filled(center, 7.5, p.accent);
     ui.painter().text(
         center,

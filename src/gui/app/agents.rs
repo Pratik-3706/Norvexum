@@ -518,7 +518,16 @@ impl GuiApp {
                     } else {
                         p.faint
                     },
-                    &style::clean_label(&self.status_text),
+                    // While idle the last status line is stale; say which model
+                    // is ready instead.
+                    &if self.is_processing {
+                        style::clean_label(&self.status_text)
+                    } else {
+                        format!(
+                            "{} · {}",
+                            self.settings.active_model, self.settings.active_provider
+                        )
+                    },
                     None,
                     self.chat_view == ChatView::Main && !self.split_view,
                     p,
@@ -530,13 +539,21 @@ impl GuiApp {
                 ui.add_space(10.0);
 
                 if self.subagents.is_empty() {
-                    empty_hint(
+                    if style::empty_state(
                         ui,
+                        style::Icon::Agents,
                         "No sub-agents yet",
-                        "Ask for agents (\"use sub-agents to …\") and the main agent can hand \
-                         parts of the job to helpers that work at the same time.",
+                        "Ask for agents and the main agent can hand parts of the job to \
+                         helpers that work at the same time.",
+                        Some("Ask for sub-agents"),
                         p,
-                    );
+                    ) {
+                        // Start the request for them; they finish the sentence.
+                        if self.input_text.trim().is_empty() {
+                            self.input_text = "Use sub-agents to ".to_string();
+                        }
+                        self.focus_composer = true;
+                    }
                     return;
                 }
                 style::section_label(ui, &format!("Sub-agents · {}", self.subagents.len()), p);
