@@ -239,7 +239,7 @@ impl Tool for GitPushTool {
                  variable instead), and add secret files to .gitignore. Rewriting commits that \
                  hold them is for the user to decide. If they say it's a false alarm, they can push \
                  it themselves.",
-                plan.describe()
+                plan.describe_for_agent()
             ));
         }
         let mut push = vec!["push"];
@@ -251,7 +251,7 @@ impl Tool for GitPushTool {
         match git_output(&push, &ctx.cwd).await {
             Ok(out) => ToolResult::ok(format!(
                 "{}\n\n{}",
-                plan.describe().replacen("Will push", "Pushed", 1),
+                plan.describe_for_agent().replacen("Will push", "Pushed", 1),
                 out.trim()
             )),
             Err(e) if is_behind_remote(&e) => ToolResult::err(format!(
@@ -316,6 +316,16 @@ impl PushPlan {
 
     /// The plan in words, for the approval prompt and the tool result.
     pub fn describe(&self) -> String {
+        self.describe_for(true)
+    }
+
+    /// The plan as reported back to the agent: without the user-only notes,
+    /// which aren't something for it to act on.
+    pub fn describe_for_agent(&self) -> String {
+        self.describe_for(false)
+    }
+
+    fn describe_for(&self, with_notes: bool) -> String {
         let target = format!("{}/{}", self.remote, self.branch);
         if self.nothing_to_push() {
             return format!(
@@ -352,10 +362,17 @@ impl PushPlan {
         if self.needs_env_answer() {
             return text;
         }
-        let (blocks, warns): (Vec<_>, Vec<_>) = self
+        use push_check::Level;
+        let blocks: Vec<_> = self
             .findings
             .iter()
-            .partition(|f| f.level == push_check::Level::Block);
+            .filter(|f| f.level == Level::Block)
+            .collect();
+        let warns: Vec<_> = self
+            .findings
+            .iter()
+            .filter(|f| f.level == Level::Warn || (with_notes && f.level == Level::Note))
+            .collect();
         if !blocks.is_empty() {
             text.push_str("\n\nStopped by the safety check:");
             for f in &blocks {
@@ -368,7 +385,7 @@ impl PushPlan {
                 text.push_str(&format!("\n  ! {}", f.text));
             }
         }
-        if self.findings.is_empty() {
+        if blocks.is_empty() && !self.findings.iter().any(|f| f.level == Level::Warn) {
             text.push_str("\n\nSafety check: no secrets, keys or oversized files found.");
         }
         match (self.env_files.is_empty(), self.read_env) {
@@ -925,6 +942,17 @@ mod push_tests {
             pushed.output
         );
         assert!(pushed.output.contains("Add a"), "{}", pushed.output);
+        // The email note is for the user (shown before the push), not the agent.
+        assert!(
+            plan.describe().contains("personal email"),
+            "{}",
+            plan.describe()
+        );
+        assert!(
+            !pushed.output.contains("personal email"),
+            "{}",
+            pushed.output
+        );
 
         // Pushed and tracked: nothing left to send.
         let again = GitPushTool.execute(json!({}), &ctx).await;

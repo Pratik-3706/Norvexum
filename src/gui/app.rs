@@ -3961,14 +3961,6 @@ impl GuiApp {
             self.answer_approval(approved);
         }
 
-        // Answers the agent offered (ask_user), while it waits for a pick.
-        if self.approval_pending.is_none() && !self.is_processing {
-            if let Some(answer) = self.draw_choices(ui, p) {
-                self.input_text = answer;
-                self.send_message();
-            }
-        }
-
         // Attachment chips
         let mut remove_attachment = None;
         let mut clear_attachments = false;
@@ -4609,6 +4601,11 @@ impl eframe::App for GuiApp {
         let p = self.pal();
 
         self.handle_shortcuts(ctx);
+        // Before the message box sees the key, so "1" picks instead of typing.
+        if let Some(answer) = self.pick_choice_by_key(ctx) {
+            self.input_text = answer;
+            self.send_message();
+        }
 
         // Panel order matters: the rail and the side panels run the full
         // height; the header, terminal and composer sit between them.

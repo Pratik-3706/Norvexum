@@ -21,6 +21,8 @@ use std::sync::LazyLock;
 pub enum Level {
     Block,
     Warn,
+    /// For the user only (shown before the push, not reported to the agent).
+    Note,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,12 @@ impl Finding {
     fn warn(text: impl Into<String>) -> Self {
         Self {
             level: Level::Warn,
+            text: text.into(),
+        }
+    }
+    fn note(text: impl Into<String>) -> Self {
+        Self {
+            level: Level::Note,
             text: text.into(),
         }
     }
@@ -264,9 +272,16 @@ pub async fn scan(root: &Path, range: &[String], tip: &str, read_env: bool) -> V
         .filter(|e| !e.trim().is_empty() && !e.trim().ends_with("@users.noreply.github.com"))
         .count();
     if personal > 0 {
-        findings.push(Finding::warn(format!(
-            "{personal} of these commits show the author's own email address, which is public once \
-             pushed. To keep it private, set `git config user.email` to your GitHub noreply address."
+        findings.push(Finding::note(format!(
+            "{} list your personal email (your `git config user.email`) as the author, and \
+             anyone can see it on GitHub once pushed. That's normal if you're fine with it. To \
+             hide it in future commits, set user.email to your own GitHub noreply address \
+             (GitHub → Settings → Emails).",
+            if personal == 1 {
+                "This commit will".to_string()
+            } else {
+                format!("These {personal} commits will")
+            }
         )));
     }
     findings

@@ -114,67 +114,89 @@ impl GuiApp {
             .unwrap_or_else(|| "New chat".to_string())
     }
 
-    /// The agent's offered answers (ask_user) as a card above the message
-    /// box: the question, numbered options to click (or press 1-4 while the
-    /// box is empty), and a note that typing your own works too. Returns the
-    /// option picked this frame.
+    /// The answers the agent offered (ask_user), while they can be picked:
+    /// the agent is idle and nothing waits for approval.
+    fn choices_open(&self) -> Option<&(Option<String>, Vec<String>)> {
+        self.choices
+            .as_ref()
+            .filter(|_| !self.is_processing && self.approval_pending.is_none())
+    }
+
+    /// 1-4 pick an offered answer while the message box is empty. Runs before
+    /// the panels, so the digit never lands in the box.
+    pub(super) fn pick_choice_by_key(&mut self, ctx: &egui::Context) -> Option<String> {
+        if !self.input_text.trim().is_empty()
+            || self.show_settings_modal
+            || self.shell.palette_open
+            || ctx.memory(|m| {
+                m.focused()
+                    .is_some_and(|id| id != egui::Id::new("composer_input"))
+            })
+        {
+            return None;
+        }
+        let options = self.choices_open()?.1.clone();
+        const KEYS: [egui::Key; 4] = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+        ];
+        let mut picked = None;
+        ctx.input_mut(|i| {
+            for (n, key) in KEYS.iter().enumerate().take(options.len()) {
+                if i.consume_key(egui::Modifiers::NONE, *key) {
+                    picked = Some(n);
+                    let digit = (n + 1).to_string();
+                    i.events
+                        .retain(|e| !matches!(e, egui::Event::Text(t) if *t == digit));
+                }
+            }
+        });
+        picked.and_then(|n| options.get(n).cloned())
+    }
+
+    /// The offered answers, drawn under the agent's last reply: the question
+    /// (or "Suggested next steps"), numbered rows to click, and a note that
+    /// typing your own works too. Returns the option clicked this frame.
     pub(super) fn draw_choices(&mut self, ui: &mut egui::Ui, p: &Palette) -> Option<String> {
-        let (question, options) = self.choices.clone()?;
+        let (question, options) = self.choices_open()?.clone();
         let typing = !self.input_text.trim().is_empty();
         let mut picked = None;
         let mut dismiss = false;
-        if !typing {
-            const KEYS: [egui::Key; 4] = [
-                egui::Key::Num1,
-                egui::Key::Num2,
-                egui::Key::Num3,
-                egui::Key::Num4,
-            ];
-            ui.input_mut(|i| {
-                for (n, key) in KEYS.iter().enumerate().take(options.len()) {
-                    if i.consume_key(egui::Modifiers::NONE, *key) {
-                        picked = Some(n);
-                        // The digit must not also land in the message box.
-                        let digit = (n + 1).to_string();
-                        i.events
-                            .retain(|e| !matches!(e, egui::Event::Text(t) if *t == digit));
-                    }
-                }
-            });
-        }
 
         egui::Frame::none()
             .fill(p.surface)
             .stroke(egui::Stroke::new(
                 1.0_f32,
-                p.accent.gamma_multiply(if typing { 0.25 } else { 0.6 }),
+                p.accent.gamma_multiply(if typing { 0.25 } else { 0.55 }),
             ))
             .rounding(10.0)
             .inner_margin(egui::Margin::same(12.0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    style::dot(ui, p.accent);
-                    let width = (ui.available_width() - 30.0).max(60.0);
+                    let width = (ui.available_width() - 28.0).max(60.0);
                     ui.allocate_ui_with_layout(
-                        egui::vec2(width, 0.0),
+                        egui::vec2(width, 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(
-                                        question.as_deref().unwrap_or("What next?"),
+                        |ui| match &question {
+                            Some(q) => {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(q)
+                                            .font(style::strong(13.5))
+                                            .color(p.text),
                                     )
-                                    .font(style::strong(13.0))
-                                    .color(p.text),
-                                )
-                                .wrap(),
-                            );
+                                    .wrap(),
+                                );
+                            }
+                            None => style::section_label(ui, "Suggested next steps", p),
                         },
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if style::close_button(ui, p)
-                            .on_hover_text("Hide these suggestions")
+                            .on_hover_text("Hide these")
                             .clicked()
                         {
                             dismiss = true;
@@ -239,7 +261,7 @@ impl GuiApp {
                         "Send to answer in your own words instead".to_string()
                     } else {
                         format!(
-                            "Or type your own answer below · press 1-{} to pick",
+                            "Or type your own answer · press 1-{} to pick",
                             options.len()
                         )
                     })
@@ -247,7 +269,7 @@ impl GuiApp {
                     .color(p.faint),
                 );
             });
-        ui.add_space(8.0);
+        ui.add_space(12.0);
         if dismiss {
             self.choices = None;
         }

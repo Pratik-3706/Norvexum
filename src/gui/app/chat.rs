@@ -308,6 +308,11 @@ impl GuiApp {
             }
         }
 
+        // Answers the agent offered (ask_user), under its last reply.
+        if let Some(answer) = self.draw_choices(ui, p) {
+            pending = Some(PendingAction::Reroll(answer));
+        }
+
         // While the agent thinks between tool calls.
         if self.is_processing && self.current_tool_name.is_none() {
             let secs = self
