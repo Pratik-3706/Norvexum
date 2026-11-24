@@ -33,7 +33,7 @@ graph TD
 ## 🚀 Key Features
 
 ### ⚡ Parallel Tool Execution
-Norvexum is designed for speed. If the AI requests multiple tool calls (e.g. reading three separate files and fetching a webpage), Norvexum executes them **concurrently** using `futures::join_all` and Tokio async wakers, rather than sequentially.
+Norvexum is designed for speed. If the AI requests multiple tool calls (e.g. reading three separate files and fetching a webpage), Norvexum executes them **concurrently** rather than sequentially. Calls that depend on each other keep their order: a second edit to the same file, a command after the file it runs was written, or `list` after `stop` waits for the earlier call ([schedule.rs](src/agent/schedule.rs)).
 
 ### 🛡️ Secure Workspace Sandbox
 Enforces strict canonical path verification across all filesystem and shell execution tools. The agent cannot read, edit, copy, write, or execute paths outside the workspace root directory. For shell commands, the tool tokenizes the command line, resolving and validating every path-like argument (including command names, traversal sequences like `../../`, home directories `~/`, and `file://` URLs) against the project root. Safe commands execute directly without spawning a subshell, while unparseable commands or commands with shell metacharacters fall back to a shell under forced user approval. Critical binaries are hard-blocked using a strict command name denylist.

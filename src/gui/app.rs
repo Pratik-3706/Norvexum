@@ -3207,7 +3207,10 @@ impl GuiApp {
                         .on_hover_text("Stop this background process")
                         .clicked()
                     {
-                        crate::tools::shell::kill_background_process(proc.pid);
+                        crate::tools::shell::kill_background_process(
+                            proc.pid,
+                            crate::tools::shell::StoppedBy::User,
+                        );
                     }
                     ui.label(
                         egui::RichText::new(proc.pid.to_string())

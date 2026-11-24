@@ -18,6 +18,9 @@ pub struct Skill {
     pub trigger_patterns: Vec<String>,
     pub system_instructions: String,
     pub default_tools: Vec<String>,
+    /// Programs the skill runs. It is hidden while one of them is missing.
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
 /// Skills shipped inside the binary, so they work in every project (they used
@@ -48,6 +51,7 @@ pub fn load_default_skills() -> Vec<Skill> {
                                   Point out security flaws, race conditions, memory leaks, or bad design patterns. \
                                   Propose exact refactoring options using the edit_file tool.".into(),
             default_tools: vec![],
+            requires: vec![],
         },
         Skill {
             name: "image_finder".into(),
@@ -57,8 +61,27 @@ pub fn load_default_skills() -> Vec<Skill> {
                                   and query alignment, and download the best candidate to the user-specified output folder \
                                   or the current working directory.".into(),
             default_tools: vec![],
+            requires: vec![],
         },
     ]
+}
+
+/// A frontmatter value: `[a, "b"]` or a single item.
+fn parse_list(value: &str) -> Vec<String> {
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    let items: Vec<&str> = if inner.len() == value.len() {
+        vec![inner]
+    } else {
+        inner.split(',').collect()
+    };
+    items
+        .into_iter()
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Parse a markdown file with YAML frontmatter into a Skill
@@ -75,6 +98,7 @@ pub fn parse_skill_markdown(content: &str) -> Option<Skill> {
     let mut name = String::new();
     let mut description = String::new();
     let mut trigger_patterns = Vec::new();
+    let mut requires = Vec::new();
     let mut in_frontmatter = true;
     let mut remaining_lines = Vec::new();
     let mut current_key = String::new();
@@ -89,7 +113,9 @@ pub fn parse_skill_markdown(content: &str) -> Option<Skill> {
             if trimmed.starts_with('-') {
                 let item = trimmed.trim_start_matches('-').trim();
                 let unquoted = item.trim_matches('"').trim_matches('\'').to_lowercase();
-                if current_key == "trigger_patterns" && !unquoted.is_empty() {
+                if current_key == "requires" && !unquoted.is_empty() {
+                    requires.push(unquoted);
+                } else if current_key == "trigger_patterns" && !unquoted.is_empty() {
                     trigger_patterns.push(unquoted);
                 }
             } else if let Some((key, val)) = trimmed.split_once(':') {
@@ -100,17 +126,10 @@ pub fn parse_skill_markdown(content: &str) -> Option<Skill> {
                     name = v;
                 } else if k == "description" {
                     description = v;
+                } else if k == "requires" && !v.is_empty() {
+                    requires.extend(parse_list(&v));
                 } else if k == "trigger_patterns" && !v.is_empty() {
-                    if v.starts_with('[') && v.ends_with(']') {
-                        let parsed: Vec<String> = v[1..v.len() - 1]
-                            .split(',')
-                            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_lowercase())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        trigger_patterns.extend(parsed);
-                    } else {
-                        trigger_patterns.push(v.to_lowercase());
-                    }
+                    trigger_patterns.extend(parse_list(&v).iter().map(|s| s.to_lowercase()));
                 }
             }
         } else {
@@ -132,6 +151,7 @@ pub fn parse_skill_markdown(content: &str) -> Option<Skill> {
         trigger_patterns,
         system_instructions: remaining_lines.join("\n").trim().to_string(),
         default_tools: vec![],
+        requires,
     })
 }
 
@@ -160,6 +180,7 @@ fn scan_skills_dir(dir: &Path, skills: &mut Vec<Skill>) {
 
 /// Load built-in skills, then custom ones from the project and home folders.
 /// A custom skill with the same name (case-insensitive) replaces the built-in.
+/// Skills whose `requires` programs are not all installed are left out.
 pub fn load_all_skills(project_root: &Path) -> Vec<Skill> {
     let mut skills = load_default_skills();
     skills.extend(
@@ -180,6 +201,8 @@ pub fn load_all_skills(project_root: &Path) -> Vec<Skill> {
             None => skills.push(skill),
         }
     }
+    // Guidance for a program that isn't installed only leads to failed commands.
+    skills.retain(|skill| skill.requires.iter().all(|cmd| which::which(cmd).is_ok()));
     skills
 }
 
@@ -243,7 +266,8 @@ mod tests {
     #[test]
     fn builtin_skills_are_embedded() {
         let skills = load_all_skills(Path::new("definitely-not-a-real-dir"));
-        assert!(skills.len() >= 14, "got {}", skills.len());
+        // 14, less any whose program isn't installed here.
+        assert!(skills.len() >= 13, "got {}", skills.len());
         assert!(skills.iter().any(|s| s.name == "Frontend Specialist"));
     }
 
@@ -263,5 +287,32 @@ mod tests {
             find_matching_skill("please add a unit test for this", Path::new("nope")).unwrap();
         assert_eq!(skill.name, "Testing Engineer");
         assert!(find_matching_skill("/help", Path::new("nope")).is_none());
+    }
+
+    #[test]
+    fn skills_for_missing_programs_are_hidden() {
+        // The shipped one: advertised exactly when `tvly` can run.
+        let shipped = load_all_skills(Path::new("definitely-not-a-real-dir"));
+        assert_eq!(
+            shipped.iter().any(|s| s.name == "Tavily Agent Skills"),
+            which::which("tvly").is_ok()
+        );
+
+        let root = std::env::temp_dir().join(format!("norvexum_skill_{}", uuid::Uuid::new_v4()));
+        let dir = root.join("skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        let skill = |name: &str, requires: &str| {
+            let text = format!("---\nname: {name}\ndescription: x\n{requires}\n---\nBody");
+            std::fs::write(dir.join(format!("{name}.md")), text).unwrap();
+        };
+        skill("needs-git", "requires: git");
+        skill("needs-both", "requires: [git, no-such-program-xyz]");
+        skill("needs-list", "requires:\n  - \"no-such-program-xyz\"");
+        skill("needs-nothing", "");
+        let names: Vec<String> = load_all_skills(&root).into_iter().map(|s| s.name).collect();
+        let has = |name: &str| names.iter().any(|n| n == name);
+        assert!(has("needs-git") && has("needs-nothing"), "{names:?}");
+        assert!(!has("needs-both") && !has("needs-list"), "{names:?}");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

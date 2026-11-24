@@ -11,41 +11,57 @@ const MAX_DIMENSION: u32 = 2048;
 /// Raw-size threshold above which an image is always re-encoded.
 const MAX_BYTES: usize = 3_500_000;
 
-pub fn mime_for_path(path: &std::path::Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("avif") => "image/avif",
-        Some("bmp") => "image/bmp",
-        _ => "image/jpeg",
-    }
-}
-
 /// Encode a local image file to base64 for the AI model, downscaling and
 /// re-encoding large images first.
+///
+/// The type comes from the content, not the extension, and anything that isn't
+/// an image is refused: providers reject the whole request over one bad image,
+/// and the image stays in the conversation.
 pub fn encode_image_file(path: &std::path::Path) -> Result<(String, String)> {
-    let bytes = std::fs::read(path)?;
-    let mime = mime_for_path(path);
+    use image::ImageFormat;
 
+    if path.is_dir() {
+        eyre::bail!("it is a folder");
+    }
+    let bytes = std::fs::read(path)?;
+    let reader = image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?;
+    let mime = match reader.format() {
+        Some(ImageFormat::Png) => "image/png",
+        Some(ImageFormat::Jpeg) => "image/jpeg",
+        Some(ImageFormat::Gif) => "image/gif",
+        Some(ImageFormat::WebP) => "image/webp",
+        Some(ImageFormat::Bmp) => "image/bmp",
+        Some(other) => {
+            let kind = other.extensions_str().first().copied().unwrap_or("these");
+            eyre::bail!(
+                "{} images can't be viewed; convert it to PNG or JPEG first",
+                kind.to_uppercase()
+            )
+        }
+        None => eyre::bail!("it is not an image (PNG, JPEG, GIF, WebP or BMP)"),
+    };
+    if let Err(e) = reader.into_dimensions() {
+        eyre::bail!("the image is damaged: {e}");
+    }
+    let encode = |data: &[u8]| base64::engine::general_purpose::STANDARD.encode(data);
+
+    // Providers don't take BMP.
+    if mime == "image/bmp" {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::load_from_memory(&bytes)?.write_to(&mut png, ImageFormat::Png)?;
+        let png = png.into_inner();
+        return Ok(match shrink_if_needed(&png) {
+            Some((data, new_mime)) => (encode(&data), new_mime.into()),
+            None => (encode(&png), "image/png".into()),
+        });
+    }
     // GIFs would lose their animation; other formats are safe to re-encode.
     if mime != "image/gif" {
         if let Some((data, new_mime)) = shrink_if_needed(&bytes) {
-            return Ok((
-                base64::engine::general_purpose::STANDARD.encode(data),
-                new_mime.into(),
-            ));
+            return Ok((encode(&data), new_mime.into()));
         }
     }
-
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok((b64, mime.to_string()))
+    Ok((encode(&bytes), mime.to_string()))
 }
 
 /// Re-encode when the image is too large in bytes or pixels. `None` means the
@@ -155,8 +171,31 @@ mod tests {
     }
 
     #[test]
-    fn mime_detection_ignores_case() {
-        assert_eq!(mime_for_path(std::path::Path::new("SHOT.PNG")), "image/png");
-        assert_eq!(mime_for_path(std::path::Path::new("a.JpEg")), "image/jpeg");
+    fn the_content_decides_the_type() {
+        let dir = std::env::temp_dir().join(format!("norvexum_vision_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 30, 30]));
+        let encode = |name: &str| encode_image_file(&dir.join(name));
+
+        let png = dir.join("x.png");
+        img.save(&png).unwrap();
+        std::fs::copy(&png, dir.join("wrong.jpg")).unwrap();
+        std::fs::copy(&png, dir.join("none")).unwrap();
+        assert_eq!(encode("wrong.jpg").unwrap().1, "image/png");
+        assert_eq!(encode("none").unwrap().1, "image/png");
+        img.save(dir.join("x.bmp")).unwrap();
+        assert_eq!(encode("x.bmp").unwrap().1, "image/png");
+
+        let bytes = std::fs::read(&png).unwrap();
+        std::fs::write(dir.join("cut.png"), &bytes[..12]).unwrap();
+        std::fs::write(dir.join("text.png"), "hello").unwrap();
+        std::fs::write(dir.join("empty.png"), "").unwrap();
+        std::fs::write(dir.join("x.avif"), b"\0\0\0\x20ftypavif\0\0\0\0").unwrap();
+        let why = |name: &str| encode(name).unwrap_err().to_string();
+        assert!(why("cut.png").contains("damaged"));
+        assert!(why("text.png").contains("not an image"));
+        assert!(why("empty.png").contains("not an image"));
+        assert!(why("x.avif").contains("AVIF"), "{}", why("x.avif"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

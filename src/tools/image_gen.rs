@@ -109,7 +109,7 @@ impl Tool for GenerateImageTool {
                                 "✅ Successfully generated image using {} ({}) and saved to {}",
                                 res.provider,
                                 res.model,
-                                filepath.display()
+                                super::filesystem::display_path(&filepath, ctx)
                             ),
                             json!({
                                 "path": filepath.to_string_lossy(),
