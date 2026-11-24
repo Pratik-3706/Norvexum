@@ -422,6 +422,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_view_reports_bad_files_and_still_shows_the_good_ones() {
+        let (root, mut context) = test_context();
+        context.client = Some(Arc::new(SeeingModel(Default::default())));
+        write_png(&root.join("a.png"));
+        write_png(&root.join("b.png"));
+        std::fs::write(root.join("notes.txt"), "just text").unwrap();
+        let registry = ToolRegistry::new(&context.settings);
+
+        let mixed = registry
+            .execute(
+                "batch_view_images",
+                json!({ "paths": ["notes.txt", "a.png", "missing.png", "../out.png", 7, "b.png"] }),
+                &context,
+            )
+            .await;
+        let said = mixed.to_message_content();
+        assert!(mixed.success, "{said}");
+        assert_eq!(mixed.images.len(), 2, "{said}");
+        assert!(
+            said.contains("1. a.png") && said.contains("2. b.png"),
+            "{said}"
+        );
+        for bad in ["notes.txt", "missing.png", "../out.png", "7"] {
+            assert!(said.contains(&format!("- {bad}: ")), "{bad}: {said}");
+        }
+
+        // Nothing usable: an error that names every file.
+        let none = registry
+            .execute(
+                "batch_view_images",
+                json!({ "paths": ["missing.png", "notes.txt"] }),
+                &context,
+            )
+            .await;
+        let said = none.to_message_content();
+        assert!(!none.success && none.images.is_empty(), "{said}");
+        assert!(
+            said.contains("- missing.png: ") && said.contains("- notes.txt: "),
+            "{said}"
+        );
+        assert!(!said.contains(r"\\?\"), "{said}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn view_image_refuses_what_is_not_an_image_and_trusts_content_over_extension() {
+        let (root, mut context) = test_context();
+        context.client = Some(Arc::new(SeeingModel(Default::default())));
+        std::fs::write(root.join("fake.png"), "not an image").unwrap();
+        write_png(&root.join("real.png"));
+        std::fs::rename(root.join("real.png"), root.join("misnamed.jpg")).unwrap();
+        let registry = ToolRegistry::new(&context.settings);
+
+        for bad in ["fake.png", "missing.png", "."] {
+            let result = registry
+                .execute("view_image", json!({ "path": bad }), &context)
+                .await;
+            let said = result.to_message_content();
+            assert!(!result.success && result.images.is_empty(), "{bad}: {said}");
+            assert!(
+                said.contains(bad) && !said.contains(r"\\?\"),
+                "{bad}: {said}"
+            );
+        }
+        let png = registry
+            .execute("view_image", json!({ "path": "misnamed.jpg" }), &context)
+            .await;
+        assert_eq!(png.images[0].1, "image/png");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn ls_shows_the_size_of_a_file_still_being_written() {
+        use std::io::Write;
+        let (root, context) = test_context();
+        let mut open = std::fs::File::create(root.join("live.log")).unwrap();
+        open.write_all(&[b'x'; 321]).unwrap();
+        let registry = ToolRegistry::new(&context.settings);
+        let listed = registry.execute("ls", json!({}), &context).await;
+        assert!(listed.output.contains("321 B"), "{}", listed.output);
+        drop(open);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn the_removed_zerochan_tool_is_gone_and_explained() {
         let (root, context) = test_context();
         let registry = ToolRegistry::new(&context.settings);

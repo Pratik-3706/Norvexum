@@ -1,10 +1,11 @@
 // ===========================================================================
-// Agent — Core reasoning loop with thinking + truly parallel tool calling
+// Agent — Core reasoning loop with thinking + parallel tool calling
 //
 // Loop:
 //   1. Send conversation + tools to AI model (streaming)
 //   2. Display thinking tokens live in the UI
 //   3. On tool calls → ask for approval where required, execute in parallel
+//      (calls that depend on an earlier one wait for it)
 //   4. Append results → repeat
 //   5. On content → stream text live to the UI
 //   6. On "done" → break
@@ -15,6 +16,7 @@
 pub mod checkpoint;
 pub mod compaction;
 pub mod history;
+pub mod schedule;
 pub mod session;
 pub mod subagent;
 pub mod vision;
@@ -863,6 +865,7 @@ Another agent gave you one task. Work on it independently with your tools; the u
         if self.client.supports_vision() {
             self.status(format!("📸 Loading {} image(s)...", images.len()));
             let mut encoded = Vec::new();
+            let mut text = text.to_string();
             for img in &images {
                 match vision::encode_image_file(img) {
                     Ok(pair) => encoded.push(pair),
@@ -871,6 +874,11 @@ Another agent gave you one task. Work on it independently with your tools; the u
                             "Failed to load image '{}': {e}",
                             img.display()
                         )));
+                        // Or the model would look for an image it never got.
+                        text.push_str(&format!(
+                            "\n\n[Image '{}' could not be attached: {e}]",
+                            img.display()
+                        ));
                     }
                 }
             }
@@ -1576,8 +1584,9 @@ Another agent gave you one task. Work on it independently with your tools; the u
         Some(approvals)
     }
 
-    /// Run all calls in parallel. Results come back in the same order as `calls`.
-    /// Returns `None` if the run was cancelled (running tools are aborted).
+    /// Run all calls in parallel, except that a call waits for the earlier ones
+    /// it depends on (see [`schedule`]). Results come back in the same order as
+    /// `calls`. Returns `None` if the run was cancelled (running tools are aborted).
     async fn execute_tools(
         &self,
         calls: &[ToolCall],
@@ -1595,17 +1604,43 @@ Another agent gave you one task. Work on it independently with your tools; the u
             inbox: Some(self.inbox_tx.clone()),
         };
 
+        let parsed: Vec<Option<serde_json::Value>> = calls
+            .iter()
+            .zip(approvals)
+            .map(|(tc, &approved)| approved.then(|| parse_tool_args(&tc.arguments)).flatten())
+            .collect();
+        // A call that won't run uses nothing.
+        let waits = schedule::dependencies(
+            calls.iter().zip(&parsed).map(|(tc, args)| match args {
+                Some(args) => (tc.name.as_str(), args),
+                None => ("", &serde_json::Value::Null),
+            }),
+            &ctx.cwd,
+        );
+        // Each call holds its `done` until it ends, however it ends.
+        let (done, ended): (Vec<_>, Vec<_>) = calls
+            .iter()
+            .map(|_| tokio::sync::watch::channel(()))
+            .unzip();
+
         let mut handles = Vec::with_capacity(calls.len());
-        for (tc, &approved) in calls.iter().zip(approvals) {
+        for ((((tc, &approved), args), done), waits) in
+            calls.iter().zip(approvals).zip(parsed).zip(done).zip(waits)
+        {
             let tc = tc.clone();
             let ctx = ctx.clone();
             let tools = self.tools.clone();
             let ev_tx = self.event_tx.clone();
+            let waits: Vec<_> = waits.into_iter().map(|i| ended[i].clone()).collect();
 
             handles.push(tokio::spawn(async move {
+                let _done = done;
+                for mut earlier in waits {
+                    while earlier.changed().await.is_ok() {}
+                }
                 let result = if !approved {
                     ToolResult::err("The user denied this tool call. Do not retry it; ask the user how to proceed if needed.")
-                } else if let Some(args) = parse_tool_args(&tc.arguments) {
+                } else if let Some(args) = args {
                     let name = crate::tools::canonical_tool_name(&tc.name);
                     let writes_file = FILE_WRITE_TOOLS.contains(&name);
                     let target = args["path"].as_str().map(|p| ctx.cwd.join(p));
@@ -2331,6 +2366,140 @@ mod tests {
         assert!(files.is_empty());
         assert_eq!(prompt, "plain | text");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn test_agent(name: &str) -> (std::path::PathBuf, Agent) {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("agent-test-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = Settings {
+            project_root: root.clone(),
+            ..Settings::default()
+        };
+        let (event_tx, _) = mpsc::unbounded_channel();
+        (root, Agent::new(settings, event_tx))
+    }
+
+    /// Run calls as one batch, the way a single model reply does.
+    async fn run_batch(agent: &Agent, calls: &[(&str, serde_json::Value)]) -> Vec<ToolResult> {
+        let calls: Vec<ToolCall> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| ToolCall {
+                id: format!("call-{i}"),
+                name: name.to_string(),
+                arguments: args.clone(),
+                thought_signature: None,
+            })
+            .collect();
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        agent
+            .execute_tools(&calls, &vec![true; calls.len()], &mut cancel_rx)
+            .await
+            .expect("not cancelled")
+    }
+
+    #[cfg(windows)]
+    const PING: &str = "ping -n 30 127.0.0.1";
+    #[cfg(not(windows))]
+    const PING: &str = "sleep 30";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_then_list_in_one_reply_agree() {
+        let (root, agent) = test_agent("stop");
+        let started = run_batch(
+            &agent,
+            &[("run_command", json!({"command": PING, "background": true}))],
+        )
+        .await;
+        let pid: u64 = started[0]
+            .output
+            .split("PID ")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .and_then(|s| s.parse().ok())
+            .expect("a pid");
+        let results = run_batch(
+            &agent,
+            &[
+                ("manage_processes", json!({"action": "stop", "pid": pid})),
+                ("manage_processes", json!({"action": "list"})),
+            ],
+        )
+        .await;
+        assert!(
+            results[0].output.contains("Stopped"),
+            "{}",
+            results[0].output
+        );
+        let line = results[1]
+            .output
+            .lines()
+            .find(|l| l.contains(&format!("pid {pid} ")))
+            .expect("listed");
+        assert!(
+            line.contains("stopped") && !line.contains("running"),
+            "{line}"
+        );
+        // Stopped means gone, not "asked to stop".
+        let run = crate::tools::shell::command_feed()
+            .into_iter()
+            .rfind(|r| r.pid == Some(pid as u32))
+            .unwrap();
+        assert!(run.ended.is_some(), "still running after stop returned");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn edits_to_one_file_in_one_reply_are_all_kept() {
+        let (root, agent) = test_agent("edits");
+        let names: Vec<String> = (0..12).map(|i| format!("<slot{i}>")).collect();
+        for round in 0..10 {
+            std::fs::write(root.join("f.txt"), names.join("\n")).unwrap();
+            let calls: Vec<(&str, serde_json::Value)> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    (
+                        "edit_file",
+                        json!({"path": "f.txt", "target": n, "replacement": format!("done{i}")}),
+                    )
+                })
+                .collect();
+            run_batch(&agent, &calls).await;
+            let after = std::fs::read_to_string(root.join("f.txt")).unwrap();
+            assert!(
+                !after.contains("slot"),
+                "round {round} lost edits:\n{after}"
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_command_sees_the_file_written_before_it_in_the_same_reply() {
+        let (root, agent) = test_agent("write-run");
+        let show = if cfg!(windows) { "findstr body" } else { "cat" };
+        for round in 0..5 {
+            let file = format!("f{round}.txt");
+            let body = format!("body-{round}\n").repeat(20_000);
+            let results = run_batch(
+                &agent,
+                &[
+                    ("write_file", json!({"path": file, "content": body})),
+                    ("run_command", json!({"command": format!("{show} {file}")})),
+                    ("rm", json!({"path": file})),
+                ],
+            )
+            .await;
+            let said = results[1].to_message_content();
+            assert!(results[1].success, "round {round}: {said}");
+            assert!(said.contains(&format!("body-{round}")), "round {round}");
+            assert!(!root.join(&file).exists());
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::image_inspect::{attach_images, describe_for_text_model, model_sees_images};
+use super::image_inspect::{attach_images, describe_for_text_model, load_image, model_sees_images};
 use super::{Tool, ToolContext, ToolResult};
 
 const MAX_BATCH_SIZE: usize = 14;
@@ -46,45 +46,52 @@ impl Tool for BatchViewImageTool {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let mut paths: Vec<String> = match args["paths"].as_array() {
-            Some(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
-            None => return ToolResult::err("'paths' must be an array of file path strings"),
+        let Some(paths) = args["paths"].as_array() else {
+            return ToolResult::err("'paths' must be an array of file path strings");
         };
         if paths.is_empty() {
             return ToolResult::err("No image paths provided");
         }
 
-        let mut warning = String::new();
+        // One bad file must not cost the others: show what can be shown and
+        // say what is wrong with the rest.
+        let mut images = Vec::new();
+        let mut problems = Vec::new();
+        for path in &paths[..paths.len().min(MAX_BATCH_SIZE)] {
+            match path.as_str() {
+                Some(name) => match load_image(name, ctx) {
+                    Ok(image) => images.push(image),
+                    Err(e) => problems.push(format!("- {name}: {e}")),
+                },
+                None => problems.push(format!("- {path}: not a path (a string)")),
+            }
+        }
+
+        let mut notes = String::new();
         if paths.len() > MAX_BATCH_SIZE {
-            warning = format!(
+            notes.push_str(&format!(
                 "Warning: {} images given, but at most {MAX_BATCH_SIZE} fit in one call. \
                  Only the first {MAX_BATCH_SIZE} are included.\n\n",
                 paths.len()
-            );
-            paths.truncate(MAX_BATCH_SIZE);
+            ));
         }
-
-        let mut images = Vec::with_capacity(paths.len());
-        for path_str in paths {
-            let path = match super::filesystem::resolve_path(&path_str, ctx) {
-                Ok(p) => p,
-                Err(e) => return ToolResult::err(format!("Path '{path_str}': {e}")),
-            };
-            if !path.exists() {
-                return ToolResult::err(format!("Image not found: {}", path.display()));
-            }
-            images.push((path_str, path));
+        if !problems.is_empty() {
+            notes.push_str(&format!(
+                "{} of the files can't be shown:\n{}\n\n",
+                problems.len(),
+                problems.join("\n")
+            ));
+        }
+        if images.is_empty() {
+            return ToolResult::err(notes.trim_end());
         }
 
         let prompt = args["prompt"].as_str();
         let mut result = if model_sees_images(ctx) {
-            attach_images(&images, prompt)
+            attach_images(images, prompt)
         } else {
             describe_for_text_model(
-                &images,
+                images,
                 prompt.unwrap_or(
                     "Describe each image in detail and note any similarities or differences.",
                 ),
@@ -92,8 +99,8 @@ impl Tool for BatchViewImageTool {
             )
             .await
         };
-        if result.success && !warning.is_empty() {
-            result.output = format!("{warning}{}", result.output);
+        if result.success {
+            result.output = format!("{notes}{}", result.output);
         }
         result
     }

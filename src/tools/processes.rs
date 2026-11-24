@@ -6,8 +6,11 @@
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::shell::{get_background_processes, get_finished_processes, kill_background_process};
+use super::shell::{StoppedBy, background_snapshot, get_background_processes, stop_and_wait};
 use super::{Tool, ToolContext, ToolResult};
+
+/// How long stopping may take (killing a process tree on Windows is not instant).
+const STOP_WAIT_SECS: u64 = 15;
 
 pub struct ManageProcessesTool;
 
@@ -21,7 +24,7 @@ impl Tool for ManageProcessesTool {
         "Manage commands running in the background (started with background=true, or still running \
          when run_command stopped waiting): 'list' shows running and recently finished ones, 'wait' \
          waits up to `secs` for one to finish and returns its status and latest output, 'logs' shows \
-         recent output (also after it exited), 'stop' terminates it and its child processes."
+         recent output (also after it exited), 'stop' terminates it and its child processes and returns once it has ended."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -66,11 +69,10 @@ impl Tool for ManageProcessesTool {
             }
             return logs;
         }
-        let processes = get_background_processes();
+        let (processes, finished) = background_snapshot();
 
         match action {
             "list" => {
-                let finished = get_finished_processes();
                 if processes.is_empty() && finished.is_empty() {
                     return ToolResult::ok("No background processes are running.");
                 }
@@ -86,7 +88,7 @@ impl Tool for ManageProcessesTool {
                     format!(
                         "pid {} — {} after {}s — {}",
                         f.info.pid,
-                        exit_label(f.exit_code),
+                        f.exit_label(),
                         f.ran_for.as_secs(),
                         crate::util::truncate_chars(&f.info.command, 120)
                     )
@@ -97,13 +99,13 @@ impl Tool for ManageProcessesTool {
                 let Some(pid) = pid else {
                     return ToolResult::err("'pid' is required for this action");
                 };
-                let finished = get_finished_processes();
                 let exited = finished.iter().rev().find(|f| f.info.pid == pid);
                 if action == "stop" {
                     if let Some(f) = exited.filter(|_| !processes.iter().any(|p| p.pid == pid)) {
                         return ToolResult::ok(format!(
-                            "pid {pid} already {}.",
-                            exit_label(f.exit_code)
+                            "pid {pid} had already ended: it {} after {}s.",
+                            f.exit_label(),
+                            f.ran_for.as_secs()
                         ));
                     }
                 }
@@ -127,8 +129,21 @@ impl Tool for ManageProcessesTool {
                 };
 
                 if action == "stop" {
-                    kill_background_process(pid);
-                    return ToolResult::ok(format!("Stopped pid {pid} ({})", info.command));
+                    let limit = std::time::Duration::from_secs(STOP_WAIT_SECS);
+                    return match stop_and_wait(pid, StoppedBy::Agent, limit).await {
+                        Some(f) if f.stopped_by == Some(StoppedBy::Agent) => {
+                            ToolResult::ok(format!("Stopped pid {pid} ({})", info.command))
+                        }
+                        // It ended by itself, or someone else stopped it first.
+                        Some(f) => ToolResult::ok(format!(
+                            "pid {pid} {} before it could be stopped.",
+                            f.exit_label()
+                        )),
+                        None => ToolResult::err(format!(
+                            "pid {pid} is still running {STOP_WAIT_SECS}s after being told to \
+                             stop. Check it with action=\"list\"."
+                        )),
+                    };
                 }
 
                 let wanted = args["lines"].as_u64().unwrap_or(60).clamp(1, 500) as usize;
@@ -139,7 +154,7 @@ impl Tool for ManageProcessesTool {
                         let tail = &lines[lines.len().saturating_sub(wanted)..];
                         let state = match exited {
                             Some(f) if !processes.iter().any(|p| p.pid == pid) => {
-                                format!(" ({})", exit_label(f.exit_code))
+                                format!(" ({})", f.exit_label())
                             }
                             _ => String::new(),
                         };
@@ -161,12 +176,5 @@ impl Tool for ManageProcessesTool {
             }
             other => ToolResult::err(format!("Unknown action '{other}'. Use list, logs or stop.")),
         }
-    }
-}
-
-fn exit_label(code: Option<i32>) -> String {
-    match code {
-        Some(code) => format!("exited with code {code}"),
-        None => "was stopped".to_string(),
     }
 }

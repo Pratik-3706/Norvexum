@@ -15,11 +15,36 @@ use std::sync::Mutex;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const MAX_TIMEOUT_SECS: u64 = 3600;
 
+/// Why a command ended before finishing on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoppedBy {
+    /// manage_processes(action="stop").
+    Agent,
+    /// A Stop button.
+    User,
+    /// It ran past its timeout_secs.
+    TimeLimit,
+}
+
+/// Exit code (`None`: stopped or killed), and who stopped it.
+type End = (Option<i32>, Option<StoppedBy>);
+
+/// How a command ended, as shown to the agent.
+pub fn exit_label(exit_code: Option<i32>, stopped_by: Option<StoppedBy>) -> String {
+    match (stopped_by, exit_code) {
+        (Some(StoppedBy::Agent), _) => "was stopped with manage_processes".into(),
+        (Some(StoppedBy::User), _) => "was stopped by the user".into(),
+        (Some(StoppedBy::TimeLimit), _) => "was stopped at its time limit".into(),
+        (None, Some(code)) => format!("exited with code {code}"),
+        (None, None) => "was killed by the system or another program".into(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub command: String,
-    pub kill_tx: tokio::sync::mpsc::Sender<()>,
+    pub kill_tx: tokio::sync::mpsc::Sender<StoppedBy>,
     pub started: std::time::Instant,
     /// stdout + stderr of the process.
     pub log_path: std::path::PathBuf,
@@ -34,7 +59,14 @@ pub struct FinishedProcess {
     pub info: ProcessInfo,
     /// Exit code, or `None` when it was stopped or killed by a signal.
     pub exit_code: Option<i32>,
+    pub stopped_by: Option<StoppedBy>,
     pub ran_for: std::time::Duration,
+}
+
+impl FinishedProcess {
+    pub fn exit_label(&self) -> String {
+        exit_label(self.exit_code, self.stopped_by)
+    }
 }
 
 /// How many exited background commands are remembered.
@@ -42,23 +74,27 @@ const KEEP_FINISHED: usize = 20;
 
 static FINISHED_PROCESSES: Lazy<Mutex<Vec<FinishedProcess>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
-/// Background commands that have exited, oldest first.
-pub fn get_finished_processes() -> Vec<FinishedProcess> {
+// Lock order: processes(), then finished().
+fn finished() -> std::sync::MutexGuard<'static, Vec<FinishedProcess>> {
     FINISHED_PROCESSES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
 }
 
-fn remember_finished(info: ProcessInfo, exit_code: Option<i32>) {
-    let mut finished = FINISHED_PROCESSES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    finished.retain(|f| f.info.pid != info.pid);
+/// Move a background command that has ended to the finished list, in one step:
+/// at any moment it is in exactly one of the two.
+fn move_to_finished(pid: u32, exit_code: Option<i32>, stopped_by: Option<StoppedBy>) {
+    let mut running = processes();
+    let Some(info) = running.remove(&pid) else {
+        return;
+    };
+    let mut finished = finished();
+    finished.retain(|f| f.info.pid != pid);
     let ran_for = info.started.elapsed();
     finished.push(FinishedProcess {
         info,
         exit_code,
+        stopped_by,
         ran_for,
     });
     let excess = finished.len().saturating_sub(KEEP_FINISHED);
@@ -72,17 +108,49 @@ fn processes() -> std::sync::MutexGuard<'static, HashMap<u32, ProcessInfo>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub fn get_background_processes() -> Vec<ProcessInfo> {
-    let mut list: Vec<ProcessInfo> = processes().values().cloned().collect();
+fn sorted(running: &HashMap<u32, ProcessInfo>) -> Vec<ProcessInfo> {
+    let mut list: Vec<ProcessInfo> = running.values().cloned().collect();
     list.sort_by_key(|p| p.started);
     list
 }
 
-pub fn kill_background_process(pid: u32) {
-    // Remove the process and send the kill signal to the background task
-    if let Some(info) = processes().remove(&pid) {
-        let _ = info.kill_tx.try_send(());
-        remember_finished(info, None);
+pub fn get_background_processes() -> Vec<ProcessInfo> {
+    sorted(&processes())
+}
+
+/// Running and finished background commands as of one moment, oldest first.
+pub fn background_snapshot() -> (Vec<ProcessInfo>, Vec<FinishedProcess>) {
+    let running = processes();
+    let finished = finished();
+    (sorted(&running), finished.clone())
+}
+
+/// Ask a background command to stop. It stays listed as running until it has
+/// really ended.
+pub fn kill_background_process(pid: u32, by: StoppedBy) {
+    if let Some(info) = processes().get(&pid) {
+        let _ = info.kill_tx.try_send(by);
+    }
+}
+
+/// Stop a background command and wait up to `limit` for it to end. `None`
+/// when it is still running then.
+pub async fn stop_and_wait(
+    pid: u32,
+    by: StoppedBy,
+    limit: std::time::Duration,
+) -> Option<FinishedProcess> {
+    kill_background_process(pid, by);
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let (running, finished) = background_snapshot();
+        if !running.iter().any(|p| p.pid == pid) {
+            return finished.into_iter().rfind(|f| f.info.pid == pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -121,13 +189,13 @@ pub struct CommandRun {
     pub ended: Option<(Option<i32>, std::time::Duration)>,
     /// Left running in the background.
     pub background: bool,
-    kill_tx: tokio::sync::mpsc::Sender<()>,
+    kill_tx: tokio::sync::mpsc::Sender<StoppedBy>,
 }
 
 /// Stop a command from the feed (and everything it started).
 pub fn stop_command(id: u64) {
     if let Some(run) = feed().iter().find(|r| r.id == id && r.ended.is_none()) {
-        let _ = run.kill_tx.try_send(());
+        let _ = run.kill_tx.try_send(StoppedBy::User);
     }
 }
 
@@ -157,6 +225,7 @@ fn feed_update(id: u64, change: impl FnOnce(&mut CommandRun)) {
     }
 }
 
+#[cfg(test)]
 fn feed_ended(id: u64) -> bool {
     feed().iter().any(|r| r.id == id && r.ended.is_some())
 }
@@ -211,6 +280,12 @@ async fn run_logged(
     budget: std::time::Duration,
     hard_limit: Option<std::time::Duration>,
 ) -> ToolResult {
+    // A command about to hit its limit: wait for that, rather than report it as
+    // running in the background just as it is stopped.
+    let budget = match hard_limit {
+        Some(limit) if limit <= budget => limit + std::time::Duration::from_secs(10),
+        _ => budget,
+    };
     let log_dir = ctx
         .settings
         .project_root
@@ -273,7 +348,7 @@ async fn run_logged(
         }
     }
 
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Option<i32>>();
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<End>();
     tokio::spawn(async move {
         let limit = async {
             match hard_limit {
@@ -281,25 +356,27 @@ async fn run_logged(
                 None => std::future::pending().await,
             }
         };
-        let exit_code = tokio::select! {
-            status = child.wait() => status.ok().and_then(|s| s.code()),
-            _ = kill_rx.recv() => {
+        let outcome = tokio::select! {
+            // A command that ended on its own was not stopped.
+            biased;
+            status = child.wait() => Err(status.ok().and_then(|s| s.code())),
+            Some(by) = kill_rx.recv() => Ok(by),
+            _ = limit => Ok(StoppedBy::TimeLimit),
+        };
+        let (exit_code, stopped_by) = match outcome {
+            Ok(by) => {
                 kill_tree(&mut child).await;
-                None
+                (None, Some(by))
             }
-            _ = limit => {
-                kill_tree(&mut child).await;
-                None
-            }
+            Err(code) => (code, None),
         };
         feed_update(id, |run| run.ended = Some((exit_code, started.elapsed())));
+        // Before leaving the running list: a call that is just handing the
+        // command over to the background checks this with the list locked.
+        let _ = done_tx.send((exit_code, stopped_by));
         if let Some(pid) = pid {
-            // Stopped processes were already moved to the finished list.
-            if let Some(info) = processes().remove(&pid) {
-                remember_finished(info, exit_code);
-            }
+            move_to_finished(pid, exit_code, stopped_by);
         }
-        let _ = done_tx.send(exit_code);
     });
 
     let shown_log = log_path
@@ -319,19 +396,15 @@ async fn run_logged(
         };
     }
 
-    match tokio::time::timeout(budget, done_rx).await {
-        Ok(exit) => finished_result(exit.ok().flatten(), &log_path, started.elapsed()),
+    match tokio::time::timeout(budget, &mut done_rx).await {
+        Ok(end) => finished_result(end.unwrap_or((None, None)), &log_path, started.elapsed()),
         Err(_) => {
             // Still running: leave it in the background unless it ended just now.
             {
                 let mut procs = processes();
-                if feed_ended(id) {
+                if let Ok(end) = done_rx.try_recv() {
                     drop(procs);
-                    let exit = feed()
-                        .iter()
-                        .find(|r| r.id == id)
-                        .and_then(|r| r.ended.and_then(|(code, _)| code));
-                    return finished_result(exit, &log_path, started.elapsed());
+                    return finished_result(end, &log_path, started.elapsed());
                 }
                 if let Some(info) = info {
                     procs.insert(info.pid, info);
@@ -357,7 +430,7 @@ async fn run_logged(
 }
 
 /// The tool result for a command that has ended.
-fn finished_result(exit: Option<i32>, log_path: &Path, ran_for: std::time::Duration) -> ToolResult {
+fn finished_result(end: End, log_path: &Path, ran_for: std::time::Duration) -> ToolResult {
     let output = std::fs::read(log_path)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
@@ -368,9 +441,10 @@ fn finished_result(exit: Option<i32>, log_path: &Path, ran_for: std::time::Durat
         String::new()
     };
     // Empty sections are omitted — they'd cost tokens on every later request.
+    let (exit, stopped_by) = end;
     let mut summary = match exit {
         Some(code) => format!("Exit code: {code}{took}"),
-        None => format!("The command was stopped{took}"),
+        None => format!("The command {}{took}", exit_label(None, stopped_by)),
     };
     if output.trim().is_empty() {
         summary.push_str(" (no output)");
@@ -399,7 +473,16 @@ pub fn is_shell_builtin(cmd_name: &str) -> bool {
     matches!(
         cmd_name,
         "exit" | "echo" | "set" | "export" | "dir" | "cls" | "start"
-    )
+    ) || (cfg!(windows)
+        // Part of cmd.exe: there is no program to run by that name.
+        && matches!(
+            cmd_name,
+            "type" | "copy" | "move" | "del" | "erase" | "ren" | "rename" | "md" | "mkdir"
+                | "rd" | "rmdir" | "ver" | "vol" | "mklink" | "assoc" | "ftype" | "path"
+                | "call" | "for" | "if"
+        )
+        // Unless there is one (Git for Windows adds mkdir, rmdir, …).
+        && which::which(cmd_name).is_err())
 }
 
 /// Check if a command is unparseable or contains shell metacharacters/wildcards
@@ -1012,6 +1095,94 @@ mod tests {
         assert!(feed_ended(run.id));
         let pid = run.pid.unwrap();
         assert!(!get_background_processes().iter().any(|p| p.pid == pid));
+    }
+
+    #[tokio::test]
+    async fn an_ended_command_says_who_stopped_it() {
+        use crate::tools::processes::ManageProcessesTool;
+        let ctx = context();
+        let manage = |args| ManageProcessesTool.execute(args, &ctx);
+        let start = || async {
+            let result = ShellCommandTool
+                .execute(json!({"command": SLEEP_LONG, "background": true}), &ctx)
+                .await;
+            let run = command_feed()
+                .into_iter()
+                .rfind(|r| {
+                    r.background
+                        && r.pid
+                            .is_some_and(|p| result.output.contains(&format!("PID {p};")))
+                })
+                .expect("in the feed");
+            (run.id, run.pid.unwrap())
+        };
+
+        // A Stop button, while the agent wasn't looking.
+        let (id, pid) = start().await;
+        stop_command(id);
+        for _ in 0..200 {
+            if feed_ended(id) && !get_background_processes().iter().any(|p| p.pid == pid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let said = manage(json!({"action": "stop", "pid": pid})).await.output;
+        assert!(
+            said.contains("had already ended: it was stopped by the user"),
+            "{said}"
+        );
+
+        // The agent's own stop: over by the time the call returns.
+        let (id, pid) = start().await;
+        let said = manage(json!({"action": "stop", "pid": pid})).await.output;
+        assert!(said.starts_with("Stopped pid"), "{said}");
+        assert!(feed_ended(id));
+        let said = manage(json!({"action": "logs", "pid": pid})).await.output;
+        assert!(said.contains("was stopped with manage_processes"), "{said}");
+
+        // Its time limit.
+        let result = ShellCommandTool
+            .execute(
+                json!({"command": SLEEP_LONG, "timeout_secs": 1, "expected_secs": 8}),
+                &ctx,
+            )
+            .await;
+        let said = result.to_message_content();
+        assert!(said.contains("was stopped at its time limit"), "{said}");
+
+        // On its own.
+        let result = ShellCommandTool
+            .execute(json!({"command": "echo done", "background": true}), &ctx)
+            .await;
+        let pid: u64 = result
+            .output
+            .split("PID ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let said = manage(json!({"action": "wait", "pid": pid, "secs": 10}))
+            .await
+            .output;
+        assert!(said.contains("exited with code 0"), "{said}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_builtins_run_without_a_program_of_that_name() {
+        let ctx = context();
+        std::fs::write(ctx.cwd.join("builtin.txt"), "from-type").unwrap();
+        let result = ShellCommandTool
+            .execute(json!({"command": "type builtin.txt"}), &ctx)
+            .await;
+        assert!(
+            result.output.contains("from-type"),
+            "{}",
+            result.to_message_content()
+        );
     }
 
     #[test]

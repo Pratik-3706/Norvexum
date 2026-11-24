@@ -131,7 +131,11 @@ impl Tool for DownloadImageTool {
                     Ok(_) => {
                         let kb = bytes.len() as f64 / 1024.0;
                         ToolResult::ok_with_data(
-                            format!("✅ Downloaded {:.1} KB → {}", kb, filepath.display()),
+                            format!(
+                                "✅ Downloaded {:.1} KB → {}",
+                                kb,
+                                super::filesystem::display_path(&filepath, ctx)
+                            ),
                             json!({
                                 "path": filepath.to_string_lossy(),
                                 "size_kb": (kb * 10.0).round() / 10.0,
@@ -238,7 +242,7 @@ impl Tool for BatchDownloadImageTool {
             "Downloaded {}/{} images to {}:\n",
             downloaded.len(),
             top_n,
-            out_dir.display()
+            super::filesystem::display_path(&out_dir, ctx)
         );
         for d in &downloaded {
             output.push_str(&format!("  {}\n", d));

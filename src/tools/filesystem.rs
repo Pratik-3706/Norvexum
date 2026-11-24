@@ -87,16 +87,23 @@ pub(super) fn resolve_path(path_str: &str, ctx: &ToolContext) -> Result<PathBuf,
     if !resolved.starts_with(&root) {
         return Err(format!(
             "Access denied: path '{}' is outside the project sandbox ({})",
-            resolved.display(),
-            root.display()
+            plain(&resolved),
+            plain(&root)
         ));
     }
 
     Ok(resolved)
 }
 
+/// A resolved path without Windows' `\?\` prefix, which neither people nor
+/// cmd.exe can use.
+fn plain(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\?\").unwrap_or(&text).to_string()
+}
+
 /// Project-relative display path (shorter for the model and the user).
-fn display_path(path: &Path, ctx: &ToolContext) -> String {
+pub(super) fn display_path(path: &Path, ctx: &ToolContext) -> String {
     let root = ctx
         .settings
         .project_root
@@ -736,7 +743,12 @@ impl Tool for ListDirTool {
             if entry.file_type().is_dir() {
                 entries.push(format!("{:>10}  {rel}/", "dir"));
             } else {
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                // Not entry.metadata(): on Windows that is the folder's copy of
+                // the size, which stays old while a file is being written.
+                let size = std::fs::metadata(entry.path())
+                    .or_else(|_| entry.metadata().map_err(std::io::Error::other))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 entries.push(format!("{:>10}  {rel}", format_size(size)));
             }
         }

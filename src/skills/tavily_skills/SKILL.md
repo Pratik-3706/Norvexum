@@ -1,6 +1,7 @@
 ---
 name: Tavily Agent Skills
 description: Guide on using Tavily CLI tools (tvly search, extract, map, crawl, research) for web operations
+requires: [tvly]
 trigger_patterns:
   - "tavily-search"
   - "tavily-extract"
